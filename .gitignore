@@ -1,0 +1,5 @@
+.env
+sessions/
+!sessions/.gitkeep
+__pycache__/
+nginx.conf

@@ -1,0 +1,76 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Photobooth</title>
+<style>
+* { margin: 0; padding: 0; box-sizing: border-box; }
+body { font-family: system-ui, sans-serif; background: #f5f5f5; color: #333; min-height: 100vh; display: flex; flex-direction: column; align-items: center; padding: 2rem 1rem; }
+.loading { text-align: center; margin-top: 20vh; }
+.loading p { font-size: 1.2rem; color: #888; margin-bottom: 1rem; }
+.spinner { width: 40px; height: 40px; border: 4px solid #ddd; border-top-color: #333; border-radius: 50%; animation: spin 0.8s linear infinite; margin: 0 auto 1rem; }
+@keyframes spin { to { transform: rotate(360deg); } }
+.gallery { display: grid; grid-template-columns: repeat(2, 1fr); gap: 0.8rem; width: 100%; max-width: 800px; }
+.gallery a { display: block; }
+.gallery img { width: 100%; border-radius: 8px; }
+.video { width: 100%; max-width: 600px; border-radius: 8px; margin-top: 1rem; }
+h1 { font-size: 1.5rem; margin-bottom: 1.5rem; }
+#content { display: none; width: 100%; max-width: 800px; text-align: center; }
+</style>
+</head>
+<body>
+
+<div id="loading" class="loading">
+    <div class="spinner"></div>
+    <p>Фото загружаются...</p>
+</div>
+
+<div id="content">
+    <h1>Ваши фото</h1>
+    <div id="gallery" class="gallery"></div>
+    <div id="video-wrap"></div>
+</div>
+
+<script>
+const sid = location.pathname.split("/").filter(Boolean).pop();
+const base = `/s/${sid}`;
+
+async function load() {
+    try {
+        const r = await fetch(`${base}/files.json`);
+        if (!r.ok) throw new Error();
+        show(await r.json());
+    } catch {
+        setTimeout(load, 5000);
+    }
+}
+
+function show(files) {
+    document.getElementById("loading").style.display = "none";
+    document.getElementById("content").style.display = "block";
+
+    const gallery = document.getElementById("gallery");
+    for (const p of files.photos) {
+        const a = document.createElement("a");
+        a.href = `${base}/${p.photo}`;
+        a.download = p.photo;
+        const img = document.createElement("img");
+        img.src = `${base}/${p.thumb}`;
+        a.appendChild(img);
+        gallery.appendChild(a);
+    }
+
+    if (files.video) {
+        const v = document.createElement("video");
+        v.src = `${base}/${files.video}`;
+        v.controls = true;
+        v.className = "video";
+        document.getElementById("video-wrap").appendChild(v);
+    }
+}
+
+load();
+</script>
+</body>
+</html>
