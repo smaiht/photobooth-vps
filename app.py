@@ -22,7 +22,7 @@ TG_CHAT = os.environ.get("TG_CHAT_ID", "")
 SESSIONS_DIR = Path("sessions")
 SESSIONS_DIR.mkdir(exist_ok=True)
 POLL_INTERVAL = 10
-PROCESSING_TTL = 600  # 10 min fallback
+PROCESSING_TTL = 300
 THUMB_SIZE = (400, 400)
 
 _processing: dict[str, float] = {}
@@ -57,11 +57,27 @@ async def webdav_list(session: aiohttp.ClientSession) -> list[str]:
         return files
 
 
-async def webdav_download(session: aiohttp.ClientSession, filename: str) -> bytes:
-    async with session.get(f"{WEBDAV_URL}/{filename}",
-                           timeout=aiohttp.ClientTimeout(total=300)) as r:
-        r.raise_for_status()
-        return await r.read()
+async def webdav_download(session: aiohttp.ClientSession, filename: str, dest: Path) -> bool:
+    """Download file in chunks to disk. Returns True on success."""
+    url = f"{WEBDAV_URL}/{filename}"
+    try:
+        async with session.get(url, timeout=aiohttp.ClientTimeout(total=600, sock_read=60)) as r:
+            if r.status != 200:
+                log.warning(f"Download {filename}: HTTP {r.status}")
+                return False
+            total = int(r.headers.get("Content-Length", 0))
+            log.info(f"Downloading {filename} ({total/1024/1024:.1f}MB)...")
+            with open(dest, "wb") as f:
+                downloaded = 0
+                async for chunk in r.content.iter_chunked(64 * 1024):
+                    f.write(chunk)
+                    downloaded += len(chunk)
+            log.info(f"Downloaded {filename} ({downloaded/1024/1024:.1f}MB)")
+            return True
+    except Exception as e:
+        log.warning(f"Download {filename} failed: {e}")
+        dest.unlink(missing_ok=True)
+        return False
 
 
 async def webdav_delete(session: aiohttp.ClientSession, filename: str):
@@ -147,33 +163,37 @@ async def _tg_send_media_group(session: aiohttp.ClientSession, base: str,
 async def process_zip(session: aiohttp.ClientSession, filename: str):
     log.info(f"Processing {filename}...")
 
-    # Download with retries
-    data = None
-    for attempt in range(5):
-        try:
-            data = await webdav_download(session, filename)
-            log.info(f"Downloaded {filename} ({len(data) / 1024 / 1024:.1f}MB)")
-            break
-        except Exception as e:
-            log.warning(f"Download attempt {attempt+1}/5 failed: {e}")
-            await asyncio.sleep(5)
+    session_id = filename.replace(".zip", "")
+    session_dir = SESSIONS_DIR / session_id
+    session_dir.mkdir(exist_ok=True)
+    zip_path = session_dir / filename
 
-    if not data:
-        log.error(f"Failed to download {filename}")
+    # Download with retries
+    ok = False
+    for attempt in range(5):
+        ok = await webdav_download(session, filename, zip_path)
+        if ok:
+            break
+        log.warning(f"Retry {attempt+1}/5 for {filename}")
+        await asyncio.sleep(5)
+
+    if not ok:
+        log.error(f"Failed to download {filename} after 5 attempts")
         _processing.pop(filename, None)
         return
 
     await webdav_delete(session, filename)
 
-    session_id = filename.replace(".zip", "")
-    session_dir = SESSIONS_DIR / session_id
-    session_dir.mkdir(exist_ok=True)
-
-    zip_path = session_dir / filename
-    zip_path.write_bytes(data)
-    with zipfile.ZipFile(zip_path, "r") as zf:
-        zf.extractall(session_dir)
-    zip_path.unlink()
+    # Unpack
+    try:
+        with zipfile.ZipFile(zip_path, "r") as zf:
+            zf.extractall(session_dir)
+        zip_path.unlink()
+        log.info(f"Unpacked {session_id}")
+    except Exception as e:
+        log.error(f"Unpack failed: {e}")
+        _processing.pop(filename, None)
+        return
 
     # Generate thumbnails
     await asyncio.get_event_loop().run_in_executor(None, generate_thumbnails, session_dir)
