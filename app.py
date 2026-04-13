@@ -58,16 +58,21 @@ async def webdav_list(session: aiohttp.ClientSession) -> list[str]:
 
 
 async def webdav_download(session: aiohttp.ClientSession, filename: str, dest: Path) -> bool:
-    """Download file to disk. Returns True on success."""
+    """Download file in chunks to disk. Returns True on success."""
+    url = f"{WEBDAV_URL}/{filename}"
     try:
-        async with session.get(f"{WEBDAV_URL}/{filename}",
-                               timeout=aiohttp.ClientTimeout(total=600)) as r:
+        async with session.get(url, timeout=aiohttp.ClientTimeout(total=600, sock_read=60)) as r:
             if r.status != 200:
                 log.warning(f"Download {filename}: HTTP {r.status}")
                 return False
-            data = await r.read()
-            dest.write_bytes(data)
-            log.info(f"Downloaded {filename} ({len(data)/1024/1024:.1f}MB)")
+            total = int(r.headers.get("Content-Length", 0))
+            log.info(f"Downloading {filename} ({total/1024/1024:.1f}MB)...")
+            with open(dest, "wb") as f:
+                downloaded = 0
+                async for chunk in r.content.iter_chunked(64 * 1024):
+                    f.write(chunk)
+                    downloaded += len(chunk)
+            log.info(f"Downloaded {filename} ({downloaded/1024/1024:.1f}MB)")
             return True
     except Exception as e:
         log.warning(f"Download {filename} failed: {e}")
