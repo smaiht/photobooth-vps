@@ -22,7 +22,7 @@ TG_CHAT = os.environ.get("TG_CHAT_ID", "")
 SESSIONS_DIR = Path("sessions")
 SESSIONS_DIR.mkdir(exist_ok=True)
 POLL_INTERVAL = 10
-PROCESSING_TTL = 300
+PROCESSING_TTL = 600  # 10 min fallback
 THUMB_SIZE = (400, 400)
 
 _processing: dict[str, float] = {}
@@ -147,8 +147,21 @@ async def _tg_send_media_group(session: aiohttp.ClientSession, base: str,
 async def process_zip(session: aiohttp.ClientSession, filename: str):
     log.info(f"Processing {filename}...")
 
-    data = await webdav_download(session, filename)
-    log.info(f"Downloaded {filename} ({len(data) / 1024 / 1024:.1f}MB)")
+    # Download with retries
+    data = None
+    for attempt in range(5):
+        try:
+            data = await webdav_download(session, filename)
+            log.info(f"Downloaded {filename} ({len(data) / 1024 / 1024:.1f}MB)")
+            break
+        except Exception as e:
+            log.warning(f"Download attempt {attempt+1}/5 failed: {e}")
+            await asyncio.sleep(5)
+
+    if not data:
+        log.error(f"Failed to download {filename}")
+        _processing.pop(filename, None)
+        return
 
     await webdav_delete(session, filename)
 
@@ -176,6 +189,8 @@ async def process_zip(session: aiohttp.ClientSession, filename: str):
                 log.warning(f"TG attempt {attempt + 1}/5: {e}")
                 await asyncio.sleep(2)
         log.error(f"TG failed for {session_id}")
+
+    _processing.pop(filename, None)
 
 
 # --- Main ---
