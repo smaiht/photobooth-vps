@@ -77,8 +77,8 @@ async def webdav_download(session: aiohttp.ClientSession, filename: str, dest: P
 
 async def webdav_delete(session: aiohttp.ClientSession, filename: str):
     async with session.delete(f"{WEBDAV_URL}/{filename}",
-                              timeout=aiohttp.ClientTimeout(total=10)):
-        pass
+                              timeout=aiohttp.ClientTimeout(total=10)) as r:
+        log.info(f"Deleted {filename} from cloud ({r.status})")
 
 
 # --- Thumbnails ---
