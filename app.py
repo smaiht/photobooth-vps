@@ -61,7 +61,7 @@ async def webdav_download(session: aiohttp.ClientSession, filename: str, dest: P
     """Download file in chunks to disk. Returns True on success."""
     url = f"{WEBDAV_URL}/{filename}"
     try:
-        async with session.get(url, timeout=aiohttp.ClientTimeout(total=600, sock_read=300)) as r:
+        async with session.get(url, timeout=aiohttp.ClientTimeout(total=600, sock_read=60)) as r:
             if r.status != 200:
                 log.warning(f"Download {filename}: HTTP {r.status}")
                 return False
