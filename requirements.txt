@@ -1,4 +1,3 @@
 aiohttp
 pillow
-requests
 cryptography
