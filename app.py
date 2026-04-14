@@ -22,7 +22,7 @@ TG_TOKEN = os.environ.get("TG_BOT_TOKEN", "")
 TG_CHAT = os.environ.get("TG_CHAT_ID", "")
 SESSIONS_DIR = Path("sessions")
 SESSIONS_DIR.mkdir(exist_ok=True)
-POLL_INTERVAL = 2
+POLL_INTERVAL = 1
 THUMB_SIZE = (400, 400)
 
 BASE = "https://cloud-api.yandex.ru/yadisk_web/v1"
@@ -331,7 +331,6 @@ async def main():
                 log.warning(f"Poll error: {e}")
 
             await asyncio.sleep(POLL_INTERVAL)
-
 
 if __name__ == "__main__":
     asyncio.run(main())
