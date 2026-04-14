@@ -26,7 +26,7 @@ POLL_INTERVAL = 2
 THUMB_SIZE = (400, 400)
 
 BASE = "https://cloud-api.yandex.ru/yadisk_web/v1"
-UPLOAD_NOTES = ["pb2vps_1", "pb2vps_2", "pb2vps_3"]
+UPLOAD_NOTES = ["pb2vps_1", "pb2vps_2", "pb2vps_3", "pb2vps_4", "pb2vps_5", "pb2vps_6"]
 CMD_NOTE = "vps2pb"
 
 HEADERS = {
