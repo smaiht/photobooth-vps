@@ -20,6 +20,7 @@ YANOTES_SESSION_ID = os.environ.get("YANOTES_SESSION_ID", "")
 YANOTES_SECRET = os.environ.get("YANOTES_SECRET", "photobooth")
 TG_TOKEN = os.environ.get("TG_BOT_TOKEN", "")
 TG_CHAT = os.environ.get("TG_CHAT_ID", "")
+TG_ADMIN = os.environ.get("TG_ADMIN_ID", "")
 SESSIONS_DIR = Path("sessions")
 SESSIONS_DIR.mkdir(exist_ok=True)
 POLL_INTERVAL = 1
@@ -204,12 +205,57 @@ async def send_command(s: aiohttp.ClientSession, cmd_note_id: str, cmd: str, dat
     log.info(f"Command '{cmd}' sent OK")
 
 
+# --- Process logs note ---
+
+async def _process_logs(s: aiohttp.ClientSession, note_id: str, title: str):
+    """Extract logs from note, send to TG, clear."""
+    try:
+        content = await _get_note_content(s, note_id)
+        if isinstance(content, list):
+            content = content[0]
+        attrs = content["children"][0]["children"][0].get("attributes", [])
+        payload = None
+        for attr in attrs:
+            if attr[0] == "d" and attr[1]:
+                payload = attr[1]
+                break
+        if not payload:
+            await _clear_note(s, note_id)
+            return
+        text = _decrypt_str(payload)
+        await _clear_note(s, note_id)
+        log.info(f"Logs from {title} ({len(text)//1024}KB), sending to TG")
+
+        if TG_TOKEN and TG_ADMIN:
+            base = f"https://api.telegram.org/bot{TG_TOKEN}"
+            async with aiohttp.ClientSession() as tg:
+                data = aiohttp.FormData()
+                data.add_field("chat_id", TG_ADMIN)
+                data.add_field("document", text.encode("utf-8"),
+                               filename="photobooth.log", content_type="text/plain")
+                async with tg.post(f"{base}/sendDocument", data=data,
+                                   timeout=aiohttp.ClientTimeout(total=30)) as r:
+                    if r.status != 200:
+                        log.warning(f"TG logs send failed: {await r.text()}")
+                    else:
+                        log.info("Logs sent to TG")
+    except Exception as e:
+        log.warning(f"Process logs failed: {e}")
+
+
 # --- Process upload note ---
 
 async def process_note(s: aiohttp.ClientSession, note_id: str, title: str, encrypted_snippet: str):
     try:
-        session_id = _decrypt_str(encrypted_snippet)
-        log.info(f"Processing {title}: session={session_id}")
+        snippet_text = _decrypt_str(encrypted_snippet)
+        log.info(f"Processing {title}: type={snippet_text[:20]}")
+
+        if snippet_text == "logs":
+            await _process_logs(s, note_id, title)
+            return
+
+        # It's a session upload
+        session_id = snippet_text
 
         # Download content
         log.info(f"Fetching content from {title}...")
@@ -267,6 +313,37 @@ async def process_note(s: aiohttp.ClientSession, note_id: str, title: str, encry
             pass
 
 
+# --- Telegram bot commands ---
+
+async def tg_poll_commands(s: aiohttp.ClientSession, note_map: dict):
+    """Poll Telegram for /logs command from admin."""
+    if not TG_TOKEN or not TG_CHAT:
+        return
+    base = f"https://api.telegram.org/bot{TG_TOKEN}"
+    offset = 0
+    async with aiohttp.ClientSession() as tg:
+        while True:
+            try:
+                async with tg.get(f"{base}/getUpdates",
+                                  params={"offset": offset, "timeout": 10},
+                                  timeout=aiohttp.ClientTimeout(total=15)) as r:
+                    data = await r.json()
+                for upd in data.get("result", []):
+                    offset = upd["update_id"] + 1
+                    msg = upd.get("message", {})
+                    if str(msg.get("chat", {}).get("id")) != TG_ADMIN:
+                        continue
+                    text = msg.get("text", "")
+                    if text == "/logs":
+                        cmd_id = note_map.get(CMD_NOTE, {}).get("id")
+                        if cmd_id:
+                            await send_command(s, cmd_id, "send_logs")
+                            log.info("TG: /logs command -> send_logs sent to photobooth")
+            except Exception as e:
+                log.warning(f"TG poll error: {e}")
+                await asyncio.sleep(5)
+
+
 # --- Main ---
 
 async def main():
@@ -304,6 +381,7 @@ async def main():
 
         # Poll loop
         log.info(f"Polling every {POLL_INTERVAL}s...")
+        asyncio.create_task(tg_poll_commands(s, note_map))
         while True:
             try:
                 deltas = await _get_deltas(s, revision)
