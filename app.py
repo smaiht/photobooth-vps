@@ -355,12 +355,18 @@ async def tg_poll_commands(s: aiohttp.ClientSession, note_map: dict):
                         cmd_id = note_map.get(CMD_NOTE, {}).get("id")
                         if cmd_id:
                             await send_command(s, cmd_id, "send_logs")
-                            log.info("TG: /logs command -> send_logs sent to photobooth")
+                            log.info("TG: /logs -> send_logs")
                     elif text == "/clear_logs":
                         cmd_id = note_map.get(CMD_NOTE, {}).get("id")
                         if cmd_id:
                             await send_command(s, cmd_id, "clear_logs")
-                            log.info("TG: /clear_logs command -> clear_logs sent to photobooth")
+                            log.info("TG: /clear_logs -> clear_logs")
+                    elif text == "/restart":
+                        cmd_id = note_map.get(CMD_NOTE, {}).get("id")
+                        if cmd_id:
+                            await send_command(s, cmd_id, "restart")
+                            await _tg_admin_msg("Рестарт отправлен")
+                            log.info("TG: /restart -> restart")
             except Exception as e:
                 log.warning(f"TG poll error: {e}")
                 await asyncio.sleep(5)
