@@ -195,6 +195,17 @@ async def _tg_send(session, base, media, files):
             raise RuntimeError(f"TG {r.status}: {await r.text()}")
 
 
+async def _tg_admin_msg(text: str):
+    if not TG_TOKEN or not TG_ADMIN:
+        return
+    base = f"https://api.telegram.org/bot{TG_TOKEN}"
+    async with aiohttp.ClientSession() as tg:
+        async with tg.post(f"{base}/sendMessage",
+                           json={"chat_id": TG_ADMIN, "text": text}) as r:
+            if r.status != 200:
+                log.warning(f"TG admin msg failed: {await r.text()}")
+
+
 # --- Send command to photobooth ---
 
 async def send_command(s: aiohttp.ClientSession, cmd_note_id: str, cmd: str, data: str | None = None):
@@ -252,6 +263,12 @@ async def process_note(s: aiohttp.ClientSession, note_id: str, title: str, encry
 
         if snippet_text == "logs":
             await _process_logs(s, note_id, title)
+            return
+
+        if snippet_text == "clear_logs":
+            await _clear_note(s, note_id)
+            await _tg_admin_msg("Логи очищены")
+            log.info(f"clear_logs confirmed from {title}")
             return
 
         # It's a session upload
@@ -339,6 +356,11 @@ async def tg_poll_commands(s: aiohttp.ClientSession, note_map: dict):
                         if cmd_id:
                             await send_command(s, cmd_id, "send_logs")
                             log.info("TG: /logs command -> send_logs sent to photobooth")
+                    elif text == "/clear_logs":
+                        cmd_id = note_map.get(CMD_NOTE, {}).get("id")
+                        if cmd_id:
+                            await send_command(s, cmd_id, "clear_logs")
+                            log.info("TG: /clear_logs command -> clear_logs sent to photobooth")
             except Exception as e:
                 log.warning(f"TG poll error: {e}")
                 await asyncio.sleep(5)
