@@ -356,6 +356,12 @@ async def tg_poll_commands(s: aiohttp.ClientSession, note_map: dict):
                         if cmd_id:
                             await send_command(s, cmd_id, "send_logs")
                             log.info("TG: /logs -> send_logs")
+                    elif text == "/run":
+                        cmd_id = note_map.get(CMD_NOTE, {}).get("id")
+                        if cmd_id:
+                            await send_command(s, cmd_id, "run")
+                            await _tg_admin_msg("Запуск сессии отправлен")
+                            log.info("TG: /run -> run")
                     elif text == "/clear_logs":
                         cmd_id = note_map.get(CMD_NOTE, {}).get("id")
                         if cmd_id:
