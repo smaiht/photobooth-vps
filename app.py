@@ -437,11 +437,16 @@ async def tg_poll_commands(s: aiohttp.ClientSession, note_map: dict):
         return
     base = f"https://api.telegram.org/bot{TG_TOKEN}"
     offset = 0
+    allowed_updates = json.dumps(["message", "callback_query"])
     async with aiohttp.ClientSession() as tg:
         while True:
             try:
                 async with tg.get(f"{base}/getUpdates",
-                                  params={"offset": offset, "timeout": 10},
+                                  params={
+                                      "offset": offset,
+                                      "timeout": 10,
+                                      "allowed_updates": allowed_updates,
+                                  },
                                   timeout=aiohttp.ClientTimeout(total=15)) as r:
                     data = await r.json()
                 for upd in data.get("result", []):
@@ -451,8 +456,9 @@ async def tg_poll_commands(s: aiohttp.ClientSession, note_map: dict):
                         user_id = msg.get("from", {}).get("id")
                         if not is_admin(user_id):
                             continue
+                        chat_id = msg.get("chat", {}).get("id", user_id)
                         await _tg_handle_admin_command(
-                            s, tg, base, note_map, user_id, msg.get("text", "")
+                            s, tg, base, note_map, chat_id, msg.get("text", "")
                         )
                         continue
 
@@ -462,8 +468,9 @@ async def tg_poll_commands(s: aiohttp.ClientSession, note_map: dict):
                         if not is_admin(user_id):
                             continue
                         await _tg_answer_callback(tg, base, callback.get("id"))
+                        chat_id = callback.get("message", {}).get("chat", {}).get("id", user_id)
                         await _tg_handle_admin_command(
-                            s, tg, base, note_map, user_id, callback.get("data", "")
+                            s, tg, base, note_map, chat_id, callback.get("data", "")
                         )
             except Exception as e:
                 log.warning(f"TG poll error: {e}")
