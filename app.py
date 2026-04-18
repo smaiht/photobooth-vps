@@ -441,17 +441,7 @@ async def _tg_handle_admin_command(notes_session: aiohttp.ClientSession,
         return
 
     pb_cmd = command
-    cmd_id = note_map.get(CMD_NOTE, {}).get("id")
-    if not cmd_id:
-        await _tg_send_text(
-            tg,
-            base,
-            chat_id,
-            "Командная заметка vps2pb не найдена. Проверь, что фотобудка создала notes.",
-            reply_markup=TG_COMMAND_KEYBOARD,
-        )
-        return
-
+    cmd_id = note_map[CMD_NOTE]["id"]
     await send_command(notes_session, cmd_id, pb_cmd)
     await _tg_send_text(tg, base, chat_id, f"{pb_cmd} -> отправлено")
     log.info(f"TG: {text} -> {pb_cmd}")
