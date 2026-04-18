@@ -25,6 +25,18 @@ SESSIONS_DIR = Path("sessions")
 SESSIONS_DIR.mkdir(exist_ok=True)
 POLL_INTERVAL = 1
 THUMB_SIZE = (400, 400)
+TG_COMMANDS = {
+    "/run": ("run", "Запуск сессии отправлен"),
+    "/logs": ("send_logs", "Запрос логов отправлен"),
+    "/clear_logs": ("clear_logs", "Очистка логов отправлена"),
+    "/restart": ("restart", "Рестарт отправлен"),
+}
+TG_COMMAND_KEYBOARD = {
+    "inline_keyboard": [
+        [{"text": text, "callback_data": text}]
+        for text in TG_COMMANDS
+    ],
+}
 
 BASE = "https://cloud-api.yandex.ru/yadisk_web/v1"
 UPLOAD_NOTES = ["pb2vps_1", "pb2vps_2", "pb2vps_3", "pb2vps_4", "pb2vps_5", "pb2vps_6"]
@@ -66,6 +78,34 @@ async def _list_notes(s: aiohttp.ClientSession) -> list[dict]:
     if isinstance(notes, dict):
         notes = notes.get("items", notes.get("notes", []))
     return [n for n in notes if 1 not in n.get("tags", [])]
+
+
+async def _create_note(s: aiohttp.ClientSession, title: str) -> str:
+    async with s.post(f"{BASE}/notes/notes",
+                      json={"title": title, "snippet": "", "tags": []},
+                      timeout=aiohttp.ClientTimeout(total=15)) as r:
+        r.raise_for_status()
+        obj = await r.json()
+    if isinstance(obj, list):
+        obj = obj[0]
+    return obj.get("id") or obj.get("newNoteId") or obj.get("noteId")
+
+
+async def _find_or_create_notes(s: aiohttp.ClientSession, titles: list[str]) -> dict:
+    notes = await _list_notes(s)
+    note_map = {}
+    for n in notes:
+        title = n.get("title", "")
+        if title in titles:
+            note_map[title] = {"id": n["id"], "snippet": n.get("snippet", "")}
+
+    for title in titles:
+        if title not in note_map:
+            note_id = await _create_note(s, title)
+            note_map[title] = {"id": note_id, "snippet": ""}
+            log.info(f"Created note '{title}': {note_id}")
+
+    return note_map
 
 
 async def _get_note_content(s: aiohttp.ClientSession, note_id: str) -> dict:
@@ -195,15 +235,22 @@ async def _tg_send(session, base, media, files):
             raise RuntimeError(f"TG {r.status}: {await r.text()}")
 
 
-async def _tg_admin_msg(text: str):
+async def _tg_send_text(session: aiohttp.ClientSession, base: str, chat_id: str | int,
+                        text: str, reply_markup: dict | None = None):
+    payload = {"chat_id": chat_id, "text": text}
+    if reply_markup:
+        payload["reply_markup"] = reply_markup
+    async with session.post(f"{base}/sendMessage", json=payload) as r:
+        if r.status != 200:
+            log.warning(f"TG sendMessage failed: {await r.text()}")
+
+
+async def _tg_admin_msg(text: str, reply_markup: dict | None = None):
     if not TG_TOKEN or not TG_ADMIN:
         return
     base = f"https://api.telegram.org/bot{TG_TOKEN}"
     async with aiohttp.ClientSession() as tg:
-        async with tg.post(f"{base}/sendMessage",
-                           json={"chat_id": TG_ADMIN, "text": text}) as r:
-            if r.status != 200:
-                log.warning(f"TG admin msg failed: {await r.text()}")
+        await _tg_send_text(tg, base, TG_ADMIN, text, reply_markup=reply_markup)
 
 
 # --- Send command to photobooth ---
@@ -332,9 +379,61 @@ async def process_note(s: aiohttp.ClientSession, note_id: str, title: str, encry
 
 # --- Telegram bot commands ---
 
+def is_admin(user_id) -> bool:
+    return bool(TG_ADMIN and user_id is not None and str(user_id) == TG_ADMIN)
+
+
+async def _tg_show_keyboard(tg: aiohttp.ClientSession, base: str, chat_id: str | int):
+    await _tg_send_text(
+        tg,
+        base,
+        chat_id,
+        "Не понял команду. Выбери действие кнопкой:",
+        reply_markup=TG_COMMAND_KEYBOARD,
+    )
+
+
+async def _tg_answer_callback(tg: aiohttp.ClientSession, base: str, callback_id: str | None):
+    if not callback_id:
+        return
+    async with tg.post(f"{base}/answerCallbackQuery",
+                       json={"callback_query_id": callback_id}) as r:
+        if r.status != 200:
+            log.warning(f"TG answerCallbackQuery failed: {await r.text()}")
+
+
+async def _tg_handle_admin_command(notes_session: aiohttp.ClientSession,
+                                   tg: aiohttp.ClientSession,
+                                   base: str,
+                                   note_map: dict,
+                                   chat_id: str | int,
+                                   text: str):
+    text = (text or "").strip()
+    command = TG_COMMANDS.get(text)
+    if not command:
+        await _tg_show_keyboard(tg, base, chat_id)
+        return
+
+    pb_cmd, ok_text = command
+    cmd_id = note_map.get(CMD_NOTE, {}).get("id")
+    if not cmd_id:
+        await _tg_send_text(
+            tg,
+            base,
+            chat_id,
+            "Командная заметка vps2pb не найдена. Проверь, что фотобудка создала notes.",
+            reply_markup=TG_COMMAND_KEYBOARD,
+        )
+        return
+
+    await send_command(notes_session, cmd_id, pb_cmd)
+    await _tg_send_text(tg, base, chat_id, ok_text)
+    log.info(f"TG: {text} -> {pb_cmd}")
+
+
 async def tg_poll_commands(s: aiohttp.ClientSession, note_map: dict):
-    """Poll Telegram for /logs command from admin."""
-    if not TG_TOKEN or not TG_CHAT:
+    """Poll Telegram admin commands without aiogram/middleware."""
+    if not TG_TOKEN or not TG_ADMIN:
         return
     base = f"https://api.telegram.org/bot{TG_TOKEN}"
     offset = 0
@@ -347,32 +446,25 @@ async def tg_poll_commands(s: aiohttp.ClientSession, note_map: dict):
                     data = await r.json()
                 for upd in data.get("result", []):
                     offset = upd["update_id"] + 1
-                    msg = upd.get("message", {})
-                    if str(msg.get("chat", {}).get("id")) != TG_ADMIN:
+                    msg = upd.get("message")
+                    if msg:
+                        user_id = msg.get("from", {}).get("id")
+                        if not is_admin(user_id):
+                            continue
+                        await _tg_handle_admin_command(
+                            s, tg, base, note_map, user_id, msg.get("text", "")
+                        )
                         continue
-                    text = msg.get("text", "")
-                    if text == "/logs":
-                        cmd_id = note_map.get(CMD_NOTE, {}).get("id")
-                        if cmd_id:
-                            await send_command(s, cmd_id, "send_logs")
-                            log.info("TG: /logs -> send_logs")
-                    elif text == "/run":
-                        cmd_id = note_map.get(CMD_NOTE, {}).get("id")
-                        if cmd_id:
-                            await send_command(s, cmd_id, "run")
-                            await _tg_admin_msg("Запуск сессии отправлен")
-                            log.info("TG: /run -> run")
-                    elif text == "/clear_logs":
-                        cmd_id = note_map.get(CMD_NOTE, {}).get("id")
-                        if cmd_id:
-                            await send_command(s, cmd_id, "clear_logs")
-                            log.info("TG: /clear_logs -> clear_logs")
-                    elif text == "/restart":
-                        cmd_id = note_map.get(CMD_NOTE, {}).get("id")
-                        if cmd_id:
-                            await send_command(s, cmd_id, "restart")
-                            await _tg_admin_msg("Рестарт отправлен")
-                            log.info("TG: /restart -> restart")
+
+                    callback = upd.get("callback_query")
+                    if callback:
+                        user_id = callback.get("from", {}).get("id")
+                        if not is_admin(user_id):
+                            continue
+                        await _tg_answer_callback(tg, base, callback.get("id"))
+                        await _tg_handle_admin_command(
+                            s, tg, base, note_map, user_id, callback.get("data", "")
+                        )
             except Exception as e:
                 log.warning(f"TG poll error: {e}")
                 await asyncio.sleep(5)
@@ -385,21 +477,11 @@ async def main():
     cookies = {"Session_id": YANOTES_SESSION_ID}
 
     async with aiohttp.ClientSession(headers=HEADERS, cookies=cookies) as s:
-        # Find notes
-        log.info("Listing notes...")
-        notes = await _list_notes(s)
-        note_map = {}
-        for n in notes:
-            t = n.get("title", "")
-            if t in UPLOAD_NOTES or t == CMD_NOTE:
-                note_map[t] = {"id": n["id"], "snippet": n.get("snippet", "")}
-                status = "OCCUPIED" if n.get("snippet") else "FREE"
-                log.info(f"  {t}: {n['id']} [{status}]")
-
-        missing = [t for t in UPLOAD_NOTES if t not in note_map]
-        if missing:
-            log.error(f"Missing notes: {missing}. Run photobooth first to create them.")
-            return
+        log.info("Finding/creating notes...")
+        note_map = await _find_or_create_notes(s, UPLOAD_NOTES + [CMD_NOTE])
+        for title, info in note_map.items():
+            status = "OCCUPIED" if info["snippet"] else "FREE"
+            log.info(f"  {title}: {info['id']} [{status}]")
 
         log.info(f"Watching {len(note_map)} notes, TG chat: {TG_CHAT}")
 
