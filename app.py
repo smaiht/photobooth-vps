@@ -7,6 +7,7 @@ import hashlib
 import json
 import logging
 import os
+import tempfile
 import zipfile
 from pathlib import Path
 from PIL import Image
@@ -16,13 +17,26 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(mess
 log = logging.getLogger(__name__)
 
 # --- Config ---
+
+CONFIG_PATH = Path(os.environ.get("VPS_CONFIG", "config_vps.json"))
+
+
+def _load_config() -> dict:
+    if not CONFIG_PATH.exists():
+        return {}
+    return json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
+
+
+CONFIG = _load_config()
 YANOTES_SESSION_ID = os.environ.get("YANOTES_SESSION_ID", "")
 YANOTES_SECRET = os.environ.get("YANOTES_SECRET", "photobooth")
 TG_TOKEN = os.environ.get("TG_BOT_TOKEN", "")
 TG_CHAT = os.environ.get("TG_CHAT_ID", "")
 TG_ADMIN = os.environ.get("TG_ADMIN_ID", "")
-SESSIONS_DIR = Path("sessions")
-SESSIONS_DIR.mkdir(exist_ok=True)
+SAVE_SESSIONS = bool(CONFIG.get("save_sessions", False))
+SESSIONS_DIR = Path(CONFIG.get("sessions_dir", "sessions"))
+if SAVE_SESSIONS:
+    SESSIONS_DIR.mkdir(exist_ok=True)
 POLL_INTERVAL = 1
 THUMB_SIZE = (400, 400)
 TG_COMMANDS = {
@@ -174,8 +188,7 @@ def generate_thumbnails(session_dir: Path):
     log.info(f"Thumbnails + files.json: {session_dir.name}")
 
 
-def process_zip_data(zip_data: bytes, session_id: str) -> Path:
-    session_dir = SESSIONS_DIR / session_id
+def process_zip_data(zip_data: bytes, session_id: str, session_dir: Path, save_for_web: bool) -> Path:
     session_dir.mkdir(exist_ok=True)
     zip_path = session_dir / f"{session_id}.zip"
     zip_path.write_bytes(zip_data)
@@ -187,7 +200,8 @@ def process_zip_data(zip_data: bytes, session_id: str) -> Path:
     zip_path.unlink()
     log.info(f"Unpacked {session_id}")
 
-    generate_thumbnails(session_dir)
+    if save_for_web:
+        generate_thumbnails(session_dir)
     return session_dir
 
 
@@ -304,6 +318,7 @@ async def _process_logs(s: aiohttp.ClientSession, note_id: str, title: str):
 # --- Process upload note ---
 
 async def process_note(s: aiohttp.ClientSession, note_id: str, title: str, encrypted_snippet: str):
+    tmp_session = None
     try:
         snippet_text = _decrypt_str(encrypted_snippet)
         log.info(f"Processing {title}: type={snippet_text[:20]}")
@@ -348,9 +363,16 @@ async def process_note(s: aiohttp.ClientSession, note_id: str, title: str, encry
         zip_data = _decrypt(payload)
         log.info(f"Decrypted: {len(zip_data)/1048576:.1f}MB")
 
+        if SAVE_SESSIONS:
+            target_dir = SESSIONS_DIR / session_id
+        else:
+            tmp_session = tempfile.TemporaryDirectory(prefix=f"photobooth_{session_id}_")
+            target_dir = Path(tmp_session.name) / session_id
+            log.info("Session archive disabled: using temporary unpack dir")
+
         # Unpack (CPU-bound)
         session_dir = await asyncio.get_event_loop().run_in_executor(
-            None, process_zip_data, zip_data, session_id)
+            None, process_zip_data, zip_data, session_id, target_dir, SAVE_SESSIONS)
 
         # Clear note
         log.info(f"Clearing {title}...")
@@ -375,6 +397,10 @@ async def process_note(s: aiohttp.ClientSession, note_id: str, title: str, encry
             log.info(f"Cleared {title} after error")
         except Exception:
             pass
+    finally:
+        if tmp_session:
+            tmp_session.cleanup()
+            log.info(f"Temporary session files removed for {title}")
 
 
 # --- Telegram bot commands ---
@@ -481,6 +507,7 @@ async def tg_poll_commands(s: aiohttp.ClientSession, note_map: dict):
 
 async def main():
     log.info("Starting VPS service...")
+    log.info(f"Config: save_sessions={SAVE_SESSIONS}, sessions_dir={SESSIONS_DIR}")
     cookies = {"Session_id": YANOTES_SESSION_ID}
 
     async with aiohttp.ClientSession(headers=HEADERS, cookies=cookies) as s:

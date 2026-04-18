@@ -1,0 +1,6 @@
+{
+    "_comment": "VPS runtime settings. Secrets stay in .env.",
+    "save_sessions": false,
+    "_save_sessions_comment": "false = do not keep sessions on VPS for the removed web gallery; unpack temporarily, send to Telegram, then delete. true = keep sessions_dir with photos/video/thumbs/files.json for web.",
+    "sessions_dir": "sessions"
+}
