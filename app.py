@@ -40,10 +40,10 @@ if SAVE_SESSIONS:
 POLL_INTERVAL = 1
 THUMB_SIZE = (400, 400)
 TG_COMMANDS = {
-    "/run": ("run", "Запуск сессии отправлен"),
-    "/logs": ("send_logs", "Запрос логов отправлен"),
-    "/clear_logs": ("clear_logs", "Очистка логов отправлена"),
-    "/restart": ("restart", "Рестарт отправлен"),
+    "/run": "run",
+    "/logs": "send_logs",
+    "/clear_logs": "clear_logs",
+    "/restart": "restart",
 }
 TG_COMMAND_KEYBOARD = {
     "inline_keyboard": [
@@ -440,7 +440,7 @@ async def _tg_handle_admin_command(notes_session: aiohttp.ClientSession,
         await _tg_show_keyboard(tg, base, chat_id)
         return
 
-    pb_cmd, ok_text = command
+    pb_cmd = command
     cmd_id = note_map.get(CMD_NOTE, {}).get("id")
     if not cmd_id:
         await _tg_send_text(
@@ -453,7 +453,7 @@ async def _tg_handle_admin_command(notes_session: aiohttp.ClientSession,
         return
 
     await send_command(notes_session, cmd_id, pb_cmd)
-    await _tg_send_text(tg, base, chat_id, ok_text)
+    await _tg_send_text(tg, base, chat_id, f"{pb_cmd} -> отправлено")
     log.info(f"TG: {text} -> {pb_cmd}")
 
 
