@@ -4,6 +4,7 @@ import asyncio
 import base64
 import datetime
 import hashlib
+import io
 import json
 import logging
 import os
@@ -46,6 +47,7 @@ TG_COMMANDS = {
     "/clear_logs": "clear_logs",
     "/restart": "restart",
     "/update": "update",
+    "/update_small": "update_small",
 }
 TG_COMMAND_KEYBOARD = {
     "inline_keyboard": [
@@ -431,8 +433,8 @@ async def _tg_answer_callback(tg: aiohttp.ClientSession, base: str, callback_id:
             log.warning(f"TG answerCallbackQuery failed: {await r.text()}")
 
 
-async def _do_update(s: aiohttp.ClientSession, note_map: dict) -> str:
-    """Download GitHub release ZIP, encrypt, put in pb_update note. Returns status message."""
+async def _do_update(s: aiohttp.ClientSession, note_map: dict, small: bool = False) -> str:
+    """Download GitHub release ZIP, encrypt, put in pb_update note."""
     if not GITHUB_RELEASE_URL:
         return "❌ GITHUB_RELEASE_URL не задан в .env"
 
@@ -445,8 +447,20 @@ async def _do_update(s: aiohttp.ClientSession, note_map: dict) -> str:
             if r.status != 200:
                 return f"❌ GitHub вернул {r.status}"
             zip_data = await r.read()
-    size_mb = len(zip_data) / 1048576
-    log.info(f"Downloaded {size_mb:.1f} MB")
+    log.info(f"Downloaded {len(zip_data)/1048576:.1f} MB")
+
+    # Repack without heavy dirs for small update
+    if small:
+        skip = ("python/", "bin/", "EDSDK_Win/", ".git/")
+        buf = io.BytesIO()
+        with zipfile.ZipFile(io.BytesIO(zip_data)) as src, \
+             zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as dst:
+            for item in src.namelist():
+                if any(item.startswith(s) or item.replace("\\", "/").startswith(s) for s in skip):
+                    continue
+                dst.writestr(item, src.read(item))
+        zip_data = buf.getvalue()
+        log.info(f"Repacked (code only): {len(zip_data)/1048576:.1f} MB")
 
     # Hash
     zip_hash = hashlib.sha256(zip_data).hexdigest()[:16]
@@ -469,7 +483,10 @@ async def _do_update(s: aiohttp.ClientSession, note_map: dict) -> str:
     log.info(f"Putting {len(encrypted_data)/1048576:.1f} MB in note...")
     await _put_note_content(s, update_id, encrypted_data, encrypted_hash)
     note_map[UPDATE_NOTE]["snippet"] = encrypted_hash
-    return f"✅ Обновление загружено ({size_mb:.1f} MB, {zip_hash})"
+    note_mb = len(encrypted_data) / 1048576
+    size_mb = len(zip_data) / 1048576
+    label = "код" if small else "полный"
+    return f"✅ Обновление загружено ({label})\nZIP: {size_mb:.1f} MB → заметка: {note_mb:.1f} MB\nХеш: {zip_hash}"
 
 
 async def _tg_handle_admin_command(notes_session: aiohttp.ClientSession,
@@ -485,10 +502,12 @@ async def _tg_handle_admin_command(notes_session: aiohttp.ClientSession,
         return
 
     # /update runs on VPS, not sent to photobooth
-    if command == "update":
-        await _tg_send_text(tg, base, chat_id, "⏳ Скачиваю релиз...")
+    if command in ("update", "update_small"):
+        small = command == "update_small"
+        label = "код" if small else "полный релиз"
+        await _tg_send_text(tg, base, chat_id, f"⏳ Скачиваю {label}...")
         try:
-            result = await _do_update(notes_session, note_map)
+            result = await _do_update(notes_session, note_map, small=small)
         except Exception as e:
             result = f"❌ Ошибка: {e}"
         await _tg_send_text(tg, base, chat_id, result)
