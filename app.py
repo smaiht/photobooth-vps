@@ -33,6 +33,7 @@ YANOTES_SECRET = os.environ.get("YANOTES_SECRET", "photobooth")
 TG_TOKEN = os.environ.get("TG_BOT_TOKEN", "")
 TG_CHAT = os.environ.get("TG_CHAT_ID", "")
 TG_ADMIN = os.environ.get("TG_ADMIN_ID", "")
+GITHUB_RELEASE_URL = os.environ.get("GITHUB_RELEASE_URL", "")
 SAVE_SESSIONS = bool(CONFIG.get("save_sessions", False))
 SESSIONS_DIR = Path(CONFIG.get("sessions_dir", "sessions"))
 if SAVE_SESSIONS:
@@ -44,6 +45,7 @@ TG_COMMANDS = {
     "/logs": "send_logs",
     "/clear_logs": "clear_logs",
     "/restart": "restart",
+    "/update": "update",
 }
 TG_COMMAND_KEYBOARD = {
     "inline_keyboard": [
@@ -55,6 +57,7 @@ TG_COMMAND_KEYBOARD = {
 BASE = "https://cloud-api.yandex.ru/yadisk_web/v1"
 UPLOAD_NOTES = ["pb2vps_1", "pb2vps_2", "pb2vps_3", "pb2vps_4", "pb2vps_5", "pb2vps_6"]
 CMD_NOTE = "vps2pb"
+UPDATE_NOTE = "pb_update"
 
 HEADERS = {
     "User-Agent": "Mozilla/5.0",
@@ -428,6 +431,47 @@ async def _tg_answer_callback(tg: aiohttp.ClientSession, base: str, callback_id:
             log.warning(f"TG answerCallbackQuery failed: {await r.text()}")
 
 
+async def _do_update(s: aiohttp.ClientSession, note_map: dict) -> str:
+    """Download GitHub release ZIP, encrypt, put in pb_update note. Returns status message."""
+    if not GITHUB_RELEASE_URL:
+        return "❌ GITHUB_RELEASE_URL не задан в .env"
+
+    update_id = note_map[UPDATE_NOTE]["id"]
+
+    # Download release ZIP
+    log.info(f"Downloading release from {GITHUB_RELEASE_URL}...")
+    async with aiohttp.ClientSession() as dl:
+        async with dl.get(GITHUB_RELEASE_URL, timeout=aiohttp.ClientTimeout(total=300)) as r:
+            if r.status != 200:
+                return f"❌ GitHub вернул {r.status}"
+            zip_data = await r.read()
+    size_mb = len(zip_data) / 1048576
+    log.info(f"Downloaded {size_mb:.1f} MB")
+
+    # Hash
+    zip_hash = hashlib.sha256(zip_data).hexdigest()[:16]
+    log.info(f"Hash: {zip_hash}")
+
+    # Check if same version already in note
+    current_snippet = note_map[UPDATE_NOTE].get("snippet", "")
+    if current_snippet:
+        try:
+            current_hash = _decrypt_str(current_snippet)
+            if current_hash == zip_hash:
+                return f"✅ Уже актуальная версия ({zip_hash})"
+        except Exception:
+            pass
+
+    # Encrypt and put in note
+    log.info("Encrypting...")
+    encrypted_data = _encrypt_str(base64.b64encode(zip_data).decode("ascii"))
+    encrypted_hash = _encrypt_str(zip_hash)
+    log.info(f"Putting {len(encrypted_data)/1048576:.1f} MB in note...")
+    await _put_note_content(s, update_id, encrypted_data, encrypted_hash)
+    note_map[UPDATE_NOTE]["snippet"] = encrypted_hash
+    return f"✅ Обновление загружено ({size_mb:.1f} MB, {zip_hash})"
+
+
 async def _tg_handle_admin_command(notes_session: aiohttp.ClientSession,
                                    tg: aiohttp.ClientSession,
                                    base: str,
@@ -438,6 +482,16 @@ async def _tg_handle_admin_command(notes_session: aiohttp.ClientSession,
     command = TG_COMMANDS.get(text)
     if not command:
         await _tg_show_keyboard(tg, base, chat_id)
+        return
+
+    # /update runs on VPS, not sent to photobooth
+    if command == "update":
+        await _tg_send_text(tg, base, chat_id, "⏳ Скачиваю релиз...")
+        try:
+            result = await _do_update(notes_session, note_map)
+        except Exception as e:
+            result = f"❌ Ошибка: {e}"
+        await _tg_send_text(tg, base, chat_id, result)
         return
 
     pb_cmd = command
@@ -502,7 +556,7 @@ async def main():
 
     async with aiohttp.ClientSession(headers=HEADERS, cookies=cookies) as s:
         log.info("Finding/creating notes...")
-        note_map = await _find_or_create_notes(s, UPLOAD_NOTES + [CMD_NOTE])
+        note_map = await _find_or_create_notes(s, UPLOAD_NOTES + [CMD_NOTE, UPDATE_NOTE])
         for title, info in note_map.items():
             status = "OCCUPIED" if info["snippet"] else "FREE"
             log.info(f"  {title}: {info['id']} [{status}]")
