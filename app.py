@@ -35,6 +35,7 @@ TG_TOKEN = os.environ.get("TG_BOT_TOKEN", "")
 TG_CHAT = os.environ.get("TG_CHAT_ID", "")
 TG_ADMIN = os.environ.get("TG_ADMIN_ID", "")
 GITHUB_RELEASE_URL = os.environ.get("GITHUB_RELEASE_URL", "")
+GITHUB_REPO_ZIP_URL = os.environ.get("GITHUB_REPO_ZIP_URL", "")
 SAVE_SESSIONS = bool(CONFIG.get("save_sessions", False))
 SESSIONS_DIR = Path(CONFIG.get("sessions_dir", "sessions"))
 if SAVE_SESSIONS:
@@ -434,31 +435,43 @@ async def _tg_answer_callback(tg: aiohttp.ClientSession, base: str, callback_id:
 
 
 async def _do_update(s: aiohttp.ClientSession, note_map: dict, small: bool = False) -> str:
-    """Download GitHub release ZIP, encrypt, put in pb_update note."""
-    if not GITHUB_RELEASE_URL:
-        return "❌ GITHUB_RELEASE_URL не задан в .env"
-
+    """Download update, encrypt, put in pb_update note."""
     update_id = note_map[UPDATE_NOTE]["id"]
 
-    # Download release ZIP
-    log.info(f"Downloading release from {GITHUB_RELEASE_URL}...")
+    if small:
+        url = GITHUB_REPO_ZIP_URL
+        if not url:
+            return "❌ GITHUB_REPO_ZIP_URL не задан в .env"
+    else:
+        url = GITHUB_RELEASE_URL
+        if not url:
+            return "❌ GITHUB_RELEASE_URL не задан в .env"
+
+    # Download
+    log.info(f"Downloading from {url}...")
     async with aiohttp.ClientSession() as dl:
-        async with dl.get(GITHUB_RELEASE_URL, timeout=aiohttp.ClientTimeout(total=300)) as r:
+        async with dl.get(url, timeout=aiohttp.ClientTimeout(total=300)) as r:
             if r.status != 200:
                 return f"❌ GitHub вернул {r.status}"
             zip_data = await r.read()
     log.info(f"Downloaded {len(zip_data)/1048576:.1f} MB")
 
-    # Repack without heavy dirs for small update
+    # Small: repack without heavy dirs, flatten root folder
     if small:
         skip = ("python/", "bin/", "EDSDK_Win/", ".git/")
         buf = io.BytesIO()
         with zipfile.ZipFile(io.BytesIO(zip_data)) as src, \
              zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as dst:
-            for item in src.namelist():
-                if any(item.startswith(s) or item.replace("\\", "/").startswith(s) for s in skip):
+            # GitHub archive has root folder like "photobooth-main/"
+            prefix = ""
+            names = src.namelist()
+            if names and names[0].endswith("/"):
+                prefix = names[0]
+            for item in names:
+                rel = item[len(prefix):] if prefix else item
+                if not rel or any(rel.startswith(s) for s in skip):
                     continue
-                dst.writestr(item, src.read(item))
+                dst.writestr(rel, src.read(item))
         zip_data = buf.getvalue()
         log.info(f"Repacked (code only): {len(zip_data)/1048576:.1f} MB")
 
