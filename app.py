@@ -130,7 +130,7 @@ async def _find_or_create_notes(s: aiohttp.ClientSession, titles: list[str]) -> 
 
 async def _get_note_content(s: aiohttp.ClientSession, note_id: str) -> dict:
     async with s.get(f"{BASE}/notes/notes/{note_id}/content",
-                     timeout=aiohttp.ClientTimeout(total=120)) as r:
+                     timeout=aiohttp.ClientTimeout(total=600)) as r:
         r.raise_for_status()
         return await r.json()
 
@@ -152,7 +152,7 @@ async def _put_note_content(s: aiohttp.ClientSession, note_id: str, payload: str
     }
     async with s.put(f"{BASE}/notes/notes/{note_id}/content_with_meta",
                      headers=headers, data=json.dumps(body),
-                     timeout=aiohttp.ClientTimeout(total=120)) as r:
+                     timeout=aiohttp.ClientTimeout(total=600)) as r:
         r.raise_for_status()
 
 
