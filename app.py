@@ -60,7 +60,6 @@ TG_COMMAND_KEYBOARD = {
 BASE = "https://cloud-api.yandex.ru/yadisk_web/v1"
 UPLOAD_NOTES = ["pb2vps_1", "pb2vps_2", "pb2vps_3", "pb2vps_4", "pb2vps_5", "pb2vps_6"]
 CMD_NOTE = "vps2pb"
-UPDATE_NOTE = "pb_update"
 
 HEADERS = {
     "User-Agent": "Mozilla/5.0",
@@ -434,10 +433,8 @@ async def _tg_answer_callback(tg: aiohttp.ClientSession, base: str, callback_id:
             log.warning(f"TG answerCallbackQuery failed: {await r.text()}")
 
 
-async def _do_update(s: aiohttp.ClientSession, note_map: dict, small: bool = False) -> str:
-    """Download update, encrypt, put in pb_update note."""
-    update_id = note_map[UPDATE_NOTE]["id"]
-
+async def _do_update(small: bool = False) -> str:
+    """Download the existing full/small package and publish it to Disk."""
     if small:
         url = GITHUB_REPO_ZIP_URL
         if not url:
@@ -475,31 +472,14 @@ async def _do_update(s: aiohttp.ClientSession, note_map: dict, small: bool = Fal
         zip_data = buf.getvalue()
         log.info(f"Repacked (code only): {len(zip_data)/1048576:.1f} MB")
 
-    # Hash
-    zip_hash = hashlib.sha256(zip_data).hexdigest()[:16]
-    log.info(f"Hash: {zip_hash}")
-
-    # Check if same version already in note
-    current_snippet = note_map[UPDATE_NOTE].get("snippet", "")
-    if current_snippet:
-        try:
-            current_hash = _decrypt_str(current_snippet)
-            if current_hash == zip_hash:
-                return f"✅ Уже актуальная версия ({zip_hash})"
-        except Exception:
-            pass
-
-    # Encrypt and put in note
-    log.info("Encrypting...")
-    encrypted_data = _encrypt_str(base64.b64encode(zip_data).decode("ascii"))
-    encrypted_hash = _encrypt_str(zip_hash)
-    log.info(f"Putting {len(encrypted_data)/1048576:.1f} MB in note...")
-    await _put_note_content(s, update_id, encrypted_data, encrypted_hash)
-    note_map[UPDATE_NOTE]["snippet"] = encrypted_hash
-    note_mb = len(encrypted_data) / 1048576
+    import yadisk_updates
+    kind = "small" if small else "full"
+    updates_folder = CONFIG.get("yadisk_updates_folder", "photobooth_system/updates")
+    status = await yadisk_updates.publish_update(
+        zip_data, kind, updates_folder, source_url=url)
     size_mb = len(zip_data) / 1048576
-    label = "код" if small else "полный"
-    return f"✅ Обновление загружено ({label})\nZIP: {size_mb:.1f} MB → заметка: {note_mb:.1f} MB\nХеш: {zip_hash}"
+    return (f"✅ Обновление загружено на Диск ({kind})\n"
+            f"ZIP: {size_mb:.1f} MB\nВерсия: {status['version']}")
 
 
 async def _tg_handle_admin_command(notes_session: aiohttp.ClientSession,
@@ -520,7 +500,7 @@ async def _tg_handle_admin_command(notes_session: aiohttp.ClientSession,
         label = "код" if small else "полный релиз"
         await _tg_send_text(tg, base, chat_id, f"⏳ Скачиваю {label}...")
         try:
-            result = await _do_update(notes_session, note_map, small=small)
+            result = await _do_update(small=small)
         except Exception as e:
             result = f"❌ Ошибка: {e}"
         await _tg_send_text(tg, base, chat_id, result)
@@ -586,54 +566,62 @@ async def main():
     log.info(f"Config: save_sessions={SAVE_SESSIONS}, sessions_dir={SESSIONS_DIR}")
     cookies = {"Session_id": YANOTES_SESSION_ID}
 
+    media_transport = CONFIG.get("media_transport", "yadisk")
+    if media_transport == "yadisk":
+        import yadisk_poll
+        yadisk_folder = CONFIG.get("yadisk_folder", "")
+        configured = await yadisk_poll.yadisk_init(yadisk_folder, TG_TOKEN, TG_CHAT)
+        if configured:
+            asyncio.create_task(yadisk_poll.yadisk_poll_loop())
+            log.info(f"Yandex.Disk manifest poller started for /{yadisk_folder}")
+        else:
+            log.error("Yandex.Disk poller is not configured; check token and folder")
+    elif media_transport == "notes":
+        log.warning("Legacy Yandex.Notes media transport is enabled")
+    else:
+        raise ValueError(f"Unknown media_transport: {media_transport}")
+
+    # Notes remain active for commands, logs, migration leftovers and
+    # the emergency media_transport=notes fallback.
     async with aiohttp.ClientSession(headers=HEADERS, cookies=cookies) as s:
         log.info("Finding/creating notes...")
-        note_map = await _find_or_create_notes(s, UPLOAD_NOTES + [CMD_NOTE, UPDATE_NOTE])
+        note_map = await _find_or_create_notes(s, UPLOAD_NOTES + [CMD_NOTE])
         for title, info in note_map.items():
             status = "OCCUPIED" if info["snippet"] else "FREE"
             log.info(f"  {title}: {info['id']} [{status}]")
 
-        log.info(f"Watching {len(note_map)} notes, TG chat: {TG_CHAT}")
+        log.info(f"TG chat: {TG_CHAT}")
 
-        # Initial revision
         revision = await _get_db_revision(s)
         log.info(f"Base revision: {revision}")
-
-        # Process pending uploads
         for title, info in note_map.items():
             if title in UPLOAD_NOTES and info["snippet"]:
-                log.info(f"Pending upload in {title}, processing...")
+                log.info(f"Pending Notes response/upload in {title}")
                 asyncio.create_task(process_note(s, info["id"], title, info["snippet"]))
 
-        # Poll loop
-        log.info(f"Polling every {POLL_INTERVAL}s...")
         asyncio.create_task(tg_poll_commands(s, note_map))
         while True:
             try:
                 deltas = await _get_deltas(s, revision)
-                new_rev = deltas.get("revision", revision)
-                items = deltas.get("items", [])
-                if new_rev != revision:
-                    revision = new_rev
-
-                if items:
-                    log.info(f"Deltas: {len(items)} changes, revision {revision}")
+                revision = deltas.get("revision", revision)
+                if deltas.get("items", []):
                     notes = await _list_notes(s)
-                    for n in notes:
-                        t = n.get("title", "")
-                        snippet = n.get("snippet", "")
-                        if t in UPLOAD_NOTES and t in note_map:
-                            old = note_map[t]["snippet"]
-                            if snippet and snippet != old:
-                                log.info(f"New upload in {t}")
-                                note_map[t]["snippet"] = snippet
-                                asyncio.create_task(process_note(s, note_map[t]["id"], t, snippet))
-                            elif not snippet and old:
-                                log.info(f"Slot {t} confirmed FREE")
-                                note_map[t]["snippet"] = ""
+                    for note in notes:
+                        title = note.get("title", "")
+                        snippet = note.get("snippet", "")
+                        if title not in UPLOAD_NOTES or title not in note_map:
+                            continue
+                        old_snippet = note_map[title]["snippet"]
+                        if snippet and snippet != old_snippet:
+                            note_map[title]["snippet"] = snippet
+                            log.info(f"New Notes response/upload in {title}")
+                            asyncio.create_task(process_note(
+                                s, note_map[title]["id"], title, snippet))
+                        elif not snippet and old_snippet:
+                            note_map[title]["snippet"] = ""
+                            log.info(f"Notes slot {title} is free")
             except Exception as e:
-                log.warning(f"Poll error: {e}")
-
+                log.warning(f"Notes poll error: {e}")
             await asyncio.sleep(POLL_INTERVAL)
 
 if __name__ == "__main__":

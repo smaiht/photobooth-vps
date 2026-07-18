@@ -1,0 +1,9 @@
+.env
+.env.*
+.ENV
+.ENV.*
+.git
+.DS_Store
+__pycache__
+sessions
+vps_yadisk_state.json
