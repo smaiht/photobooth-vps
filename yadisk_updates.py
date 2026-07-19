@@ -79,9 +79,28 @@ async def _upload_bytes(api_session: aiohttp.ClientSession,
         raise RuntimeError(f"uploaded update resource did not verify: {path}")
 
 
-async def publish_update(payload: bytes, kind: str, folder: str,
-                         source_url: str = "") -> dict:
-    """Upload an immutable artifact, then publish status.json last."""
+async def _read_status(api_session: aiohttp.ClientSession,
+                       transfer_session: aiohttp.ClientSession,
+                       status_path: str) -> dict:
+    async with api_session.get(
+        f"{API}/resources/download", params={"path": status_path},
+    ) as response:
+        if response.status == 404:
+            return {}
+        if response.status != 200:
+            raise RuntimeError(
+                f"read update status URL: {response.status} {await response.text()}")
+        href = (await response.json())["href"]
+    async with transfer_session.get(href) as response:
+        if response.status != 200:
+            raise RuntimeError(
+                f"read update status: {response.status} {await response.text()}")
+        data = await response.json()
+    return data if isinstance(data, dict) else {}
+
+
+async def publish_update(payload: bytes, kind: str, folder: str) -> dict:
+    """Overwrite one fixed artifact, then publish the dual-artifact status last."""
     if kind not in ("full", "small"):
         raise ValueError(f"unsupported update kind: {kind}")
     token = os.environ.get("YADISK_TOKEN", "").strip()
@@ -90,21 +109,14 @@ async def publish_update(payload: bytes, kind: str, folder: str,
 
     root = normalize_folder(folder)
     sha256 = hashlib.sha256(payload).hexdigest()
-    version = sha256[:16]
-    artifact_path = f"{root}/artifacts/{version}-{kind}.zip"
+    artifact_path = f"{root}/artifacts/{kind}.zip"
     status_path = f"{root}/status.json"
-    status = {
-        "schema_version": SCHEMA_VERSION,
-        "version": version,
-        "kind": kind,
+    artifact = {
         "path": artifact_path,
         "size": len(payload),
         "sha256": sha256,
-        "created_at": datetime.now(timezone.utc).isoformat(),
-        "source_url": source_url,
+        "updated_at": datetime.now(timezone.utc).isoformat(),
     }
-    status_payload = json.dumps(
-        status, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
 
     api_timeout = aiohttp.ClientTimeout(total=90, connect=20)
     transfer_timeout = aiohttp.ClientTimeout(total=600, connect=30)
@@ -112,8 +124,22 @@ async def publish_update(payload: bytes, kind: str, folder: str,
         headers={"Authorization": f"OAuth {token}"}, timeout=api_timeout,
     ) as api_session, aiohttp.ClientSession(timeout=transfer_timeout) as transfer_session:
         await _ensure_directories(api_session, root)
+        previous = await _read_status(api_session, transfer_session, status_path)
+        previous_artifacts = previous.get("artifacts", {})
+        artifacts = {
+            "full": previous_artifacts.get("full") if isinstance(previous_artifacts, dict) else None,
+            "small": previous_artifacts.get("small") if isinstance(previous_artifacts, dict) else None,
+        }
+        artifacts[kind] = artifact
+        status = {
+            "schema_version": SCHEMA_VERSION,
+            "active": kind,
+            "artifacts": artifacts,
+        }
+        status_payload = json.dumps(
+            status, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
         await _upload_bytes(api_session, transfer_session, artifact_path, payload)
         await _upload_bytes(api_session, transfer_session, status_path, status_payload)
 
-    log.info(f"YaDisk update: published {kind} {version}, {len(payload)} bytes")
+    log.info(f"YaDisk update: published {kind} {sha256[:16]}, {len(payload)} bytes")
     return status

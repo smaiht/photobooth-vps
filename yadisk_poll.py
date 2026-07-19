@@ -169,6 +169,8 @@ async def _list_inbox() -> list[dict]:
             "fields": "_embedded.total,_embedded.items.name,_embedded.items.path,_embedded.items.type",
         }
         async with _session.get(f"{API}/resources", params=params) as response:
+            if response.status == 404:
+                return []
             if response.status != 200:
                 raise RuntimeError(f"list inbox {response.status}: {await response.text()}")
             embedded = (await response.json()).get("_embedded", {})
@@ -387,6 +389,55 @@ async def yadisk_init(folder: str, tg_token: str, tg_chat: str) -> bool:
     else:
         log.info(f"YaDisk: watching {_folder}/_sessions/inbox")
     return True
+
+
+def validate_event_name(folder: str) -> str:
+    name = str(folder or "").strip()
+    if (not name or name in (".", "..") or "/" in name or "\\" in name
+            or any(ord(char) < 32 for char in name) or len(name) > 160):
+        raise ValueError("invalid event folder name")
+    return name
+
+
+async def set_event_folder(folder: str) -> None:
+    """Activate one event folder for future polling."""
+    global _folder
+    name = validate_event_name(folder)
+    target = "/" + name
+    if target == _folder:
+        return
+    if not await _connect():
+        raise RuntimeError("Yandex.Disk poller is unavailable")
+    for path in (target, f"{target}/_sessions", f"{target}/_sessions/inbox",
+                 f"{target}/_sessions/done"):
+        if not await _ensure_directory(path):
+            raise RuntimeError(f"cannot create event directory {path}")
+    _folder = target
+    _state_save()
+    log.info(f"YaDisk: active event changed to {_folder}")
+
+
+def current_event_folder() -> str:
+    return _folder.lstrip("/")
+
+
+async def publish_current_folder() -> str:
+    if not await _connect():
+        raise RuntimeError("Yandex.Disk poller is unavailable")
+    async with _session.put(
+        f"{API}/resources/publish", params={"path": _folder},
+    ) as response:
+        if response.status not in (200, 201, 409):
+            raise RuntimeError(f"publish event: {response.status} {await response.text()}")
+    async with _session.get(
+        f"{API}/resources", params={"path": _folder, "fields": "public_url"},
+    ) as response:
+        if response.status != 200:
+            raise RuntimeError(f"read public URL: {response.status} {await response.text()}")
+        public_url = (await response.json()).get("public_url")
+    if not public_url:
+        raise RuntimeError("Yandex.Disk did not return public_url")
+    return public_url
 
 
 async def yadisk_close() -> None:

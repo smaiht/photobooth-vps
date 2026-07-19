@@ -23,16 +23,26 @@ class PublishUpdateTests(unittest.IsolatedAsyncioTestCase):
         with patch.dict("os.environ", {"YADISK_TOKEN": "test-token"}), \
              patch("yadisk_updates.aiohttp.ClientSession", side_effect=[_Session(), _Session()]), \
              patch("yadisk_updates._ensure_directories", AsyncMock()), \
+             patch("yadisk_updates._read_status", AsyncMock(return_value={
+                 "schema_version": 1,
+                 "active": "full",
+                 "artifacts": {
+                     "full": {"path": "/updates/artifacts/full.zip", "sha256": "f" * 64},
+                     "small": None,
+                 },
+             })), \
              patch("yadisk_updates._upload_bytes", side_effect=capture_upload):
             status = await yadisk_updates.publish_update(
-                b"zip payload", "small", "photobooth_system/updates", "https://source.test")
+                b"zip payload", "small", "photobooth_system/updates")
 
         self.assertEqual(len(uploads), 2)
-        self.assertEqual(uploads[0][0], status["path"])
-        self.assertTrue(uploads[0][0].endswith("-small.zip"))
+        self.assertEqual(uploads[0][0], status["artifacts"]["small"]["path"])
+        self.assertTrue(uploads[0][0].endswith("/small.zip"))
         self.assertEqual(uploads[0][1], b"zip payload")
         self.assertEqual(uploads[1][0], "/photobooth_system/updates/status.json")
         self.assertEqual(json.loads(uploads[1][1]), status)
+        self.assertEqual(status["active"], "small")
+        self.assertIsNotNone(status["artifacts"]["full"])
 
     async def test_rejects_unknown_update_kind(self):
         with self.assertRaisesRegex(ValueError, "unsupported update kind"):

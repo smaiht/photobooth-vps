@@ -1,12 +1,9 @@
 {
     "_comment": "VPS runtime settings. Secrets stay in .env.",
-    "save_sessions": false,
-    "_save_sessions_comment": "false = do not keep sessions on VPS for the removed web gallery; unpack temporarily, send to Telegram, then delete. true = keep sessions_dir with photos/video/thumbs/files.json for web.",
-    "sessions_dir": "sessions",
-    "media_transport": "yadisk",
-    "_media_transport_comment": "yadisk = manifest inbox; notes = emergency legacy ZIP transport.",
     "yadisk_folder": "test_event",
     "_yadisk_folder_comment": "Yandex.Disk folder watched by the poller. Must match yadisk_folder on the photobooth side.",
     "yadisk_updates_folder": "photobooth_system/updates",
-    "_yadisk_updates_folder_comment": "Fixed private folder for full/small artifacts and status.json. Must match the photobooth config."
+    "_yadisk_updates_folder_comment": "Fixed private folder for full/small artifacts and status.json. Must match the photobooth config.",
+    "yadisk_control_folder": "photobooth_system/control",
+    "_yadisk_control_folder_comment": "Private command inbox, responses and logs. Must match the photobooth config."
 }

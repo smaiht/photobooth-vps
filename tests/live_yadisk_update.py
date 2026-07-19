@@ -83,15 +83,16 @@ async def main() -> None:
     booth_client = _load_booth_client()
     try:
         published = await publisher.publish_update(
-            payload, "small", folder, source_url="live-smoke-test")
+            payload, "small", folder)
         status = await asyncio.to_thread(booth_client.read_status, folder)
         if status != published:
             raise RuntimeError("downloaded status.json differs from the published status")
+        artifact = status["artifacts"][status["active"]]
 
         with tempfile.TemporaryDirectory() as tmpdir:
             destination = Path(tmpdir) / "update.zip"
             size, sha256 = await asyncio.to_thread(
-                booth_client.download_artifact, status, destination)
+                booth_client.download_artifact, artifact, destination)
             if destination.read_bytes() != payload:
                 raise RuntimeError("downloaded artifact bytes differ")
             if size != len(payload) or sha256 != hashlib.sha256(payload).hexdigest():
