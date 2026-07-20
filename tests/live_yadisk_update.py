@@ -82,12 +82,11 @@ async def main() -> None:
     payload = _test_zip()
     booth_client = _load_booth_client()
     try:
-        published = await publisher.publish_update(
-            payload, "small", folder)
+        published = await publisher.publish_update(payload, folder)
         status = await asyncio.to_thread(booth_client.read_status, folder)
         if status != published:
             raise RuntimeError("downloaded status.json differs from the published status")
-        artifact = status["artifacts"][status["active"]]
+        artifact = status["artifacts"]["full"]
 
         with tempfile.TemporaryDirectory() as tmpdir:
             destination = Path(tmpdir) / "update.zip"

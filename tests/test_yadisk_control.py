@@ -11,13 +11,14 @@ class ResponseValidationTests(unittest.TestCase):
     def test_validates_response_and_artifact_path(self):
         command_id = "a" * 32
         response = yadisk_control.validate_response({
-            "schema_version": 1,
+            "schema_version": 2,
+            "message_type": "command_response",
             "command_id": command_id,
             "command": "send_logs",
             "status": "ok",
             "message": "done",
             "artifact_path": "/photobooth_system/control/logs/test.log",
-        }, f"{command_id}.json")
+        }, f"response_{command_id}.json")
         self.assertEqual(response["status"], "ok")
 
         with self.assertRaisesRegex(ValueError, "artifact"):
@@ -36,14 +37,19 @@ class SendCommandTests(unittest.IsolatedAsyncioTestCase):
 
         with patch("yadisk_control._connect", AsyncMock(return_value=True)), \
              patch("yadisk_control._upload_bytes", side_effect=upload), \
+             patch.object(yadisk_control, "_root", "/photobooth_system/control"), \
              patch("yadisk_control.uuid.uuid4") as uuid4:
             uuid4.return_value.hex = "a" * 32
             command = await yadisk_control.send_command(
                 "set_event", {"name": "Свадьба"}, reply_chat_id=123)
 
         self.assertEqual(command["command_id"], "a" * 32)
+        self.assertEqual(uploads[0][0]["message_type"], "command")
         self.assertEqual(uploads[0][0]["data"], {"name": "Свадьба"})
-        self.assertTrue(uploads[0][1].endswith(f"/{'a' * 32}.json"))
+        self.assertEqual(
+            uploads[0][1],
+            f"/photobooth_system/control/to_booth/{'a' * 32}.json",
+        )
 
 
 class EventSwitchTests(unittest.IsolatedAsyncioTestCase):
@@ -71,7 +77,7 @@ class UpdateCommandTests(unittest.IsolatedAsyncioTestCase):
              patch("app._send_disk_command", AsyncMock(return_value="a" * 32)) as send, \
              patch("app._tg_send_text", AsyncMock(return_value=True)):
             await app._tg_handle_admin_command(
-                object(), "https://telegram.test", 123, "/update_small")
+                object(), "https://telegram.test", 123, "/update")
 
         send.assert_not_awaited()
 

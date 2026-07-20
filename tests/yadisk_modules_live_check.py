@@ -69,6 +69,7 @@ async def main() -> int:
         f"/photobooth_modules_test_{datetime.now(timezone.utc):%Y%m%d_%H%M%S}_"
         f"{secrets.token_hex(4)}"
     )
+    bus = f"{folder}/control"
     print(f"production module temporary folder: {folder}")
     poller = load_vps_poller()
 
@@ -92,6 +93,7 @@ async def main() -> int:
             )
             booth_disk._token = token
             booth_disk._folder = folder
+            booth_disk._bus_root = bus
             booth_disk._configured = True
             if not await booth_disk._connect():
                 raise RuntimeError("production booth uploader failed to connect")
@@ -102,10 +104,11 @@ async def main() -> int:
 
             poller._token = token
             poller._folder = folder
+            poller._bus_root = bus
             poller._tg_token = "live-check-not-sent"
             poller._tg_chat = "live-check-not-sent"
             poller._configured = True
-            poller._state = {"sent_manifests": []}
+            poller._state = {"handled_messages": []}
             poller.STATE_FILE = root / "vps_state.json"
             received = []
 

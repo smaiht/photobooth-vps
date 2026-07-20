@@ -1,5 +1,6 @@
-import unittest
+import asyncio
 import json
+import unittest
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from unittest.mock import AsyncMock, patch
@@ -11,7 +12,9 @@ from yadisk_poll import _process_manifest, _tg_send_chunk, validate_manifest
 class ManifestTests(unittest.TestCase):
     def test_accepts_complete_manifest(self):
         manifest = validate_manifest({
-            "schema_version": 1,
+            "schema_version": 2,
+            "message_type": "session_ready",
+            "event_folder": "event_2026",
             "session_id": "abc123def456",
             "created_at": "2026-07-17T12:00:00+00:00",
             "files": [{
@@ -23,11 +26,14 @@ class ManifestTests(unittest.TestCase):
         })
 
         self.assertEqual(manifest["session_id"], "abc123def456")
+        self.assertEqual(manifest["event_folder"], "/event_2026")
         self.assertEqual(manifest["files"][0]["size"], 1234)
 
     def test_rejects_paths_and_duplicate_names(self):
         base = {
-            "schema_version": 1,
+            "schema_version": 2,
+            "message_type": "session_ready",
+            "event_folder": "event",
             "session_id": "abc123",
             "files": [],
         }
@@ -44,8 +50,19 @@ class ManifestTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             validate_manifest(duplicate)
 
+        with self.assertRaisesRegex(ValueError, "event"):
+            validate_manifest(dict(base, event_folder="../other", files=[{
+                "name": "photo.jpg", "kind": "photo", "size": 1, "md5": None,
+            }]))
+
 
 class DeliveryTests(unittest.IsolatedAsyncioTestCase):
+    def setUp(self):
+        yadisk_poll._inflight.clear()
+
+    def tearDown(self):
+        yadisk_poll._inflight.clear()
+
     async def test_single_photo_uses_send_photo_not_media_group(self):
         with TemporaryDirectory() as tmpdir:
             photo = Path(tmpdir) / "photo.jpg"
@@ -56,7 +73,9 @@ class DeliveryTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_download_failure_keeps_manifest_in_inbox(self):
         manifest = {
-            "schema_version": 1,
+            "schema_version": 2,
+            "message_type": "session_ready",
+            "event_folder": "event",
             "session_id": "abc123",
             "created_at": "2026-07-17T12:00:00+00:00",
             "files": [{
@@ -66,24 +85,61 @@ class DeliveryTests(unittest.IsolatedAsyncioTestCase):
                 "md5": None,
             }],
         }
-        yadisk_poll._state = {"sent_manifests": []}
-        yadisk_poll._folder = "/event"
+        yadisk_poll._state = {"handled_messages": []}
 
+        download_file = AsyncMock(side_effect=RuntimeError("network down"))
         with patch("yadisk_poll._download_bytes", AsyncMock(
                 return_value=json.dumps(manifest).encode("utf-8"))), \
-             patch("yadisk_poll._download_file", AsyncMock(
-                side_effect=RuntimeError("network down"))), \
+             patch("yadisk_poll._download_file", download_file), \
              patch("yadisk_poll._tg_send_session", AsyncMock()) as send, \
              patch("yadisk_poll._move_to_done", AsyncMock()) as move:
             ok = await _process_manifest({
                 "name": "abc123.json",
-                "path": "disk:/event/_sessions/inbox/abc123.json",
+                "path": "disk:/photobooth_system/control/to_vps/abc123.json",
             })
 
         self.assertFalse(ok)
         send.assert_not_awaited()
         move.assert_not_awaited()
-        self.assertEqual(yadisk_poll._state["sent_manifests"], [])
+        self.assertEqual(download_file.await_args.args[0], "/event/photo.jpg")
+        self.assertEqual(yadisk_poll._state["handled_messages"], [])
+
+    async def test_one_inbox_dispatches_sessions_and_responses_separately(self):
+        session = {
+            "schema_version": 2,
+            "message_type": "session_ready",
+            "event_folder": "event",
+            "session_id": "abc123",
+            "files": [{
+                "name": "photo.jpg", "kind": "photo", "size": 5, "md5": None,
+            }],
+        }
+        response = {
+            "schema_version": 2,
+            "message_type": "command_response",
+            "command_id": "a" * 32,
+        }
+        items = [
+            {"name": "session_abc123.json", "path": "disk:/bus/to_vps/session_abc123.json"},
+            {"name": f"response_{'a' * 32}.json", "path": "disk:/bus/to_vps/response.json"},
+        ]
+        payloads = [json.dumps(session).encode(), json.dumps(response).encode()]
+        session_queue = asyncio.Queue()
+        response_queue = asyncio.Queue()
+        yadisk_poll._state = {"handled_messages": []}
+
+        with patch("yadisk_poll._connect", AsyncMock(return_value=True)), \
+             patch("yadisk_poll._list_inbox", AsyncMock(return_value=items)), \
+             patch("yadisk_poll._download_bytes", AsyncMock(side_effect=payloads)):
+            await yadisk_poll._poll_once(session_queue, response_queue)
+
+        self.assertEqual(session_queue.qsize(), 1)
+        self.assertEqual(response_queue.qsize(), 1)
+        self.assertEqual((await session_queue.get())[2], "session_ready")
+        self.assertEqual((await response_queue.get())[2], "command_response")
+
+    def test_poll_interval_is_ten_seconds(self):
+        self.assertEqual(yadisk_poll.POLL_INTERVAL, 10)
 
 
 if __name__ == "__main__":

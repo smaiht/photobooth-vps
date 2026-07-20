@@ -137,8 +137,9 @@ def main() -> int:
 
     suffix = secrets.token_hex(4)
     folder = f"/photobooth_api_test_{datetime.now(timezone.utc):%Y%m%d_%H%M%S}_{suffix}"
-    inbox = f"{folder}/_sessions/inbox"
-    done = f"{folder}/_sessions/done"
+    control = f"{folder}/control"
+    inbox = f"{control}/to_vps"
+    done = f"{control}/done/to_vps"
     published = False
 
     # A valid 1x1 JPEG plus a small ISO-BMFF header for transport checks.
@@ -155,7 +156,7 @@ def main() -> int:
         free = int(disk.get("total_space", 0)) - int(disk.get("used_space", 0))
         print(f"oauth: OK; free={free} bytes; max_file={disk.get('max_file_size')} bytes")
 
-        for path in (folder, f"{folder}/_sessions", inbox, done):
+        for path in (folder, control, inbox, f"{control}/done", done):
             create_directory(path)
         print(f"temporary folder created: {folder}")
 
@@ -177,12 +178,14 @@ def main() -> int:
         manifests = []
         for index in (1, 2):
             manifest = json.dumps({
-                "schema_version": 1,
+                "schema_version": 2,
+                "message_type": "session_ready",
+                "event_folder": folder.lstrip("/"),
                 "session_id": f"livecheck{index}",
                 "created_at": datetime.now(timezone.utc).isoformat(),
                 "files": files,
             }, separators=(",", ":")).encode("utf-8")
-            manifest_path = f"{inbox}/livecheck{index}.json"
+            manifest_path = f"{inbox}/session_livecheck{index}.json"
             upload(manifest_path, manifest)
             manifests.append((manifest_path, manifest))
 

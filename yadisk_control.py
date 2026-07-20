@@ -1,4 +1,4 @@
-"""VPS side of the Yandex.Disk command and response channel."""
+"""VPS helpers for commands and control artifacts on Yandex.Disk."""
 
 from __future__ import annotations
 
@@ -10,17 +10,13 @@ import os
 import re
 import uuid
 from datetime import datetime, timezone
-from pathlib import Path
-from typing import Awaitable, Callable
 
 import aiohttp
 
 log = logging.getLogger(__name__)
 
 API = "https://cloud-api.yandex.net/v1/disk"
-SCHEMA_VERSION = 1
-POLL_INTERVAL = 2
-PAGE_SIZE = 100
+SCHEMA_VERSION = 2
 COMMAND_ID_RE = re.compile(r"^[a-f0-9]{32}$")
 
 _session: aiohttp.ClientSession | None = None
@@ -40,10 +36,12 @@ def normalize_folder(folder: str) -> str:
 def validate_response(data: dict, filename: str = "") -> dict:
     if not isinstance(data, dict) or data.get("schema_version") != SCHEMA_VERSION:
         raise ValueError("unsupported response schema")
+    if data.get("message_type") != "command_response":
+        raise ValueError("invalid response message_type")
     command_id = data.get("command_id")
     if not isinstance(command_id, str) or not COMMAND_ID_RE.fullmatch(command_id):
         raise ValueError("invalid command_id")
-    if filename and filename != f"{command_id}.json":
+    if filename and filename != f"response_{command_id}.json":
         raise ValueError("response filename does not match command_id")
     command = data.get("command")
     if not isinstance(command, str) or not command or len(command) > 50:
@@ -64,6 +62,7 @@ def validate_response(data: dict, filename: str = "") -> dict:
         raise ValueError("invalid reply_chat_id")
     return {
         "schema_version": SCHEMA_VERSION,
+        "message_type": "command_response",
         "command_id": command_id,
         "command": command,
         "status": status,
@@ -110,7 +109,8 @@ async def _connect() -> bool:
         for part in _root.strip("/").split("/"):
             current += "/" + part
             await _ensure_directory(current)
-        for suffix in ("commands", "commands/inbox", "commands/done", "responses", "logs"):
+        for suffix in ("to_booth", "to_vps", "done", "done/to_booth",
+                       "done/to_vps", "logs"):
             await _ensure_directory(f"{_root}/{suffix}")
         return True
     except Exception as exc:
@@ -161,6 +161,7 @@ async def send_command(command: str, data: dict | str | None = None,
     command_id = uuid.uuid4().hex
     body = {
         "schema_version": SCHEMA_VERSION,
+        "message_type": "command",
         "command_id": command_id,
         "command": command,
         "data": data,
@@ -168,33 +169,9 @@ async def send_command(command: str, data: dict | str | None = None,
         "reply_chat_id": reply_chat_id,
     }
     payload = json.dumps(body, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
-    await _upload_bytes(payload, f"{_root}/commands/inbox/{command_id}.json")
+    await _upload_bytes(payload, f"{_root}/to_booth/{command_id}.json")
     log.info(f"Control: sent {command} ({command_id})")
     return body
-
-
-async def _list_responses() -> list[dict]:
-    result = []
-    offset = 0
-    path = f"{_root}/responses"
-    while True:
-        params = {
-            "path": path,
-            "limit": PAGE_SIZE,
-            "offset": offset,
-            "sort": "name",
-            "fields": "_embedded.total,_embedded.items.name,_embedded.items.path,_embedded.items.type",
-        }
-        async with _session.get(f"{API}/resources", params=params) as response:
-            if response.status != 200:
-                raise RuntimeError(f"list responses: {response.status} {await response.text()}")
-            embedded = (await response.json()).get("_embedded", {})
-        items = embedded.get("items", [])
-        result.extend(item for item in items
-                      if item.get("type") == "file" and item.get("name", "").endswith(".json"))
-        offset += len(items)
-        if not items or offset >= int(embedded.get("total", offset)):
-            return result
 
 
 async def download_bytes(remote_path: str, max_size: int = 10 * 1024 * 1024) -> bytes:
@@ -234,23 +211,6 @@ async def delete_resource(remote_path: str) -> bool:
         return False
 
 
-async def _process_response(
-    item: dict,
-    handler: Callable[[dict], Awaitable[bool]],
-) -> bool:
-    filename = item["name"]
-    remote_path = str(item.get("path", "")).removeprefix("disk:")
-    try:
-        response = validate_response(
-            json.loads((await download_bytes(remote_path)).decode("utf-8")), filename)
-    except Exception as exc:
-        log.warning(f"Control: invalid response {filename}: {exc}")
-        return False
-    if not await handler(response):
-        return False
-    return await delete_resource(remote_path)
-
-
 async def control_init(folder: str) -> bool:
     global _root, _token, _configured
     _token = os.environ.get("YADISK_TOKEN", "").strip()
@@ -260,19 +220,5 @@ async def control_init(folder: str) -> bool:
     _root = normalize_folder(folder)
     _configured = True
     return await _connect()
-
-
-async def response_poll_loop(handler: Callable[[dict], Awaitable[bool]]) -> None:
-    while True:
-        try:
-            if await _connect():
-                for item in await _list_responses():
-                    await _process_response(item, handler)
-        except Exception as exc:
-            log.warning(f"Control: response poll failed: {exc}")
-            await _close_sessions()
-        await asyncio.sleep(POLL_INTERVAL)
-
-
 async def control_close() -> None:
     await _close_sessions()

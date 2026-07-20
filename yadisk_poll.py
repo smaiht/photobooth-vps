@@ -1,9 +1,9 @@
-"""Consume completed photobooth sessions from a Yandex.Disk manifest inbox.
+"""Consume the booth-to-VPS Yandex.Disk inbox.
 
-The booth uploads event media to the event folder and publishes a manifest to
-``_sessions/inbox`` last.  After all files are verified and Telegram accepts
-them, this service moves only the manifest to ``_sessions/done``.  Media stay
-in the event folder for its public owner link.
+The booth publishes both completed-session manifests and command responses to
+the stable ``control/to_vps`` channel.  One poller dispatches those message
+types to independent asyncio workers, so a large Telegram upload cannot delay
+a command response.  Session media stay flat in their event folder.
 """
 
 from __future__ import annotations
@@ -17,26 +17,33 @@ import re
 import tempfile
 from contextlib import ExitStack
 from pathlib import Path
+from typing import Awaitable, Callable
 
 import aiohttp
+
+import yadisk_control
 
 log = logging.getLogger(__name__)
 
 API = "https://cloud-api.yandex.net/v1/disk"
-POLL_INTERVAL = 5
+POLL_INTERVAL = 10
 PAGE_SIZE = 1000
 STATE_FILE = Path("vps_yadisk_state.json")
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 MD5_RE = re.compile(r"^[a-f0-9]{32}$")
 
-_state: dict = {"sent_manifests": []}
+_state: dict = {"handled_messages": []}
 _session: aiohttp.ClientSession | None = None
 _transfer_session: aiohttp.ClientSession | None = None
 _folder = ""
+_bus_root = ""
 _token = ""
 _tg_token = ""
 _tg_chat = ""
 _configured = False
+_inflight: set[str] = set()
+
+ResponseHandler = Callable[[dict], Awaitable[bool]]
 
 
 def _state_save() -> None:
@@ -52,21 +59,25 @@ def _state_save() -> None:
 def _state_load() -> None:
     global _state
     if not STATE_FILE.exists():
-        _state = {"sent_manifests": []}
+        _state = {"handled_messages": []}
         return
     try:
         data = json.loads(STATE_FILE.read_text(encoding="utf-8"))
-        sent = data.get("sent_manifests", []) if isinstance(data, dict) else []
-        _state = {"sent_manifests": [str(name) for name in sent]}
+        handled = data.get("handled_messages", []) if isinstance(data, dict) else []
+        _state = {"handled_messages": [str(name) for name in handled]}
     except Exception as exc:
         log.warning(f"YaDisk: state load failed: {exc}")
-        _state = {"sent_manifests": []}
+        _state = {"handled_messages": []}
 
 
 def validate_manifest(data: dict) -> dict:
     """Validate untrusted manifest data and return a normalized copy."""
     if not isinstance(data, dict) or data.get("schema_version") != SCHEMA_VERSION:
         raise ValueError("unsupported manifest schema")
+    if data.get("message_type") != "session_ready":
+        raise ValueError("invalid manifest message_type")
+
+    event_name = validate_event_name(data.get("event_folder"))
 
     session_id = data.get("session_id")
     if not isinstance(session_id, str) or not session_id.isalnum() or len(session_id) > 80:
@@ -99,6 +110,8 @@ def validate_manifest(data: dict) -> dict:
 
     return {
         "schema_version": SCHEMA_VERSION,
+        "message_type": "session_ready",
+        "event_folder": "/" + event_name,
         "session_id": session_id,
         "created_at": str(data.get("created_at", "")),
         "files": normalized,
@@ -143,8 +156,15 @@ async def _connect() -> bool:
     _transfer_session = aiohttp.ClientSession(
         timeout=aiohttp.ClientTimeout(total=600, connect=30))
     try:
-        for path in (_folder, f"{_folder}/_sessions", f"{_folder}/_sessions/inbox",
-                     f"{_folder}/_sessions/done"):
+        paths = []
+        current = ""
+        for part in _bus_root.strip("/").split("/"):
+            current += "/" + part
+            paths.append(current)
+        paths.extend((f"{_bus_root}/to_booth", f"{_bus_root}/to_vps",
+                      f"{_bus_root}/done", f"{_bus_root}/done/to_booth",
+                      f"{_bus_root}/done/to_vps", f"{_bus_root}/logs", _folder))
+        for path in paths:
             if not await _ensure_directory(path):
                 await _close_sessions()
                 return False
@@ -156,10 +176,10 @@ async def _connect() -> bool:
 
 
 async def _list_inbox() -> list[dict]:
-    """List every current inbox manifest using documented pagination."""
+    """List every current booth-to-VPS message using documented pagination."""
     result = []
     offset = 0
-    inbox = f"{_folder}/_sessions/inbox"
+    inbox = f"{_bus_root}/to_vps"
     while True:
         params = {
             "path": inbox,
@@ -183,7 +203,7 @@ async def _list_inbox() -> list[dict]:
     return result
 
 
-async def _download_bytes(remote_path: str) -> bytes:
+async def _download_bytes(remote_path: str, max_size: int = 1024 * 1024) -> bytes:
     async with _session.get(
         f"{API}/resources/download", params={"path": remote_path}
     ) as response:
@@ -193,7 +213,10 @@ async def _download_bytes(remote_path: str) -> bytes:
     async with _transfer_session.get(href) as response:
         if response.status != 200:
             raise RuntimeError(f"download {response.status}: {await response.text()}")
-        return await response.read()
+        payload = await response.read()
+    if len(payload) > max_size:
+        raise ValueError("inbox message is too large")
+    return payload
 
 
 def _file_md5(path: Path) -> str:
@@ -288,9 +311,9 @@ async def _wait_operation(href: str) -> bool:
     return False
 
 
-async def _move_to_done(manifest_name: str) -> bool:
-    source = f"{_folder}/_sessions/inbox/{manifest_name}"
-    target = f"{_folder}/_sessions/done/{manifest_name}"
+async def _move_to_done(message_name: str) -> bool:
+    source = f"{_bus_root}/to_vps/{message_name}"
+    target = f"{_bus_root}/done/to_vps/{message_name}"
     params = {"from": source, "path": target, "overwrite": "true"}
     try:
         async with _session.post(f"{API}/resources/move", params=params) as response:
@@ -299,87 +322,182 @@ async def _move_to_done(manifest_name: str) -> bool:
             if response.status == 202:
                 href = (await response.json()).get("href")
                 return bool(href and await _wait_operation(href))
-            log.warning(f"YaDisk: move manifest {response.status}: {await response.text()}")
+            log.warning(f"YaDisk: move inbox message {response.status}: {await response.text()}")
             return False
     except Exception as exc:
-        log.warning(f"YaDisk: move manifest failed: {exc}")
+        log.warning(f"YaDisk: move inbox message failed: {exc}")
         return False
 
 
-async def _process_manifest(item: dict) -> bool:
-    manifest_name = item["name"]
-    manifest_path = str(item.get("path", "")).removeprefix("disk:")
-    sent = _state["sent_manifests"]
-
-    if manifest_name not in sent:
+async def _deliver_session(manifest: dict) -> bool:
+    log.info(f"YaDisk: session {manifest['session_id']} ready "
+             f"({len(manifest['files'])} files from {manifest['event_folder']})")
+    with tempfile.TemporaryDirectory(prefix=f"photobooth_{manifest['session_id']}_") as tmpdir:
+        local_files = []
         try:
-            raw = await _download_bytes(manifest_path)
-            manifest = validate_manifest(json.loads(raw.decode("utf-8")))
+            for entry in manifest["files"]:
+                local_path = Path(tmpdir) / entry["name"]
+                await _download_file(
+                    f"{manifest['event_folder']}/{entry['name']}", local_path, entry)
+                local_files.append((local_path, entry["kind"]))
         except Exception as exc:
-            log.warning(f"YaDisk: invalid manifest {manifest_name}: {exc}")
+            log.warning(f"YaDisk: session download failed, keeping inbox: {exc}")
             return False
 
-        log.info(f"YaDisk: session {manifest['session_id']} ready "
-                 f"({len(manifest['files'])} files)")
-        with tempfile.TemporaryDirectory(prefix=f"photobooth_{manifest['session_id']}_") as tmpdir:
-            local_files = []
-            try:
-                for entry in manifest["files"]:
-                    local_path = Path(tmpdir) / entry["name"]
-                    await _download_file(f"{_folder}/{entry['name']}", local_path, entry)
-                    local_files.append((local_path, entry["kind"]))
-            except Exception as exc:
-                log.warning(f"YaDisk: session download failed, keeping inbox: {exc}")
-                return False
-
-            if not await _tg_send_session(local_files):
-                log.warning(f"YaDisk: Telegram failed for {manifest['session_id']}, keeping inbox")
-                return False
-
-        sent.append(manifest_name)
-        _state_save()
-
-    if not await _move_to_done(manifest_name):
-        return False
-    if manifest_name in sent:
-        sent.remove(manifest_name)
-        _state_save()
-    log.info(f"YaDisk: completed manifest {manifest_name}")
+        if not await _tg_send_session(local_files):
+            log.warning(f"YaDisk: Telegram failed for {manifest['session_id']}, keeping inbox")
+            return False
     return True
 
 
-async def _poll_once() -> None:
+async def _finish_message(
+    item: dict,
+    processor: Callable[[], Awaitable[bool]] | None = None,
+) -> bool:
+    """Process once, then durably retry only the move if it fails."""
+    message_name = item["name"]
+    handled = _state["handled_messages"]
+    if message_name not in handled:
+        if processor is None or not await processor():
+            return False
+        handled.append(message_name)
+        _state_save()
+
+    if not await _move_to_done(message_name):
+        return False
+    if message_name in handled:
+        handled.remove(message_name)
+        _state_save()
+    log.info(f"YaDisk: completed inbox message {message_name}")
+    return True
+
+
+async def _process_manifest(item: dict, data: dict | None = None) -> bool:
+    """Process one session message directly; primarily useful for live checks."""
+    if item["name"] in _state["handled_messages"]:
+        return await _finish_message(item)
+    try:
+        if data is None:
+            remote_path = str(item.get("path", "")).removeprefix("disk:")
+            data = json.loads((await _download_bytes(remote_path)).decode("utf-8"))
+        manifest = validate_manifest(data)
+    except Exception as exc:
+        log.warning(f"YaDisk: invalid session message {item['name']}: {exc}")
+        return False
+    return await _finish_message(item, lambda: _deliver_session(manifest))
+
+
+async def _process_response(
+    item: dict,
+    data: dict,
+    handler: ResponseHandler,
+) -> bool:
+    try:
+        response = yadisk_control.validate_response(data, item["name"])
+    except Exception as exc:
+        log.warning(f"YaDisk: invalid command response {item['name']}: {exc}")
+        return False
+    return await _finish_message(item, lambda: handler(response))
+
+
+async def _message_worker(
+    queue: asyncio.Queue,
+    response_handler: ResponseHandler,
+) -> None:
+    while True:
+        item, data, message_type = await queue.get()
+        try:
+            if message_type == "handled":
+                await _finish_message(item)
+            elif message_type == "session_ready":
+                await _process_manifest(item, data)
+            else:
+                await _process_response(item, data, response_handler)
+        except Exception as exc:
+            log.warning(f"YaDisk: processing {item.get('name', '?')} failed: {exc}")
+        finally:
+            _inflight.discard(item.get("name", ""))
+            queue.task_done()
+
+
+async def _poll_once(
+    session_queue: asyncio.Queue,
+    response_queue: asyncio.Queue,
+) -> None:
     if not await _connect():
         return
     for item in await _list_inbox():
-        await _process_manifest(item)
-
-
-async def yadisk_poll_loop() -> None:
-    """Poll forever; all failed manifests remain in the durable inbox."""
-    while True:
+        message_name = item["name"]
+        if message_name in _inflight:
+            continue
+        if message_name in _state["handled_messages"]:
+            _inflight.add(message_name)
+            await response_queue.put((item, None, "handled"))
+            continue
+        remote_path = str(item.get("path", "")).removeprefix("disk:")
         try:
-            await _poll_once()
+            data = json.loads((await _download_bytes(remote_path)).decode("utf-8"))
+            message_type = data.get("message_type") if isinstance(data, dict) else None
+            if message_type == "session_ready":
+                validate_manifest(data)
+                target_queue = session_queue
+            elif message_type == "command_response":
+                target_queue = response_queue
+            else:
+                raise ValueError("unknown message_type")
         except Exception as exc:
-            log.warning(f"YaDisk: poll failed: {exc}")
-            await _close_sessions()
-        await asyncio.sleep(POLL_INTERVAL)
+            log.warning(f"YaDisk: invalid inbox message {message_name}: {exc}")
+            continue
+        _inflight.add(message_name)
+        await target_queue.put((item, data, message_type))
 
 
-async def yadisk_init(folder: str, tg_token: str, tg_chat: str) -> bool:
-    """Configure the poller. The loop retries if the initial connection fails."""
-    global _folder, _token, _tg_token, _tg_chat, _configured
+async def yadisk_poll_loop(response_handler: ResponseHandler) -> None:
+    """Poll one stable inbox and dispatch media and responses independently."""
+    session_queue = asyncio.Queue()
+    response_queue = asyncio.Queue()
+    workers = [
+        asyncio.create_task(_message_worker(session_queue, response_handler)),
+        asyncio.create_task(_message_worker(response_queue, response_handler)),
+    ]
+    try:
+        while True:
+            try:
+                await _poll_once(session_queue, response_queue)
+            except Exception as exc:
+                log.warning(f"YaDisk: poll failed: {exc}")
+            await asyncio.sleep(POLL_INTERVAL)
+    finally:
+        for worker in workers:
+            worker.cancel()
+        await asyncio.gather(*workers, return_exceptions=True)
+
+
+async def yadisk_init(
+    folder: str,
+    control_folder: str,
+    tg_token: str,
+    tg_chat: str,
+) -> bool:
+    """Configure the unified inbox poller and make its initial connection."""
+    global _folder, _bus_root, _token, _tg_token, _tg_chat, _configured
     _state_load()
+    _inflight.clear()
     _token = os.environ.get("YADISK_TOKEN", "").strip()
     folder_name = str(folder or "").strip().strip("/")
+    bus_name = str(control_folder or "").strip().strip("/")
     if not _token:
         log.warning("YaDisk: YADISK_TOKEN not set")
         return False
     if not folder_name or any(part in ("", ".", "..") for part in folder_name.split("/")):
         log.warning("YaDisk: event folder is missing or invalid")
         return False
+    if not bus_name or any(part in ("", ".", "..") for part in bus_name.split("/")):
+        log.warning("YaDisk: control folder is missing or invalid")
+        return False
 
     _folder = "/" + folder_name
+    _bus_root = "/" + bus_name
     _tg_token = tg_token
     _tg_chat = tg_chat
     _configured = True
@@ -387,7 +505,7 @@ async def yadisk_init(folder: str, tg_token: str, tg_chat: str) -> bool:
     if not connected:
         log.warning("YaDisk: initial connection failed; poll loop will retry")
     else:
-        log.info(f"YaDisk: watching {_folder}/_sessions/inbox")
+        log.info(f"YaDisk: watching {_bus_root}/to_vps every {POLL_INTERVAL}s")
     return True
 
 
@@ -400,7 +518,7 @@ def validate_event_name(folder: str) -> str:
 
 
 async def set_event_folder(folder: str) -> None:
-    """Activate one event folder for future polling."""
+    """Activate the event folder used by /link and persisted VPS state."""
     global _folder
     name = validate_event_name(folder)
     target = "/" + name
@@ -408,10 +526,8 @@ async def set_event_folder(folder: str) -> None:
         return
     if not await _connect():
         raise RuntimeError("Yandex.Disk poller is unavailable")
-    for path in (target, f"{target}/_sessions", f"{target}/_sessions/inbox",
-                 f"{target}/_sessions/done"):
-        if not await _ensure_directory(path):
-            raise RuntimeError(f"cannot create event directory {path}")
+    if not await _ensure_directory(target):
+        raise RuntimeError(f"cannot create event directory {target}")
     _folder = target
     _state_save()
     log.info(f"YaDisk: active event changed to {_folder}")

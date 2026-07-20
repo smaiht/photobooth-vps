@@ -5,6 +5,7 @@ import io
 import json
 import logging
 import os
+import time
 import zipfile
 from pathlib import Path
 
@@ -31,7 +32,6 @@ TG_TOKEN = os.environ.get("TG_BOT_TOKEN", "")
 TG_CHAT = os.environ.get("TG_CHAT_ID", "")
 TG_ADMIN = os.environ.get("TG_ADMIN_ID", "")
 GITHUB_RELEASE_URL = os.environ.get("GITHUB_RELEASE_URL", "")
-GITHUB_REPO_ZIP_URL = os.environ.get("GITHUB_REPO_ZIP_URL", "")
 
 TG_COMMANDS = {
     "/run": "run",
@@ -41,7 +41,6 @@ TG_COMMANDS = {
     "/restart": "restart",
     "/link": "link",
     "/update": "update",
-    "/update_small": "update_small",
 }
 TG_COMMAND_KEYBOARD = {
     "inline_keyboard": [
@@ -101,21 +100,70 @@ async def _tg_answer_callback(
             log.warning(f"TG answerCallbackQuery failed: {await response.text()}")
 
 
-async def _do_update(small: bool = False) -> str:
-    url = GITHUB_REPO_ZIP_URL if small else GITHUB_RELEASE_URL
-    variable = "GITHUB_REPO_ZIP_URL" if small else "GITHUB_RELEASE_URL"
-    if not url:
-        raise RuntimeError(f"{variable} не задан")
+async def _do_update() -> str:
+    if not GITHUB_RELEASE_URL:
+        raise RuntimeError("GITHUB_RELEASE_URL не задан")
 
-    log.info(f"Downloading update from {url}")
+    started_at = time.monotonic()
+    log.info("Update: requested, downloading full release from GITHUB_RELEASE_URL")
     async with aiohttp.ClientSession() as download_session:
         async with download_session.get(
-            url, timeout=aiohttp.ClientTimeout(total=300),
+            GITHUB_RELEASE_URL, timeout=aiohttp.ClientTimeout(total=300),
         ) as response:
+            content_length = response.content_length
+            expected_text = (
+                f"{content_length / 1048576:.1f} MiB"
+                if content_length is not None else "unknown size"
+            )
+            log.info(
+                "Update: GitHub responded HTTP %s, content-length=%s",
+                response.status, expected_text,
+            )
             if response.status != 200:
                 raise RuntimeError(f"GitHub вернул HTTP {response.status}")
-            zip_data = await response.read()
 
+            download_started = time.monotonic()
+            last_report_at = download_started
+            last_report_bytes = 0
+            next_report_bytes = 10 * 1024 * 1024
+            downloaded = io.BytesIO()
+            async for chunk in response.content.iter_chunked(1024 * 1024):
+                downloaded.write(chunk)
+                total = downloaded.tell()
+                now = time.monotonic()
+                if total >= next_report_bytes or now - last_report_at >= 5:
+                    interval = max(now - last_report_at, 0.001)
+                    elapsed = max(now - download_started, 0.001)
+                    current_speed = (total - last_report_bytes) / interval / 1048576
+                    average_speed = total / elapsed / 1048576
+                    progress = (
+                        f", {total * 100 / content_length:.1f}%"
+                        if content_length else ""
+                    )
+                    log.info(
+                        "Update: GitHub download %.1f MiB%s, "
+                        "speed=%.1f MiB/s, average=%.1f MiB/s",
+                        total / 1048576, progress,
+                        current_speed, average_speed,
+                    )
+                    last_report_at = now
+                    last_report_bytes = total
+                    next_report_bytes = total + 10 * 1024 * 1024
+
+            zip_data = downloaded.getvalue()
+            download_elapsed = max(time.monotonic() - download_started, 0.001)
+            if content_length is not None and len(zip_data) != content_length:
+                raise RuntimeError(
+                    f"GitHub download size mismatch: {len(zip_data)}/{content_length}")
+            log.info(
+                "Update: GitHub download complete, %.1f MiB in %.1fs "
+                "(average %.1f MiB/s)",
+                len(zip_data) / 1048576, download_elapsed,
+                len(zip_data) / download_elapsed / 1048576,
+            )
+
+    validation_started = time.monotonic()
+    log.info("Update: validating downloaded ZIP CRC")
     try:
         with zipfile.ZipFile(io.BytesIO(zip_data)) as downloaded_zip:
             bad_member = downloaded_zip.testzip()
@@ -124,31 +172,34 @@ async def _do_update(small: bool = False) -> str:
             downloaded_names = downloaded_zip.namelist()
     except zipfile.BadZipFile as exc:
         raise RuntimeError("GitHub вернул невалидный ZIP") from exc
-
-    if small:
-        skip = ("python/", "bin/", "EDSDK_Win/", ".git/")
-        output = io.BytesIO()
-        with zipfile.ZipFile(io.BytesIO(zip_data)) as source, \
-             zipfile.ZipFile(output, "w", zipfile.ZIP_DEFLATED) as target:
-            prefix = downloaded_names[0] if downloaded_names and downloaded_names[0].endswith("/") else ""
-            for item in downloaded_names:
-                relative = item[len(prefix):] if prefix else item
-                if not relative or any(relative.startswith(part) for part in skip):
-                    continue
-                target.writestr(relative, source.read(item))
-        zip_data = output.getvalue()
+    log.info(
+        "Update: source ZIP valid, %d entries checked in %.1fs",
+        len(downloaded_names), time.monotonic() - validation_started,
+    )
 
     with zipfile.ZipFile(io.BytesIO(zip_data)) as release_zip:
         names = [name.replace("\\", "/") for name in release_zip.namelist()]
         if "app.py" not in names:
             raise RuntimeError("ZIP не содержит app.py в корне")
+    log.info(
+        "Update: release ZIP structure accepted, entries=%d, size=%.1f MiB",
+        len(names), len(zip_data) / 1048576,
+    )
 
-    kind = "small" if small else "full"
     updates_folder = CONFIG.get("yadisk_updates_folder", "photobooth_system/updates")
-    status = await yadisk_updates.publish_update(zip_data, kind, updates_folder)
-    artifact = status["artifacts"][kind]
+    log.info(
+        "Update: publishing to Yandex.Disk folder /%s",
+        str(updates_folder).strip("/"),
+    )
+    status = await yadisk_updates.publish_update(zip_data, updates_folder)
+    artifact = status["artifacts"]["full"]
+    log.info(
+        "Update: finished successfully in %.1fs, sha256=%s, size=%.1f MiB",
+        time.monotonic() - started_at, artifact["sha256"][:16],
+        len(zip_data) / 1048576,
+    )
     return (
-        f"✅ Обновление загружено на Диск ({kind})\n"
+        "✅ Полное обновление загружено на Диск\n"
         f"ZIP: {len(zip_data) / 1048576:.1f} MB\n"
         f"SHA: {artifact['sha256'][:16]}\n"
         "Для установки отправь /restart"
@@ -202,12 +253,12 @@ async def _tg_handle_admin_command(
         await _tg_show_keyboard(telegram, base, chat_id)
         return
 
-    if command in ("update", "update_small"):
-        label = "код" if command == "update_small" else "полный релиз"
-        await _tg_send_text(telegram, base, chat_id, f"⏳ Скачиваю {label}...")
+    if command == "update":
+        await _tg_send_text(telegram, base, chat_id, "⏳ Скачиваю полный релиз...")
         try:
-            result = await _do_update(small=command == "update_small")
+            result = await _do_update()
         except Exception as exc:
+            log.exception("Update %s failed", command)
             result = f"❌ Ошибка: {exc}"
         await _tg_send_text(telegram, base, chat_id, result)
         return
@@ -346,14 +397,15 @@ async def _handle_control_response(response: dict) -> bool:
 
 async def main() -> None:
     yadisk_folder = CONFIG.get("yadisk_folder", "")
-    if not await yadisk_poll.yadisk_init(yadisk_folder, TG_TOKEN, TG_CHAT):
-        log.error("Yandex.Disk media poller is not configured")
-    else:
-        asyncio.create_task(yadisk_poll.yadisk_poll_loop())
-
     control_folder = CONFIG.get("yadisk_control_folder", "photobooth_system/control")
+    inbox_ready = await yadisk_poll.yadisk_init(
+        yadisk_folder, control_folder, TG_TOKEN, TG_CHAT)
     await yadisk_control.control_init(control_folder)
-    asyncio.create_task(yadisk_control.response_poll_loop(_handle_control_response))
+    if not inbox_ready:
+        log.error("Yandex.Disk inbox poller is not configured")
+    else:
+        asyncio.create_task(yadisk_poll.yadisk_poll_loop(_handle_control_response))
+
     asyncio.create_task(tg_poll_commands())
     await asyncio.Event().wait()
 

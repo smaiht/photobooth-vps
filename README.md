@@ -2,8 +2,11 @@
 
 VPS связывает Telegram с фотобудкой через сервисы Яндекса:
 
-- media: Яндекс Диск, `<event>/_sessions/inbox/*.json`;
-- commands, responses and logs: `photobooth_system/control` на Диске;
+- media: файлы в `<event>`, уведомления `session_ready` в
+  `photobooth_system/control/to_vps`;
+- commands: `photobooth_system/control/to_booth`;
+- command responses: общий с сессиями `photobooth_system/control/to_vps`;
+- processed messages and logs: `photobooth_system/control/done` и `logs`;
 - update artifacts and `status.json`: `photobooth_system/updates` на Диске;
 - delivery: Telegram Bot API.
 
@@ -11,13 +14,21 @@ VPS связывает Telegram с фотобудкой через сервис�
 
 1. Отправить `/event Название события` Telegram-боту.
 2. Дождаться подтверждения будки и VPS.
-3. После тестовой сессии убедиться, что медиа появились в корне, а манифест
-   был перенесён из `_sessions/inbox` в `_sessions/done`.
+3. После тестовой сессии убедиться, что медиа появились в event-корне, а
+   `session_*.json` был перенесён из `control/to_vps` в `control/done/to_vps`.
 4. Отправить `/link` и передать владельцу полученный `public_url`.
 
-VPS не удаляет и не перемещает медиа. При ошибке скачивания или Telegram
-манифест остаётся в inbox и повторяется. `/event` переключает одну активную
-папку и отклоняется будкой, если ещё идёт сессия или локальная загрузка.
+VPS раз в 10 секунд листит один стабильный `to_vps`. Ответы команд и готовые
+сессии обрабатываются независимыми asyncio workers, поэтому загрузка видео не
+блокирует подтверждение команды. VPS не удаляет и не перемещает медиа. При
+ошибке скачивания или Telegram сообщение остаётся в `to_vps` и повторяется.
+`session_ready` содержит свой `event_folder`, поэтому доставка не зависит от
+одновременного переключения event на будке и VPS. `/event` отклоняется будкой,
+если ещё идёт сессия или локальная загрузка.
+
+Это protocol v2 с новыми путями. При переходе нужно дождаться пустых старых
+`_sessions/inbox`, `commands/inbox` и `responses`, затем обновить будку первой,
+а VPS сразу после неё. Старые каталоги после перехода не поллятся.
 
 ## Обновления
 
@@ -26,24 +37,22 @@ Secrets не нужен.
 
 ```text
 push в main → дождаться успешного GitHub Actions
-             → /update или /update_small
-             → VPS перезаписывает full.zip или small.zip на Диске
+             → /update
+             → VPS перезаписывает artifacts/full.zip на Диске
              → status.json записывается последним
              → администратор отправляет /restart
 ```
 
-`status.json` хранит SHA-256 обоих артефактов и поле `active`. Будка сравнивает
-SHA активного ZIP с локальным `.update_hash`; отдельной нумерации версий нет.
-
-`/update_small` перепаковывает ZIP исходников без runtime. `/update` использует
-готовый Windows release. Будке GitHub не нужен.
+`status.json` хранит метаданные единственного полного артефакта и совместимое
+поле `active: "full"`. Будка сравнивает SHA ZIP с локальным `.update_hash`;
+отдельной нумерации версий нет. `/update` использует готовый Windows release,
+будке доступ к GitHub не нужен.
 
 ## Переменные окружения
 
 - `YADISK_TOKEN` — один действующий OAuth-токен Диска на VPS и будке;
 - `TG_BOT_TOKEN`, `TG_CHAT_ID`, `TG_ADMIN_ID` — Telegram;
-- `GITHUB_RELEASE_URL` — URL `photobooth-win.zip` из release `latest`;
-- `GITHUB_REPO_ZIP_URL` — URL ZIP ветки `main` для small update.
+- `GITHUB_RELEASE_URL` — URL `photobooth-win.zip` из release `latest`.
 
 `docker-compose.yml` загружает их из локального `.env`. Секреты не хранятся в
 репозитории.
