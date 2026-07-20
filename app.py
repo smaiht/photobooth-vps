@@ -121,6 +121,7 @@ async def _do_update() -> str:
             )
             if response.status != 200:
                 raise RuntimeError(f"GitHub вернул HTTP {response.status}")
+            resolved_release_url = str(response.url)
 
             download_started = time.monotonic()
             last_report_at = download_started
@@ -191,7 +192,8 @@ async def _do_update() -> str:
         "Update: publishing to Yandex.Disk folder /%s",
         str(updates_folder).strip("/"),
     )
-    status = await yadisk_updates.publish_update(zip_data, updates_folder)
+    status = await yadisk_updates.publish_update(
+        zip_data, updates_folder, source_url=resolved_release_url)
     artifact = status["artifacts"]["full"]
     log.info(
         "Update: finished successfully in %.1fs, sha256=%s, size=%.1f MiB",

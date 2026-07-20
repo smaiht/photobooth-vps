@@ -48,6 +48,12 @@ push в main → дождаться успешного GitHub Actions
 отдельной нумерации версий нет. `/update` использует готовый Windows release,
 будке доступ к GitHub не нужен.
 
+VPS скачивает release для проверки ZIP, а на Диск файл попадает через
+server-side import конечного GitHub asset URL. После проверки size/MD5 временный
+ресурс атомарно заменяет `artifacts/full.zip`, и только затем публикуется
+`status.json`. Если URL-import недоступен, используется прямой PUT с прогрессом
+и 30-минутным timeout.
+
 ## Переменные окружения
 
 - `YADISK_TOKEN` — один действующий OAuth-токен Диска на VPS и будке;

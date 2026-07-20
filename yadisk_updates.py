@@ -8,14 +8,63 @@ import json
 import logging
 import os
 import time
+import uuid
 from datetime import datetime, timezone
 
 import aiohttp
+from aiohttp.payload import Payload
 
 log = logging.getLogger(__name__)
 
 API = "https://cloud-api.yandex.net/v1/disk"
 SCHEMA_VERSION = 1
+TRANSFER_CHUNK_SIZE = 1024 * 1024
+PROGRESS_BYTES = 10 * 1024 * 1024
+PROGRESS_SECONDS = 5
+TRANSFER_TIMEOUT_SECONDS = 30 * 60
+OPERATION_MAX_ATTEMPTS = 300
+OPERATION_POLL_SECONDS = 1
+
+
+class _ProgressBytesPayload(Payload):
+    """Stream an in-memory artifact while reporting actual socket writes."""
+
+    _autoclose = True
+
+    def __init__(self, value: bytes, path: str):
+        super().__init__(value, content_type="application/octet-stream")
+        self._value = memoryview(value)
+        self._size = len(value)
+        self._path = path
+
+    def decode(self, encoding: str = "utf-8", errors: str = "strict") -> str:
+        return self._value.tobytes().decode(encoding, errors)
+
+    async def write(self, writer) -> None:
+        started_at = time.monotonic()
+        last_report_at = started_at
+        last_report_bytes = 0
+        next_report_bytes = PROGRESS_BYTES
+
+        for start in range(0, self._size, TRANSFER_CHUNK_SIZE):
+            end = min(start + TRANSFER_CHUNK_SIZE, self._size)
+            await writer.write(self._value[start:end])
+            now = time.monotonic()
+            if (end >= next_report_bytes or now - last_report_at >= PROGRESS_SECONDS
+                    or end == self._size):
+                interval = max(now - last_report_at, 0.001)
+                elapsed = max(now - started_at, 0.001)
+                current_speed = (end - last_report_bytes) / interval / 1048576
+                average_speed = end / elapsed / 1048576
+                log.info(
+                    "YaDisk update: upload progress path=%s %.1f/%.1f MiB "
+                    "(%.1f%%), speed=%.1f MiB/s, average=%.1f MiB/s",
+                    self._path, end / 1048576, self._size / 1048576,
+                    end * 100 / self._size, current_speed, average_speed,
+                )
+                last_report_at = now
+                last_report_bytes = end
+                next_report_bytes = end + PROGRESS_BYTES
 
 
 def normalize_folder(folder: str) -> str:
@@ -86,6 +135,128 @@ async def _resource_matches(session: aiohttp.ClientSession, path: str,
     return False
 
 
+async def _wait_operation(
+    session: aiohttp.ClientSession,
+    href: str,
+    label: str,
+) -> None:
+    for attempt in range(1, OPERATION_MAX_ATTEMPTS + 1):
+        async with session.get(href) as response:
+            if response.status != 200:
+                raise RuntimeError(
+                    f"Yandex.Disk operation {label}: HTTP {response.status} "
+                    f"{await response.text()}")
+            operation = await response.json()
+        status = operation.get("status")
+        if attempt == 1 or attempt % 5 == 0 or status != "in-progress":
+            log.info(
+                "YaDisk update: operation=%s attempt=%d/%d status=%s",
+                label, attempt, OPERATION_MAX_ATTEMPTS, status,
+            )
+        if status == "success":
+            return
+        if status == "failed":
+            raise RuntimeError(f"Yandex.Disk operation failed: {label}")
+        await asyncio.sleep(OPERATION_POLL_SECONDS)
+    raise TimeoutError(f"Yandex.Disk operation timed out: {label}")
+
+
+async def _delete_staging(session: aiohttp.ClientSession, path: str) -> None:
+    try:
+        async with session.delete(
+            f"{API}/resources",
+            params={"path": path, "permanently": "true"},
+        ) as response:
+            if response.status not in (202, 204, 404):
+                log.warning(
+                    "YaDisk update: staging cleanup path=%s HTTP %s: %s",
+                    path, response.status, await response.text(),
+                )
+                return
+            log.info(
+                "YaDisk update: staging cleanup path=%s HTTP %s",
+                path, response.status,
+            )
+    except Exception as exc:
+        log.warning("YaDisk update: staging cleanup failed path=%s: %s", path, exc)
+
+
+async def _move_overwrite(
+    session: aiohttp.ClientSession,
+    source: str,
+    destination: str,
+) -> None:
+    async with session.post(
+        f"{API}/resources/move",
+        params={"from": source, "path": destination, "overwrite": "true"},
+    ) as response:
+        if response.status == 201:
+            log.info("YaDisk update: staging move completed synchronously")
+            return
+        if response.status != 202:
+            raise RuntimeError(
+                f"move imported update: HTTP {response.status} {await response.text()}")
+        href = (await response.json()).get("href")
+    if not href:
+        raise RuntimeError("move imported update did not return operation URL")
+    await _wait_operation(session, href, "move imported artifact")
+
+
+async def _import_url(
+    session: aiohttp.ClientSession,
+    source_url: str,
+    destination: str,
+    payload: bytes,
+) -> None:
+    """Let Yandex fetch an immutable release URL, verify it, then move atomically."""
+    expected_size = len(payload)
+    expected_md5 = hashlib.md5(payload).hexdigest()
+    parent, filename = destination.rsplit("/", 1)
+    staging = f"{parent}/.{filename}.{uuid.uuid4().hex}.incoming.zip"
+    log.info(
+        "YaDisk update: server-side import requested staging=%s "
+        "size=%.1f MiB md5=%s",
+        staging, expected_size / 1048576, expected_md5,
+    )
+
+    staging_moved = False
+    try:
+        async with session.post(
+            f"{API}/resources/upload",
+            params={
+                "url": source_url,
+                "path": staging,
+                "disable_redirects": "false",
+            },
+        ) as response:
+            if response.status != 202:
+                raise RuntimeError(
+                    f"server-side import: HTTP {response.status} {await response.text()}")
+            href = (await response.json()).get("href")
+        if not href:
+            raise RuntimeError("server-side import did not return operation URL")
+
+        await _wait_operation(session, href, "import release URL")
+        if not await _resource_matches(
+            session, staging, expected_size, expected_md5,
+        ):
+            raise RuntimeError("server-side imported artifact did not verify")
+        log.info(
+            "YaDisk update: imported artifact verified; moving %s -> %s",
+            staging, destination,
+        )
+        await _move_overwrite(session, staging, destination)
+        staging_moved = True
+        if not await _resource_matches(
+            session, destination, expected_size, expected_md5,
+        ):
+            raise RuntimeError("moved imported artifact did not verify")
+        log.info("YaDisk update: server-side import complete path=%s", destination)
+    finally:
+        if not staging_moved:
+            await _delete_staging(session, staging)
+
+
 async def _upload_bytes(api_session: aiohttp.ClientSession,
                         transfer_session: aiohttp.ClientSession,
                         path: str, payload: bytes) -> None:
@@ -107,7 +278,8 @@ async def _upload_bytes(api_session: aiohttp.ClientSession,
 
     upload_started = time.monotonic()
     log.info("YaDisk update: upload started path=%s size=%.1f MiB", path, size / 1048576)
-    async with transfer_session.put(href, data=payload) as response:
+    body = _ProgressBytesPayload(payload, path)
+    async with transfer_session.put(href, data=body) as response:
         if response.status not in (201, 202):
             raise RuntimeError(
                 f"upload update resource {path}: {response.status} {await response.text()}")
@@ -123,7 +295,11 @@ async def _upload_bytes(api_session: aiohttp.ClientSession,
         raise RuntimeError(f"uploaded update resource did not verify: {path}")
 
 
-async def publish_update(payload: bytes, folder: str) -> dict:
+async def publish_update(
+    payload: bytes,
+    folder: str,
+    source_url: str | None = None,
+) -> dict:
     """Overwrite the full artifact, then publish its status pointer last."""
     token = os.environ.get("YADISK_TOKEN", "").strip()
     if not token:
@@ -146,7 +322,8 @@ async def publish_update(payload: bytes, folder: str) -> dict:
         root, len(payload) / 1048576, sha256[:16],
     )
     api_timeout = aiohttp.ClientTimeout(total=90, connect=20)
-    transfer_timeout = aiohttp.ClientTimeout(total=600, connect=30)
+    transfer_timeout = aiohttp.ClientTimeout(
+        total=TRANSFER_TIMEOUT_SECONDS, connect=30)
     async with aiohttp.ClientSession(
         headers={"Authorization": f"OAuth {token}"}, timeout=api_timeout,
     ) as api_session, aiohttp.ClientSession(timeout=transfer_timeout) as transfer_session:
@@ -158,11 +335,26 @@ async def publish_update(payload: bytes, folder: str) -> dict:
         }
         status_payload = json.dumps(
             status, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
-        log.info(
-            "YaDisk update: stage 1/2 uploading artifact path=%s",
-            artifact_path,
-        )
-        await _upload_bytes(api_session, transfer_session, artifact_path, payload)
+        if source_url:
+            log.info(
+                "YaDisk update: stage 1/2 importing artifact from resolved release URL "
+                "path=%s",
+                artifact_path,
+            )
+            try:
+                await _import_url(api_session, source_url, artifact_path, payload)
+            except Exception:
+                log.exception(
+                    "YaDisk update: server-side import failed; falling back to direct PUT")
+                await _upload_bytes(
+                    api_session, transfer_session, artifact_path, payload)
+        else:
+            log.info(
+                "YaDisk update: stage 1/2 uploading artifact directly path=%s",
+                artifact_path,
+            )
+            await _upload_bytes(
+                api_session, transfer_session, artifact_path, payload)
         log.info(
             "YaDisk update: stage 1/2 artifact verified; "
             "stage 2/2 publishing status pointer path=%s",
