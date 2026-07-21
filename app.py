@@ -11,6 +11,8 @@ from pathlib import Path
 
 import aiohttp
 
+import database
+import migrate
 import yadisk_control
 import yadisk_poll
 import yadisk_updates
@@ -217,6 +219,37 @@ def _event_name_from_command(text: str) -> str | None:
     return yadisk_poll.validate_event_name(argument.strip())
 
 
+def _start_parameter_from_command(text: str) -> tuple[bool, str | None]:
+    command, separator, argument = (text or "").strip().partition(" ")
+    if command.split("@", 1)[0].lower() != "/start":
+        return False, None
+    parameter = argument.strip() if separator else ""
+    return True, parameter or None
+
+
+async def _record_telegram_start(update: dict, message: dict) -> bool:
+    matched, parameter = _start_parameter_from_command(message.get("text", ""))
+    if not matched:
+        return False
+    sender = message.get("from") or {}
+    user_id = sender.get("id")
+    if user_id is None:
+        log.warning("TG /start ignored: sender id is missing")
+        return True
+    await database.record_bot_start(
+        provider="telegram",
+        provider_user_id=user_id,
+        start_parameter=parameter,
+        provider_update_id=update.get("update_id"),
+        username=sender.get("username"),
+        first_name=sender.get("first_name"),
+        last_name=sender.get("last_name"),
+        profile={},
+    )
+    log.info("TG /start stored for user=%s parameter=%r", user_id, parameter)
+    return True
+
+
 async def _send_disk_command(
     command: str,
     chat_id: str | int,
@@ -303,25 +336,29 @@ async def tg_poll_commands() -> None:
                 ) as response:
                     data = await response.json()
                 for update in data.get("result", []):
-                    offset = update["update_id"] + 1
+                    next_offset = update["update_id"] + 1
                     message = update.get("message")
                     if message:
+                        await _record_telegram_start(update, message)
                         user_id = message.get("from", {}).get("id")
                         if is_admin(user_id):
                             chat_id = message.get("chat", {}).get("id", user_id)
                             await _tg_handle_admin_command(
                                 telegram, base, chat_id, message.get("text", ""))
-                        continue
-
-                    callback = update.get("callback_query")
-                    if callback:
-                        user_id = callback.get("from", {}).get("id")
-                        if not is_admin(user_id):
-                            continue
-                        await _tg_answer_callback(telegram, base, callback.get("id"))
-                        chat_id = callback.get("message", {}).get("chat", {}).get("id", user_id)
-                        await _tg_handle_admin_command(
-                            telegram, base, chat_id, callback.get("data", ""))
+                    else:
+                        callback = update.get("callback_query")
+                        if callback:
+                            user_id = callback.get("from", {}).get("id")
+                            if is_admin(user_id):
+                                await _tg_answer_callback(
+                                    telegram, base, callback.get("id"))
+                                chat_id = callback.get("message", {}).get(
+                                    "chat", {}).get("id", user_id)
+                                await _tg_handle_admin_command(
+                                    telegram, base, chat_id, callback.get("data", ""))
+                    # Confirm an update only after every durable side effect succeeded.
+                    # A DB failure therefore retries /start instead of silently losing it.
+                    offset = next_offset
             except Exception as exc:
                 log.warning(f"TG poll error: {exc}")
                 await asyncio.sleep(5)
@@ -398,6 +435,10 @@ async def _handle_control_response(response: dict) -> bool:
 
 
 async def main() -> None:
+    log.info("Database: applying pending migrations")
+    await asyncio.to_thread(migrate.apply_migrations)
+    log.info("Database: schema is ready")
+
     yadisk_folder = CONFIG.get("yadisk_folder", "")
     control_folder = CONFIG.get("yadisk_control_folder", "photobooth_system/control")
     inbox_ready = await yadisk_poll.yadisk_init(

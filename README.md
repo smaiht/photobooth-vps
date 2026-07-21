@@ -59,9 +59,40 @@ server-side import конечного GitHub asset URL. После провер�
 - `YADISK_TOKEN` — один действующий OAuth-токен Диска на VPS и будке;
 - `TG_BOT_TOKEN`, `TG_CHAT_ID`, `TG_ADMIN_ID` — Telegram;
 - `GITHUB_RELEASE_URL` — URL `photobooth-win.zip` из release `latest`.
+- `POSTGRES_PASSWORD` — обязательный пароль локального PostgreSQL;
+- `POSTGRES_DB`, `POSTGRES_USER` — необязательные имя базы и пользователь,
+  по умолчанию оба используют `photobooth`.
+- `DB_HOST=postgres`, `DB_PORT=5432` — адрес PostgreSQL внутри Compose-сети;
+  `DB_NAME`, `DB_USER`, `DB_PASSWORD` можно задать отдельно, иначе приложение
+  использует соответствующие `POSTGRES_*`.
 
 `docker-compose.yml` загружает их из локального `.env`. Секреты не хранятся в
 репозитории.
+
+## PostgreSQL и миграции
+
+Compose запускает PostgreSQL 18 в сервисе `postgres`; данные лежат в именованном
+volume `postgres_data` и переживают пересоздание контейнеров. Порт базы наружу
+не публикуется.
+
+После успешного healthcheck PostgreSQL сервис `app` запускается и первым делом,
+до Telegram и Яндекс.Диска, применяет новые SQL-файлы из `migrations/`.
+Применённые версии, SHA-256 исходного SQL и время хранятся в
+`schema_migrations`. Advisory lock защищает от одновременного запуска двух
+экземпляров. Уже применённый файл менять нельзя: проверка checksum остановит
+запуск; изменение схемы добавляется следующим файлом, например
+`0002_events.sql`.
+
+Первая миграция создаёт:
+
+- `bot_users` — общую таблицу пользователей Telegram и MAX с уникальной парой
+  `(provider, provider_user_id)`, первым и текущим параметрами `/start`;
+- `bot_start_events` — отдельную неизменяемую историю запусков без JSON-массива.
+
+Telegram `/start` уже записывается в эти таблицы. Повторная доставка одного
+`update_id` не создаёт повторное событие. Поле `language_code` не хранится.
+Схема готова для `provider=max`; когда появится MAX-обработчик, он будет вызывать
+тот же слой `database.record_bot_start`.
 
 Официальная документация API:
 
