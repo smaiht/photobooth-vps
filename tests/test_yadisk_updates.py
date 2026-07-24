@@ -2,7 +2,7 @@ import io
 import json
 import unittest
 import zipfile
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, call, patch
 
 import app
 import yadisk_updates
@@ -121,6 +121,7 @@ class PublishUpdateTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_falls_back_to_direct_put_when_import_fails(self):
         uploads = []
+        progress = AsyncMock()
 
         async def capture_upload(api_session, transfer_session, path, payload):
             uploads.append((path, payload))
@@ -129,17 +130,67 @@ class PublishUpdateTests(unittest.IsolatedAsyncioTestCase):
              patch("yadisk_updates.aiohttp.ClientSession", side_effect=[_Session(), _Session()]), \
              patch("yadisk_updates._ensure_directories", AsyncMock()), \
              patch("yadisk_updates._import_url", AsyncMock(
-                 side_effect=RuntimeError("import unavailable"))), \
+                 side_effect=RuntimeError("import unavailable"))) as import_url, \
+             patch("yadisk_updates.asyncio.sleep", AsyncMock()) as sleep, \
              patch("yadisk_updates._upload_bytes", side_effect=capture_upload):
             status = await yadisk_updates.publish_update(
                 b"zip payload",
                 "photobooth_system/updates",
                 source_url="https://release-assets.test/immutable.zip",
+                progress_callback=progress,
             )
 
+        self.assertEqual(import_url.await_count, 5)
+        self.assertEqual(
+            sleep.await_args_list,
+            [call(2), call(4), call(8), call(16)],
+        )
         self.assertEqual(len(uploads), 2)
         self.assertEqual(uploads[0][0], status["artifacts"]["full"]["path"])
         self.assertEqual(uploads[1][0], "/photobooth_system/updates/status.json")
+        messages = [item.args[0] for item in progress.await_args_list]
+        self.assertEqual(len(messages), 6)
+        self.assertIn("попытка 1/5", messages[0])
+        self.assertIn("Повтор через 2 с", messages[0])
+        self.assertIn("попытка 5/5", messages[4])
+        self.assertIn("медленную прямую загрузку", messages[5])
+
+    async def test_server_import_retry_can_recover_without_direct_artifact_upload(self):
+        uploads = []
+        progress = AsyncMock()
+
+        async def capture_upload(api_session, transfer_session, path, payload):
+            uploads.append((path, payload))
+
+        import_url = AsyncMock(side_effect=[
+            RuntimeError("temporary 1"),
+            RuntimeError("temporary 2"),
+            None,
+        ])
+        with patch.dict("os.environ", {"YADISK_TOKEN": "test-token"}), \
+             patch("yadisk_updates.aiohttp.ClientSession", side_effect=[_Session(), _Session()]), \
+             patch("yadisk_updates._ensure_directories", AsyncMock()), \
+             patch("yadisk_updates._import_url", import_url), \
+             patch("yadisk_updates.asyncio.sleep", AsyncMock()) as sleep, \
+             patch("yadisk_updates._upload_bytes", side_effect=capture_upload):
+            await yadisk_updates.publish_update(
+                b"zip payload",
+                "photobooth_system/updates",
+                source_url="https://release-assets.test/immutable.zip",
+                progress_callback=progress,
+            )
+
+        self.assertEqual(import_url.await_count, 3)
+        self.assertEqual(sleep.await_args_list, [call(2), call(4)])
+        self.assertEqual(
+            [path for path, _payload in uploads],
+            ["/photobooth_system/updates/status.json"],
+        )
+        messages = [item.args[0] for item in progress.await_args_list]
+        self.assertEqual(len(messages), 3)
+        self.assertIn("попытка 1/5", messages[0])
+        self.assertIn("попытка 2/5", messages[1])
+        self.assertIn("выполнен с попытки 3/5", messages[2])
 
     async def test_update_streams_download_and_logs_pipeline(self):
         archive = io.BytesIO()
@@ -153,16 +204,18 @@ class PublishUpdateTests(unittest.IsolatedAsyncioTestCase):
             },
         }
 
+        progress = AsyncMock()
         with patch.object(app, "GITHUB_RELEASE_URL", "https://github.test/release.zip"), \
              patch("app.aiohttp.ClientSession", return_value=_DownloadSession(payload)), \
              patch("app.yadisk_updates.publish_update", AsyncMock(return_value=published)) as publish, \
              self.assertLogs("app", level="INFO") as captured:
-            result = await app._do_update()
+            result = await app._do_update(progress)
 
         publish.assert_awaited_once_with(
             payload, app.CONFIG.get(
                 "yadisk_updates_folder", "photobooth_system/updates"),
             source_url="https://release-assets.test/immutable.zip",
+            progress_callback=progress,
         )
         self.assertIn("Полное обновление загружено на Диск", result)
         messages = "\n".join(captured.output)

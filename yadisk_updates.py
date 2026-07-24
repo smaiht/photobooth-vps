@@ -10,6 +10,7 @@ import os
 import time
 import uuid
 from datetime import datetime, timezone
+from typing import Awaitable, Callable
 
 import aiohttp
 from aiohttp.payload import Payload
@@ -24,6 +25,10 @@ PROGRESS_SECONDS = 5
 TRANSFER_TIMEOUT_SECONDS = 30 * 60
 OPERATION_MAX_ATTEMPTS = 300
 OPERATION_POLL_SECONDS = 1
+IMPORT_MAX_ATTEMPTS = 5
+IMPORT_RETRY_BASE_SECONDS = 2
+
+ProgressCallback = Callable[[str], Awaitable[None]]
 
 
 class _ProgressBytesPayload(Payload):
@@ -257,6 +262,73 @@ async def _import_url(
             await _delete_staging(session, staging)
 
 
+async def _notify_progress(
+    progress_callback: ProgressCallback | None,
+    message: str,
+) -> None:
+    if progress_callback is None:
+        return
+    try:
+        await progress_callback(message)
+    except Exception:
+        # A Telegram outage must not turn a recoverable Disk operation into a
+        # failed update. The same information remains available in VPS logs.
+        log.exception("YaDisk update: progress notification failed")
+
+
+async def _import_url_with_retries(
+    session: aiohttp.ClientSession,
+    source_url: str,
+    destination: str,
+    payload: bytes,
+    progress_callback: ProgressCallback | None = None,
+) -> None:
+    for attempt in range(1, IMPORT_MAX_ATTEMPTS + 1):
+        log.info(
+            "YaDisk update: server-side import attempt %d/%d",
+            attempt, IMPORT_MAX_ATTEMPTS,
+        )
+        try:
+            await _import_url(session, source_url, destination, payload)
+        except Exception as exc:
+            if attempt == IMPORT_MAX_ATTEMPTS:
+                log.warning(
+                    "YaDisk update: server-side import attempt %d/%d failed; "
+                    "fast attempts exhausted: %s",
+                    attempt, IMPORT_MAX_ATTEMPTS, exc,
+                )
+                await _notify_progress(
+                    progress_callback,
+                    "⚠️ Быстрый импорт на Яндекс.Диск: попытка "
+                    f"{attempt}/{IMPORT_MAX_ATTEMPTS} не удалась: {exc}. "
+                    "Быстрые попытки исчерпаны.",
+                )
+                raise
+
+            delay = IMPORT_RETRY_BASE_SECONDS * (2 ** (attempt - 1))
+            log.warning(
+                "YaDisk update: server-side import attempt %d/%d failed: %s; "
+                "retrying in %ds",
+                attempt, IMPORT_MAX_ATTEMPTS, exc, delay,
+            )
+            await _notify_progress(
+                progress_callback,
+                "⚠️ Быстрый импорт на Яндекс.Диск: попытка "
+                f"{attempt}/{IMPORT_MAX_ATTEMPTS} не удалась: {exc}. "
+                f"Повтор через {delay} с.",
+            )
+            await asyncio.sleep(delay)
+            continue
+
+        if attempt > 1:
+            await _notify_progress(
+                progress_callback,
+                "✅ Быстрый импорт на Яндекс.Диск выполнен с попытки "
+                f"{attempt}/{IMPORT_MAX_ATTEMPTS}.",
+            )
+        return
+
+
 async def _upload_bytes(api_session: aiohttp.ClientSession,
                         transfer_session: aiohttp.ClientSession,
                         path: str, payload: bytes) -> None:
@@ -299,6 +371,7 @@ async def publish_update(
     payload: bytes,
     folder: str,
     source_url: str | None = None,
+    progress_callback: ProgressCallback | None = None,
 ) -> dict:
     """Overwrite the full artifact, then publish its status pointer last."""
     token = os.environ.get("YADISK_TOKEN", "").strip()
@@ -342,10 +415,23 @@ async def publish_update(
                 artifact_path,
             )
             try:
-                await _import_url(api_session, source_url, artifact_path, payload)
+                await _import_url_with_retries(
+                    api_session,
+                    source_url,
+                    artifact_path,
+                    payload,
+                    progress_callback,
+                )
             except Exception:
                 log.exception(
-                    "YaDisk update: server-side import failed; falling back to direct PUT")
+                    "YaDisk update: all server-side import attempts failed; "
+                    "falling back to direct PUT")
+                await _notify_progress(
+                    progress_callback,
+                    "🐢 Быстрый импорт не сработал после "
+                    f"{IMPORT_MAX_ATTEMPTS} попыток. Перехожу на медленную "
+                    "прямую загрузку; она может занять до 30 минут.",
+                )
                 await _upload_bytes(
                     api_session, transfer_session, artifact_path, payload)
         else:

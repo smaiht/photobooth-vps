@@ -110,7 +110,7 @@ async def _connect() -> bool:
             current += "/" + part
             await _ensure_directory(current)
         for suffix in ("to_booth", "to_vps", "done", "done/to_booth",
-                       "done/to_vps", "logs"):
+                       "done/to_vps", "logs", "configs"):
             await _ensure_directory(f"{_root}/{suffix}")
         return True
     except Exception as exc:

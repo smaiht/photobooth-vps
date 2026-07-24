@@ -5,9 +5,11 @@ import io
 import json
 import logging
 import os
+import re
 import time
 import zipfile
 from pathlib import Path
+from typing import Awaitable, Callable
 
 import aiohttp
 
@@ -39,11 +41,18 @@ TG_COMMANDS = {
     "/run": "run",
     "/status": "status",
     "/logs": "send_logs",
+    "/get_config": "get_config",
     "/clear_logs": "clear_logs",
     "/restart": "restart",
     "/link": "link",
     "/update": "update",
 }
+CAMERA_SETTING_COMMAND_RE = re.compile(
+    r"^/([a-z][a-z0-9_]{0,63})(?:@[a-z0-9_]+)?$",
+    re.IGNORECASE,
+)
+RESERVED_TELEGRAM_COMMANDS = set(TG_COMMANDS) | {"/event", "/start"}
+UpdateProgressCallback = Callable[[str], Awaitable[None]]
 TG_COMMAND_KEYBOARD = {
     "inline_keyboard": [
         [{"text": text, "callback_data": text}]
@@ -102,7 +111,9 @@ async def _tg_answer_callback(
             log.warning(f"TG answerCallbackQuery failed: {await response.text()}")
 
 
-async def _do_update() -> str:
+async def _do_update(
+    progress_callback: UpdateProgressCallback | None = None,
+) -> str:
     if not GITHUB_RELEASE_URL:
         raise RuntimeError("GITHUB_RELEASE_URL не задан")
 
@@ -195,7 +206,11 @@ async def _do_update() -> str:
         str(updates_folder).strip("/"),
     )
     status = await yadisk_updates.publish_update(
-        zip_data, updates_folder, source_url=resolved_release_url)
+        zip_data,
+        updates_folder,
+        source_url=resolved_release_url,
+        progress_callback=progress_callback,
+    )
     artifact = status["artifacts"]["full"]
     log.info(
         "Update: finished successfully in %.1fs, sha256=%s, size=%.1f MiB",
@@ -217,6 +232,22 @@ def _event_name_from_command(text: str) -> str | None:
     if not separator or not argument.strip():
         raise ValueError("Использование: /event Название события")
     return yadisk_poll.validate_event_name(argument.strip())
+
+
+def _camera_setting_from_command(text: str) -> tuple[str, str] | None:
+    parts = (text or "").strip().split(maxsplit=1)
+    if not parts:
+        return None
+    matched = CAMERA_SETTING_COMMAND_RE.fullmatch(parts[0])
+    if not matched:
+        return None
+
+    field = matched.group(1).lower()
+    if f"/{field}" in RESERVED_TELEGRAM_COMMANDS:
+        return None
+    if len(parts) != 2 or not parts[1].strip():
+        raise ValueError(f"Использование: /{field} значение")
+    return field, parts[1].strip()
 
 
 def _start_parameter_from_command(text: str) -> tuple[bool, str | None]:
@@ -282,7 +313,40 @@ async def _tg_handle_admin_command(
             await _tg_send_text(telegram, base, chat_id, f"❌ Event не отправлен: {exc}")
         return
 
-    normalized = text.split("@", 1)[0] if text.startswith("/") else text
+    try:
+        camera_setting = _camera_setting_from_command(text)
+    except ValueError as exc:
+        await _tg_send_text(telegram, base, chat_id, f"❌ {exc}")
+        return
+
+    if camera_setting is not None:
+        field, value = camera_setting
+        try:
+            await _send_disk_command(
+                "set_camera_config",
+                chat_id,
+                {"field": field, "value": value},
+            )
+            await _tg_send_text(
+                telegram,
+                base,
+                chat_id,
+                f"⏳ Камера: {field} → {value}; ожидаю подтверждение будки",
+            )
+        except Exception as exc:
+            await _tg_send_text(
+                telegram,
+                base,
+                chat_id,
+                f"❌ Настройка камеры не отправлена: {exc}",
+            )
+        return
+
+    command_token = text.split(maxsplit=1)[0] if text else ""
+    normalized = (
+        command_token.split("@", 1)[0].lower()
+        if command_token.startswith("/") else command_token
+    )
     command = TG_COMMANDS.get(normalized)
     if not command:
         await _tg_show_keyboard(telegram, base, chat_id)
@@ -290,8 +354,12 @@ async def _tg_handle_admin_command(
 
     if command == "update":
         await _tg_send_text(telegram, base, chat_id, "⏳ Скачиваю полный релиз...")
+
+        async def report_update_progress(message: str) -> None:
+            await _tg_send_text(telegram, base, chat_id, message)
+
         try:
-            result = await _do_update()
+            result = await _do_update(report_update_progress)
         except Exception as exc:
             log.exception("Update %s failed", command)
             result = f"❌ Ошибка: {exc}"
@@ -310,7 +378,12 @@ async def _tg_handle_admin_command(
 
     try:
         await _send_disk_command(command, chat_id)
-        await _tg_send_text(telegram, base, chat_id, f"⏳ {command}: команда отправлена")
+        message = (
+            "⏳ Запрашиваю конфиги фотобудки..."
+            if command == "get_config"
+            else f"⏳ {command}: команда отправлена"
+        )
+        await _tg_send_text(telegram, base, chat_id, message)
     except Exception as exc:
         await _tg_send_text(telegram, base, chat_id, f"❌ Команда не отправлена: {exc}")
 
@@ -374,7 +447,12 @@ def _save_vps_event(name: str) -> None:
     CONFIG["yadisk_folder"] = name
 
 
-async def _tg_send_log(chat_id: str | int, payload: bytes) -> bool:
+async def _tg_send_document(
+    chat_id: str | int,
+    payload: bytes,
+    filename: str,
+    content_type: str,
+) -> bool:
     if not TG_TOKEN:
         return False
     form = aiohttp.FormData()
@@ -382,7 +460,7 @@ async def _tg_send_log(chat_id: str | int, payload: bytes) -> bool:
     # integer chat_id is valid. Passing the raw int raises during serialization.
     form.add_field("chat_id", str(chat_id))
     form.add_field(
-        "document", payload, filename="photobooth.log", content_type="text/plain")
+        "document", payload, filename=filename, content_type=content_type)
     async with aiohttp.ClientSession() as telegram:
         async with telegram.post(
             f"https://api.telegram.org/bot{TG_TOKEN}/sendDocument",
@@ -390,9 +468,17 @@ async def _tg_send_log(chat_id: str | int, payload: bytes) -> bool:
             timeout=aiohttp.ClientTimeout(total=60),
         ) as response:
             if response.status != 200:
-                log.warning(f"TG log send failed: {await response.text()}")
+                log.warning(
+                    "TG document send failed filename=%s: %s",
+                    filename, await response.text(),
+                )
                 return False
             return True
+
+
+async def _tg_send_log(chat_id: str | int, payload: bytes) -> bool:
+    return await _tg_send_document(
+        chat_id, payload, "photobooth.log", "text/plain")
 
 
 async def _handle_control_response(response: dict) -> bool:
@@ -415,22 +501,42 @@ async def _handle_control_response(response: dict) -> bool:
     if artifact_path:
         try:
             payload = await yadisk_control.download_bytes(artifact_path)
-            if not await _tg_send_log(chat_id, payload):
+            if response["command"] == "get_config":
+                delivered = await _tg_send_document(
+                    chat_id,
+                    payload,
+                    "photobooth_configs.txt",
+                    "text/plain; charset=utf-8",
+                )
+                artifact_label = "configs"
+            else:
+                delivered = await _tg_send_log(chat_id, payload)
+                artifact_label = "log"
+            if not delivered:
                 return False
         except Exception as exc:
-            log.warning(f"Control: log delivery failed: {exc}")
+            log.warning("Control: artifact delivery failed: %s", exc)
             return False
 
-        # The document itself is the complete response to /logs. Cleanup must
-        # never cause the same Telegram document to be sent again.
+        # The document/group itself is the complete response. Cleanup must
+        # never cause the same Telegram upload to be sent again.
         try:
             deleted = await yadisk_control.delete_resource(artifact_path)
         except Exception as exc:
             deleted = None
-            log.warning("Control: delivered log; artifact cleanup failed: %s", exc)
+            log.warning(
+                "Control: delivered %s; artifact cleanup failed: %s",
+                artifact_label, exc,
+            )
         if deleted is False:
-            log.warning("Control: delivered log but could not delete %s", artifact_path)
-        log.info("Control: log delivered to Telegram chat=%s", chat_id)
+            log.warning(
+                "Control: delivered %s but could not delete %s",
+                artifact_label, artifact_path,
+            )
+        log.info(
+            "Control: %s delivered to Telegram chat=%s",
+            artifact_label, chat_id,
+        )
         return True
 
     prefix = "✅" if response["status"] == "ok" else "❌"
