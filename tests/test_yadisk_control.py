@@ -1,6 +1,6 @@
 import json
 import unittest
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import app
 import yadisk_control
@@ -80,6 +80,58 @@ class UpdateCommandTests(unittest.IsolatedAsyncioTestCase):
                 object(), "https://telegram.test", 123, "/update")
 
         send.assert_not_awaited()
+
+
+class LogDeliveryTests(unittest.IsolatedAsyncioTestCase):
+    async def test_integer_chat_id_is_serialized_as_multipart_text(self):
+        class Response:
+            status = 200
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *_args):
+                return False
+
+        class Telegram:
+            def post(self, *_args, **_kwargs):
+                return Response()
+
+        class ClientSession:
+            async def __aenter__(self):
+                return Telegram()
+
+            async def __aexit__(self, *_args):
+                return False
+
+        form = MagicMock()
+        with patch.object(app, "TG_TOKEN", "token"), \
+             patch("app.aiohttp.FormData", return_value=form), \
+             patch("app.aiohttp.ClientSession", return_value=ClientSession()):
+            self.assertTrue(await app._tg_send_log(5683598562, b"log"))
+
+        form.add_field.assert_any_call("chat_id", "5683598562")
+
+    async def test_successful_document_is_not_retried_for_cleanup_or_text(self):
+        response = {
+            "status": "ok",
+            "command": "send_logs",
+            "message": "Лог загружен",
+            "artifact_path": "/control/logs/test.log",
+            "reply_chat_id": 5683598562,
+        }
+        with patch.object(app, "TG_TOKEN", "token"), \
+             patch.object(app, "TG_ADMIN", "admin"), \
+             patch("app.yadisk_control.download_bytes", AsyncMock(return_value=b"log")), \
+             patch("app._tg_send_log", AsyncMock(return_value=True)) as send_log, \
+             patch("app._tg_send_text", new_callable=AsyncMock) as send_text, \
+             patch("app.yadisk_control.delete_resource", AsyncMock(
+                 side_effect=RuntimeError("cleanup unavailable"))) as delete:
+            self.assertTrue(await app._handle_control_response(response))
+
+        send_log.assert_awaited_once_with(5683598562, b"log")
+        send_text.assert_not_awaited()
+        delete.assert_awaited_once_with("/control/logs/test.log")
 
 
 if __name__ == "__main__":

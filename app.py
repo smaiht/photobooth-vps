@@ -378,7 +378,9 @@ async def _tg_send_log(chat_id: str | int, payload: bytes) -> bool:
     if not TG_TOKEN:
         return False
     form = aiohttp.FormData()
-    form.add_field("chat_id", chat_id)
+    # aiohttp multipart fields accept text/bytes, unlike Telegram JSON where an
+    # integer chat_id is valid. Passing the raw int raises during serialization.
+    form.add_field("chat_id", str(chat_id))
     form.add_field(
         "document", payload, filename="photobooth.log", content_type="text/plain")
     async with aiohttp.ClientSession() as telegram:
@@ -419,6 +421,18 @@ async def _handle_control_response(response: dict) -> bool:
             log.warning(f"Control: log delivery failed: {exc}")
             return False
 
+        # The document itself is the complete response to /logs. Cleanup must
+        # never cause the same Telegram document to be sent again.
+        try:
+            deleted = await yadisk_control.delete_resource(artifact_path)
+        except Exception as exc:
+            deleted = None
+            log.warning("Control: delivered log; artifact cleanup failed: %s", exc)
+        if deleted is False:
+            log.warning("Control: delivered log but could not delete %s", artifact_path)
+        log.info("Control: log delivered to Telegram chat=%s", chat_id)
+        return True
+
     prefix = "✅" if response["status"] == "ok" else "❌"
     async with aiohttp.ClientSession() as telegram:
         delivered = await _tg_send_text(
@@ -428,8 +442,6 @@ async def _handle_control_response(response: dict) -> bool:
             f"{prefix} {response['message']}",
         )
     if not delivered:
-        return False
-    if artifact_path and not await yadisk_control.delete_resource(artifact_path):
         return False
     return True
 
