@@ -265,21 +265,33 @@ class ConfigDeliveryTests(unittest.IsolatedAsyncioTestCase):
             "reply_chat_id": 123,
         }
         export = b"===== config_app.json =====\n{}\n"
+        vps_config = b'{"yadisk_folder":"event"}\n'
         with patch.object(app, "TG_TOKEN", "token"), \
+             patch.object(app, "CONFIG_PATH") as config_path, \
              patch("app.yadisk_control.download_bytes",
                    AsyncMock(return_value=export)), \
-             patch("app._tg_send_document",
+             patch("app._tg_send_documents",
                    AsyncMock(return_value=True)) as send, \
              patch("app._tg_send_log", new_callable=AsyncMock) as send_log, \
              patch("app.yadisk_control.delete_resource",
                    AsyncMock(return_value=True)) as delete:
+            config_path.read_bytes.return_value = vps_config
             self.assertTrue(await app._handle_control_response(response))
 
         send.assert_awaited_once_with(
             123,
-            export,
-            "photobooth_configs.txt",
-            "text/plain; charset=utf-8",
+            [
+                (
+                    export,
+                    "photobooth_configs.txt",
+                    "text/plain; charset=utf-8",
+                ),
+                (
+                    vps_config,
+                    "config_vps.json",
+                    "application/json",
+                ),
+            ],
         )
         send_log.assert_not_awaited()
         delete.assert_awaited_once_with("/control/configs/test.txt")

@@ -48,6 +48,10 @@ PRINT_MIME_SUFFIXES = {
     "image/webp": ".webp",
     "image/bmp": ".bmp",
     "image/tiff": ".tiff",
+    "image/gif": ".gif",
+    "image/heic": ".heic",
+    "image/heif": ".heif",
+    "image/avif": ".avif",
 }
 PRINT_FILE_SUFFIXES = {
     ".jpg": ".jpg",
@@ -57,7 +61,13 @@ PRINT_FILE_SUFFIXES = {
     ".bmp": ".bmp",
     ".tif": ".tiff",
     ".tiff": ".tiff",
+    ".gif": ".gif",
+    ".heic": ".heic",
+    ".heif": ".heif",
+    ".avif": ".avif",
+    ".ico": ".ico",
 }
+SAFE_PRINT_SUFFIX_RE = re.compile(r"^\.[a-z0-9]{1,10}$")
 _rejected_media_groups: set[str] = set()
 
 TG_COMMANDS = {
@@ -335,8 +345,11 @@ def _telegram_print_file(message: dict) -> tuple[str, str, int | None] | None:
     if not suffix:
         filename_suffix = Path(str(document.get("file_name") or "")).suffix.lower()
         suffix = PRINT_FILE_SUFFIXES.get(filename_suffix)
+        if not suffix and mime_type.startswith("image/"):
+            suffix = filename_suffix if SAFE_PRINT_SUFFIX_RE.fullmatch(
+                filename_suffix) else ".img"
     if not suffix or not document.get("file_id"):
-        raise ValueError("пришли изображение как фото или JPEG/PNG/WebP/BMP/TIFF документ")
+        raise ValueError("пришли изображение как обычное фото или image-документ")
     return str(document["file_id"]), suffix, document.get("file_size")
 
 
@@ -389,6 +402,8 @@ def _telegram_sender_data(message: dict) -> dict:
         "sender_name": display_name[:100],
         "username": username[:64],
         "source_filename": source_filename,
+        "telegram_mime_type": str(document.get("mime_type") or ""),
+        "telegram_document": dict(document),
         "telegram_user": dict(sender),
         "telegram_chat": dict(chat),
         "telegram_message_id": message.get("message_id"),
@@ -654,6 +669,45 @@ async def _tg_send_document(
             return True
 
 
+async def _tg_send_documents(
+    chat_id: str | int,
+    documents: list[tuple[bytes, str, str]],
+) -> bool:
+    """Send two or more separate documents in one Telegram media group."""
+    if not TG_TOKEN or len(documents) < 2:
+        return False
+    form = aiohttp.FormData()
+    form.add_field("chat_id", str(chat_id))
+    media = []
+    for index, (payload, filename, content_type) in enumerate(documents):
+        field_name = f"document_{index}"
+        form.add_field(
+            field_name,
+            payload,
+            filename=filename,
+            content_type=content_type,
+        )
+        media.append({
+            "type": "document",
+            "media": f"attach://{field_name}",
+        })
+    form.add_field("media", json.dumps(media, ensure_ascii=False))
+    async with aiohttp.ClientSession() as telegram:
+        async with telegram.post(
+            f"https://api.telegram.org/bot{TG_TOKEN}/sendMediaGroup",
+            data=form,
+            timeout=aiohttp.ClientTimeout(total=60),
+        ) as response:
+            if response.status != 200:
+                log.warning(
+                    "TG document group send failed files=%s: %s",
+                    [filename for _, filename, _ in documents],
+                    await response.text(),
+                )
+                return False
+            return True
+
+
 async def _tg_send_log(chat_id: str | int, payload: bytes) -> bool:
     return await _tg_send_document(
         chat_id, payload, "photobooth.log", "text/plain")
@@ -680,13 +734,23 @@ async def _handle_control_response(response: dict) -> bool:
         try:
             payload = await yadisk_control.download_bytes(artifact_path)
             if response["command"] == "get_config":
-                delivered = await _tg_send_document(
+                vps_config = await asyncio.to_thread(CONFIG_PATH.read_bytes)
+                delivered = await _tg_send_documents(
                     chat_id,
-                    payload,
-                    "photobooth_configs.txt",
-                    "text/plain; charset=utf-8",
+                    [
+                        (
+                            payload,
+                            "photobooth_configs.txt",
+                            "text/plain; charset=utf-8",
+                        ),
+                        (
+                            vps_config,
+                            "config_vps.json",
+                            "application/json",
+                        ),
+                    ],
                 )
-                artifact_label = "configs"
+                artifact_label = "booth and VPS configs"
             else:
                 delivered = await _tg_send_log(chat_id, payload)
                 artifact_label = "log"

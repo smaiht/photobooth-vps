@@ -5,5 +5,5 @@
     "yadisk_updates_folder": "photobooth_system/updates",
     "_yadisk_updates_folder_comment": "Fixed private folder for the full update artifact and status.json. Must match the photobooth config.",
     "yadisk_control_folder": "photobooth_system/control",
-    "_yadisk_control_folder_comment": "Stable private bus: to_booth, to_vps, done and logs. Must match the photobooth config."
+    "_yadisk_control_folder_comment": "Stable private bus: to_booth, to_vps and logs. Processed command and response JSON files are deleted. Must match the photobooth config."
 }
