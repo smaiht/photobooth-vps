@@ -324,7 +324,7 @@ async def store_print_job(
 
     event_folder = _folder
     sessions_root = f"{event_folder}_by_sessions"
-    jobs_root = f"{sessions_root}/___print_jobs"
+    jobs_root = f"{sessions_root}/0000_print_jobs"
     for path in (sessions_root, jobs_root):
         if not await _ensure_directory(path):
             raise RuntimeError(f"cannot create print job directory {path}")
