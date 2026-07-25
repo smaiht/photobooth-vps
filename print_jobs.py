@@ -162,18 +162,23 @@ def _tile(
     label: str,
     number: str,
 ) -> Image.Image:
+    padding = 24
     label_height = 116
     tile = Image.new(
         "RGB",
-        (visual.width, visual.height + label_height),
+        (visual.width + padding * 2,
+         visual.height + padding * 2 + label_height),
         _BACKGROUND,
     )
     draw = ImageDraw.Draw(tile)
-    tile.paste(visual, (0, 0))
+    tile.paste(visual, (padding, padding))
 
     badge_font = _font(42)
     badge_radius = 34
-    badge_center = (badge_radius + 10, badge_radius + 10)
+    badge_center = (
+        padding + badge_radius + 10,
+        padding + badge_radius + 10,
+    )
     draw.ellipse(
         (badge_center[0] - badge_radius, badge_center[1] - badge_radius,
          badge_center[0] + badge_radius, badge_center[1] + badge_radius),
@@ -194,7 +199,7 @@ def _tile(
         (0, 0), label, font=label_font, spacing=label_spacing, align="center")
     draw.multiline_text(
         ((tile.width - (label_box[0] + label_box[2])) / 2,
-         visual.height
+         padding * 2 + visual.height
          + (label_height - (label_box[1] + label_box[3])) / 2),
         label,
         fill=_TEXT,
@@ -230,19 +235,7 @@ def build_choice_preview(payload: bytes) -> PrintPreview:
 
         cover_visual, overflow_axis = _cover_view(
             preview_source, paper_size)
-
-        # Scale the fit canvas to the full comparison width/height. This keeps
-        # the white sheet itself as the visual boundary instead of padding it
-        # with dark areas merely to match the crop preview's dimensions.
-        if overflow_axis == "horizontal":
-            fit_scale = cover_visual.width / paper_size[0]
-        else:
-            fit_scale = cover_visual.height / paper_size[1]
-        fit_size = (
-            round(paper_size[0] * fit_scale),
-            round(paper_size[1] * fit_scale),
-        )
-        fit_paper = _contain(preview_source, fit_size)
+        fit_paper = _contain(preview_source, paper_size)
         preview_source.close()
 
         fit_tile = _tile(
@@ -258,7 +251,7 @@ def build_choice_preview(payload: bytes) -> PrintPreview:
         fit_paper.close()
         cover_visual.close()
 
-        gap = 24
+        gap = 16
         if overflow_axis == "vertical":
             collage = Image.new(
                 "RGB",
@@ -266,7 +259,10 @@ def build_choice_preview(payload: bytes) -> PrintPreview:
                  max(fit_tile.height, cover_tile.height)),
                 _BACKGROUND,
             )
-            collage.paste(fit_tile, (0, 0))
+            collage.paste(
+                fit_tile,
+                (0, (collage.height - fit_tile.height) // 2),
+            )
             collage.paste(cover_tile, (fit_tile.width + gap, 0))
         else:
             collage = Image.new(
@@ -275,8 +271,15 @@ def build_choice_preview(payload: bytes) -> PrintPreview:
                  fit_tile.height + cover_tile.height + gap),
                 _BACKGROUND,
             )
-            collage.paste(fit_tile, (0, 0))
-            collage.paste(cover_tile, (0, fit_tile.height + gap))
+            collage.paste(
+                fit_tile,
+                ((collage.width - fit_tile.width) // 2, 0),
+            )
+            collage.paste(
+                cover_tile,
+                ((collage.width - cover_tile.width) // 2,
+                 fit_tile.height + gap),
+            )
         fit_tile.close()
         cover_tile.close()
 
