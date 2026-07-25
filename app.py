@@ -7,6 +7,7 @@ import logging
 import os
 import re
 import time
+import uuid
 import zipfile
 from pathlib import Path
 from typing import Awaitable, Callable
@@ -36,6 +37,28 @@ TG_TOKEN = os.environ.get("TG_BOT_TOKEN", "")
 TG_CHAT = os.environ.get("TG_CHAT_ID", "")
 TG_ADMIN = os.environ.get("TG_ADMIN_ID", "")
 GITHUB_RELEASE_URL = os.environ.get("GITHUB_RELEASE_URL", "")
+
+# MVP allowlist for arbitrary Telegram image printing. Admin commands still use
+# TG_ADMIN_ID; these IDs only grant access to the print-by-image flow.
+PRINT_ALLOWED_USER_IDS = frozenset({6634566969, 5683598562})
+MAX_TELEGRAM_PRINT_FILE_SIZE = 20 * 1024 * 1024
+PRINT_MIME_SUFFIXES = {
+    "image/jpeg": ".jpg",
+    "image/png": ".png",
+    "image/webp": ".webp",
+    "image/bmp": ".bmp",
+    "image/tiff": ".tiff",
+}
+PRINT_FILE_SUFFIXES = {
+    ".jpg": ".jpg",
+    ".jpeg": ".jpg",
+    ".png": ".png",
+    ".webp": ".webp",
+    ".bmp": ".bmp",
+    ".tif": ".tiff",
+    ".tiff": ".tiff",
+}
+_rejected_media_groups: set[str] = set()
 
 TG_COMMANDS = {
     "/run": "run",
@@ -290,6 +313,159 @@ async def _send_disk_command(
     return body["command_id"]
 
 
+def _telegram_print_file(message: dict) -> tuple[str, str, int | None] | None:
+    photos = message.get("photo")
+    if isinstance(photos, list) and photos:
+        photo = max(
+            (item for item in photos if isinstance(item, dict)),
+            key=lambda item: (
+                int(item.get("file_size") or 0),
+                int(item.get("width") or 0) * int(item.get("height") or 0),
+            ),
+            default=None,
+        )
+        if photo and photo.get("file_id"):
+            return str(photo["file_id"]), ".jpg", photo.get("file_size")
+
+    document = message.get("document")
+    if not isinstance(document, dict):
+        return None
+    mime_type = str(document.get("mime_type") or "").lower()
+    suffix = PRINT_MIME_SUFFIXES.get(mime_type)
+    if not suffix:
+        filename_suffix = Path(str(document.get("file_name") or "")).suffix.lower()
+        suffix = PRINT_FILE_SUFFIXES.get(filename_suffix)
+    if not suffix or not document.get("file_id"):
+        raise ValueError("пришли изображение как фото или JPEG/PNG/WebP/BMP/TIFF документ")
+    return str(document["file_id"]), suffix, document.get("file_size")
+
+
+async def _tg_download_file(
+    telegram: aiohttp.ClientSession,
+    base: str,
+    file_id: str,
+) -> bytes:
+    async with telegram.post(
+        f"{base}/getFile",
+        json={"file_id": file_id},
+        timeout=aiohttp.ClientTimeout(total=30),
+    ) as response:
+        body = await response.json()
+        if response.status != 200 or not body.get("ok"):
+            raise RuntimeError("Telegram не отдал файл")
+    file_path = (body.get("result") or {}).get("file_path")
+    if not file_path:
+        raise RuntimeError("Telegram не вернул путь к файлу")
+
+    download_url = f"https://api.telegram.org/file/bot{TG_TOKEN}/{file_path}"
+    payload = bytearray()
+    async with telegram.get(
+        download_url,
+        timeout=aiohttp.ClientTimeout(total=90),
+    ) as response:
+        if response.status != 200:
+            raise RuntimeError(f"Telegram download HTTP {response.status}")
+        async for chunk in response.content.iter_chunked(1024 * 1024):
+            payload.extend(chunk)
+            if len(payload) > MAX_TELEGRAM_PRINT_FILE_SIZE:
+                raise ValueError("файл больше 20 МБ")
+    if not payload:
+        raise ValueError("Telegram прислал пустой файл")
+    return bytes(payload)
+
+
+def _telegram_sender_data(message: dict) -> dict:
+    sender = message.get("from") or {}
+    chat = message.get("chat") or {}
+    first_name = str(sender.get("first_name") or "").strip()
+    last_name = str(sender.get("last_name") or "").strip()
+    display_name = " ".join(part for part in (first_name, last_name) if part)
+    username = str(sender.get("username") or "").strip()
+    document = message.get("document") or {}
+    source_filename = str(document.get("file_name") or "telegram_photo.jpg")
+    source_filename = re.sub(r"[\x00-\x1f\x7f]", "", source_filename)[:200]
+    return {
+        "sender_id": sender.get("id"),
+        "sender_name": display_name[:100],
+        "username": username[:64],
+        "source_filename": source_filename,
+        "telegram_user": dict(sender),
+        "telegram_chat": dict(chat),
+        "telegram_message_id": message.get("message_id"),
+        "telegram_message_date": message.get("date"),
+        "telegram_caption": str(message.get("caption") or "")[:1024],
+        "telegram_source_kind": "photo" if message.get("photo") else "document",
+    }
+
+
+async def _tg_handle_print_message(
+    telegram: aiohttp.ClientSession,
+    base: str,
+    message: dict,
+) -> bool:
+    if not message.get("photo") and not message.get("document"):
+        return False
+
+    sender = message.get("from") or {}
+    user_id = sender.get("id")
+    chat_id = (message.get("chat") or {}).get("id", user_id)
+    if user_id not in PRINT_ALLOWED_USER_IDS:
+        await _tg_send_text(
+            telegram, base, chat_id,
+            "❌ Печать изображений для этого аккаунта не разрешена",
+        )
+        return True
+
+    media_group_id = message.get("media_group_id")
+    if media_group_id:
+        group_key = str(media_group_id)
+        if group_key not in _rejected_media_groups:
+            _rejected_media_groups.add(group_key)
+            await _tg_send_text(
+                telegram, base, chat_id,
+                "❌ Медиальбомы пока не печатаются. Пришли одно изображение отдельным сообщением",
+            )
+        return True
+
+    try:
+        file_info = _telegram_print_file(message)
+        if file_info is None:
+            return False
+        file_id, suffix, declared_size = file_info
+        if declared_size is not None and int(declared_size) > MAX_TELEGRAM_PRINT_FILE_SIZE:
+            raise ValueError("файл больше 20 МБ")
+
+        payload = await _tg_download_file(telegram, base, file_id)
+        job_id = uuid.uuid4().hex
+        metadata = _telegram_sender_data(message)
+        metadata.update({
+            "job_id": job_id,
+            "source_size": len(payload),
+        })
+        stored_files = await yadisk_poll.store_print_job(
+            job_id, user_id, suffix, payload, metadata)
+        metadata.update(stored_files)
+        await _send_disk_command("print_image", chat_id, metadata)
+    except Exception as exc:
+        log.warning("TG print job rejected user=%s: %s", user_id, exc)
+        await _tg_send_text(telegram, base, chat_id, f"❌ Фото не принято: {exc}")
+        return True
+
+    label = f"@{metadata['username']}" if metadata["username"] else metadata["sender_name"]
+    label = label or str(user_id)
+    try:
+        await _tg_send_text(
+            telegram, base, chat_id,
+            f"⏳ Фото от {label} принято и передано фотобудке; жду подтверждение печати",
+        )
+    except Exception as exc:
+        # The Disk command is already durable. A failed optional acknowledgement
+        # must not make Telegram deliver the same image as a second print job.
+        log.warning("TG print acknowledgement failed job=%s: %s", job_id, exc)
+    log.info("TG print job sent job=%s user=%s size=%s", job_id, user_id, len(payload))
+    return True
+
+
 async def _tg_handle_admin_command(
     telegram: aiohttp.ClientSession,
     base: str,
@@ -414,7 +590,9 @@ async def tg_poll_commands() -> None:
                     if message:
                         await _record_telegram_start(update, message)
                         user_id = message.get("from", {}).get("id")
-                        if is_admin(user_id):
+                        print_handled = await _tg_handle_print_message(
+                            telegram, base, message)
+                        if not print_handled and is_admin(user_id):
                             chat_id = message.get("chat", {}).get("id", user_id)
                             await _tg_handle_admin_command(
                                 telegram, base, chat_id, message.get("text", ""))

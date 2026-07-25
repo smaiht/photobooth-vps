@@ -92,7 +92,7 @@ class DeliveryTests(unittest.IsolatedAsyncioTestCase):
                 return_value=json.dumps(manifest).encode("utf-8"))), \
              patch("yadisk_poll._download_file", download_file), \
              patch("yadisk_poll._tg_send_session", AsyncMock()) as send, \
-             patch("yadisk_poll._move_to_done", AsyncMock()) as move:
+             patch("yadisk_poll._delete_inbox_message", AsyncMock()) as delete:
             ok = await _process_manifest({
                 "name": "abc123.json",
                 "path": "disk:/photobooth_system/control/to_vps/abc123.json",
@@ -100,7 +100,7 @@ class DeliveryTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertFalse(ok)
         send.assert_not_awaited()
-        move.assert_not_awaited()
+        delete.assert_not_awaited()
         self.assertEqual(download_file.await_args.args[0], "/event/photo.jpg")
         self.assertEqual(yadisk_poll._state["handled_messages"], [])
 

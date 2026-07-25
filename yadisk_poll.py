@@ -15,11 +15,14 @@ import logging
 import os
 import re
 import tempfile
+import time
 from contextlib import ExitStack
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Awaitable, Callable
 
 import aiohttp
+from aiohttp.payload import Payload
 
 import yadisk_control
 
@@ -31,6 +34,12 @@ PAGE_SIZE = 1000
 STATE_FILE = Path("vps_yadisk_state.json")
 SCHEMA_VERSION = 2
 MD5_RE = re.compile(r"^[a-f0-9]{32}$")
+PRINT_JOB_ID_RE = re.compile(r"^[a-f0-9]{32}$")
+PRINT_SUFFIX_RE = re.compile(r"^\.(?:jpe?g|png|webp|bmp|tiff?)$")
+MAX_PRINT_FILE_SIZE = 20 * 1024 * 1024
+PRINT_UPLOAD_CHUNK_SIZE = 1024 * 1024
+PRINT_UPLOAD_PROGRESS_BYTES = 5 * 1024 * 1024
+PRINT_UPLOAD_PROGRESS_SECONDS = 3
 
 _state: dict = {"handled_messages": []}
 _session: aiohttp.ClientSession | None = None
@@ -44,6 +53,50 @@ _configured = False
 _inflight: set[str] = set()
 
 ResponseHandler = Callable[[dict], Awaitable[bool]]
+
+
+class _PrintUploadPayload(Payload):
+    """Stream one Telegram print file and log actual upload progress."""
+
+    _autoclose = True
+
+    def __init__(self, value: bytes, remote_path: str):
+        super().__init__(value, content_type="application/octet-stream")
+        self._value = memoryview(value)
+        self._size = len(value)
+        self._remote_path = remote_path
+
+    def decode(self, encoding: str = "utf-8", errors: str = "strict") -> str:
+        return self._value.tobytes().decode(encoding, errors)
+
+    async def write(self, writer) -> None:
+        started_at = time.monotonic()
+        last_report_at = started_at
+        last_report_bytes = 0
+        next_report_bytes = PRINT_UPLOAD_PROGRESS_BYTES
+
+        for start in range(0, self._size, PRINT_UPLOAD_CHUNK_SIZE):
+            end = min(start + PRINT_UPLOAD_CHUNK_SIZE, self._size)
+            await writer.write(self._value[start:end])
+            now = time.monotonic()
+            if (end >= next_report_bytes
+                    or now - last_report_at >= PRINT_UPLOAD_PROGRESS_SECONDS
+                    or end == self._size):
+                interval = max(now - last_report_at, 0.001)
+                elapsed = max(now - started_at, 0.001)
+                log.info(
+                    "YaDisk print: upload progress path=%s %.1f/%.1f MiB "
+                    "(%.1f%%), speed=%.1f MiB/s, average=%.1f MiB/s",
+                    self._remote_path,
+                    end / 1048576,
+                    self._size / 1048576,
+                    end * 100 / self._size,
+                    (end - last_report_bytes) / interval / 1048576,
+                    end / elapsed / 1048576,
+                )
+                last_report_at = now
+                last_report_bytes = end
+                next_report_bytes = end + PRINT_UPLOAD_PROGRESS_BYTES
 
 
 def _state_save() -> None:
@@ -162,8 +215,7 @@ async def _connect() -> bool:
             current += "/" + part
             paths.append(current)
         paths.extend((f"{_bus_root}/to_booth", f"{_bus_root}/to_vps",
-                      f"{_bus_root}/done", f"{_bus_root}/done/to_booth",
-                      f"{_bus_root}/done/to_vps", f"{_bus_root}/logs", _folder))
+                      f"{_bus_root}/logs", _folder))
         for path in paths:
             if not await _ensure_directory(path):
                 await _close_sessions()
@@ -217,6 +269,96 @@ async def _download_bytes(remote_path: str, max_size: int = 1024 * 1024) -> byte
     if len(payload) > max_size:
         raise ValueError("inbox message is too large")
     return payload
+
+
+async def _upload_print_file(remote_path: str, payload: bytes) -> None:
+    size = len(payload)
+    log.info(
+        "YaDisk print: requesting upload URL path=%s size=%s bytes (%.2f MiB)",
+        remote_path, size, size / 1048576,
+    )
+    async with _session.get(
+        f"{API}/resources/upload",
+        params={"path": remote_path, "overwrite": "true"},
+    ) as response:
+        if response.status != 200:
+            raise RuntimeError(
+                f"print file upload URL {response.status}: {await response.text()}")
+        href = (await response.json())["href"]
+    started_at = time.monotonic()
+    log.info("YaDisk print: upload started path=%s", remote_path)
+    async with _transfer_session.put(
+        href,
+        data=_PrintUploadPayload(payload, remote_path),
+    ) as response:
+        if response.status not in (201, 202):
+            raise RuntimeError(
+                f"print file upload {response.status}: {await response.text()}")
+        upload_status = response.status
+    elapsed = max(time.monotonic() - started_at, 0.001)
+    log.info(
+        "YaDisk print: upload complete path=%s HTTP %s size=%s bytes in %.2fs "
+        "(average %.2f MiB/s)",
+        remote_path, upload_status, size, elapsed, size / elapsed / 1048576,
+    )
+
+
+async def store_print_job(
+    job_id: str,
+    user_id: int,
+    suffix: str,
+    image_payload: bytes,
+    metadata: dict,
+) -> dict:
+    """Store one Telegram image and its TXT metadata on Yandex.Disk."""
+    normalized_suffix = str(suffix or "").lower()
+    if (not PRINT_JOB_ID_RE.fullmatch(str(job_id or ""))
+            or not isinstance(user_id, int) or user_id <= 0
+            or not PRINT_SUFFIX_RE.fullmatch(normalized_suffix)
+            or not isinstance(image_payload, bytes) or not image_payload
+            or len(image_payload) > MAX_PRINT_FILE_SIZE
+            or not isinstance(metadata, dict)):
+        raise ValueError("invalid print job")
+    if not await _connect():
+        raise RuntimeError("Yandex.Disk poller is unavailable")
+
+    event_folder = _folder
+    sessions_root = f"{event_folder}_by_sessions"
+    jobs_root = f"{sessions_root}/___print_jobs"
+    for path in (sessions_root, jobs_root):
+        if not await _ensure_directory(path):
+            raise RuntimeError(f"cannot create print job directory {path}")
+
+    now = datetime.now(timezone.utc)
+    timestamp = now.strftime("%Y%m%dT%H%M%SZ")
+    basename = f"{user_id}_{timestamp}_{job_id}"
+    image_path = f"{jobs_root}/{basename}{normalized_suffix}"
+    info_path = f"{jobs_root}/{basename}.txt"
+    info = dict(metadata)
+    info.update({
+        "job_id": job_id,
+        "status": "received_by_vps",
+        "event_folder": event_folder.lstrip("/"),
+        "stored_at": now.isoformat(),
+        "image_path": image_path,
+        "info_path": info_path,
+        "image_size_bytes": len(image_payload),
+    })
+    info_payload = (
+        json.dumps(info, ensure_ascii=False, indent=2) + "\n"
+    ).encode("utf-8")
+
+    await _upload_print_file(image_path, image_payload)
+    await _upload_print_file(info_path, info_payload)
+    log.info(
+        "YaDisk print: two files stored job=%s user=%s image=%s info=%s",
+        job_id, user_id, image_path, info_path,
+    )
+    return {
+        "event_folder": event_folder.lstrip("/"),
+        "artifact_path": image_path,
+        "info_path": info_path,
+    }
 
 
 def _file_md5(path: Path) -> str:
@@ -311,21 +453,25 @@ async def _wait_operation(href: str) -> bool:
     return False
 
 
-async def _move_to_done(message_name: str) -> bool:
-    source = f"{_bus_root}/to_vps/{message_name}"
-    target = f"{_bus_root}/done/to_vps/{message_name}"
-    params = {"from": source, "path": target, "overwrite": "true"}
+async def _delete_inbox_message(message_name: str) -> bool:
+    path = f"{_bus_root}/to_vps/{message_name}"
     try:
-        async with _session.post(f"{API}/resources/move", params=params) as response:
-            if response.status == 201:
+        async with _session.delete(
+            f"{API}/resources",
+            params={"path": path, "permanently": "true"},
+        ) as response:
+            if response.status in (204, 404):
                 return True
             if response.status == 202:
                 href = (await response.json()).get("href")
                 return bool(href and await _wait_operation(href))
-            log.warning(f"YaDisk: move inbox message {response.status}: {await response.text()}")
+            log.warning(
+                "YaDisk: delete inbox message %s: %s %s",
+                message_name, response.status, await response.text(),
+            )
             return False
     except Exception as exc:
-        log.warning(f"YaDisk: move inbox message failed: {exc}")
+        log.warning("YaDisk: delete inbox message %s failed: %s", message_name, exc)
         return False
 
 
@@ -354,7 +500,7 @@ async def _finish_message(
     item: dict,
     processor: Callable[[], Awaitable[bool]] | None = None,
 ) -> bool:
-    """Process once, then durably retry only the move if it fails."""
+    """Process once, then durably retry only deletion if it fails."""
     message_name = item["name"]
     handled = _state["handled_messages"]
     if message_name not in handled:
@@ -363,7 +509,7 @@ async def _finish_message(
         handled.append(message_name)
         _state_save()
 
-    if not await _move_to_done(message_name):
+    if not await _delete_inbox_message(message_name):
         return False
     if message_name in handled:
         handled.remove(message_name)

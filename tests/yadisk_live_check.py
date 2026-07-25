@@ -115,11 +115,11 @@ def download(path: str) -> bytes:
     return body
 
 
-def move(source: str, target: str) -> None:
+def delete(path: str) -> None:
     status, result = json_request(
-        "POST", "/resources/move",
-        params={"from": source, "path": target, "overwrite": "true"},
-        data=b"", allowed=(201, 202),
+        "DELETE", "/resources",
+        params={"path": path, "permanently": "true"},
+        data=b"", allowed=(202, 204),
     )
     if status == 202:
         wait_operation(result["href"])
@@ -139,7 +139,6 @@ def main() -> int:
     folder = f"/photobooth_api_test_{datetime.now(timezone.utc):%Y%m%d_%H%M%S}_{suffix}"
     control = f"{folder}/control"
     inbox = f"{control}/to_vps"
-    done = f"{control}/done/to_vps"
     published = False
 
     # A valid 1x1 JPEG plus a small ISO-BMFF header for transport checks.
@@ -156,7 +155,7 @@ def main() -> int:
         free = int(disk.get("total_space", 0)) - int(disk.get("used_space", 0))
         print(f"oauth: OK; free={free} bytes; max_file={disk.get('max_file_size')} bytes")
 
-        for path in (folder, control, inbox, f"{control}/done", done):
+        for path in (folder, control, inbox):
             create_directory(path)
         print(f"temporary folder created: {folder}")
 
@@ -217,10 +216,14 @@ def main() -> int:
         print("download + content verification: OK")
 
         for source, _ in manifests:
-            target = f"{done}/{source.rsplit('/', 1)[-1]}"
-            move(source, target)
-            json_request("GET", "/resources", params={"path": target, "fields": "path,type"})
-        print("manifest inbox -> done move: OK")
+            delete(source)
+            request(
+                "GET",
+                f"{API}/resources",
+                params={"path": source, "fields": "path,type"},
+                allowed=(404,),
+            )
+        print("manifest inbox deletion: OK")
 
         status, result = json_request(
             "PUT", "/resources/publish", params={"path": folder}, data=b"",
