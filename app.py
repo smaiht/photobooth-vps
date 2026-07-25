@@ -19,6 +19,7 @@ import migrate
 import yadisk_control
 import yadisk_poll
 import yadisk_updates
+import print_jobs
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger(__name__)
@@ -69,6 +70,8 @@ PRINT_FILE_SUFFIXES = {
 }
 SAFE_PRINT_SUFFIX_RE = re.compile(r"^\.[a-z0-9]{1,10}$")
 _rejected_media_groups: set[str] = set()
+_print_callbacks_in_progress: set[str] = set()
+PRINT_CALLBACK_RE = re.compile(r"^print:(fit|fill):([a-f0-9]{32})$")
 
 TG_COMMANDS = {
     "/run": "run",
@@ -111,6 +114,66 @@ async def _tg_send_text(
         return True
 
 
+async def _tg_send_photo(
+    session: aiohttp.ClientSession,
+    base: str,
+    chat_id: str | int,
+    photo: bytes,
+    caption: str,
+    reply_markup: dict,
+    reply_to_message_id: int | None,
+) -> bool:
+    form = aiohttp.FormData()
+    form.add_field("chat_id", str(chat_id))
+    form.add_field("caption", caption)
+    form.add_field(
+        "photo",
+        photo,
+        filename="print_options.jpg",
+        content_type="image/jpeg",
+    )
+    form.add_field(
+        "reply_markup",
+        json.dumps(reply_markup, ensure_ascii=False, separators=(",", ":")),
+    )
+    if isinstance(reply_to_message_id, int):
+        form.add_field(
+            "reply_parameters",
+            json.dumps(
+                {"message_id": reply_to_message_id},
+                ensure_ascii=False,
+                separators=(",", ":"),
+            ),
+        )
+    async with session.post(f"{base}/sendPhoto", data=form) as response:
+        if response.status != 200:
+            log.warning("TG print preview send failed: %s", await response.text())
+            return False
+        return True
+
+
+async def _tg_edit_print_caption(
+    session: aiohttp.ClientSession,
+    base: str,
+    chat_id: str | int,
+    message_id: int,
+    caption: str,
+) -> bool:
+    payload = {
+        "chat_id": chat_id,
+        "message_id": message_id,
+        "caption": caption,
+        "reply_markup": {"inline_keyboard": []},
+    }
+    async with session.post(
+        f"{base}/editMessageCaption", json=payload,
+    ) as response:
+        if response.status != 200:
+            log.warning("TG print preview edit failed: %s", await response.text())
+            return False
+        return True
+
+
 def is_admin(user_id) -> bool:
     return bool(TG_ADMIN and user_id is not None and str(user_id) == TG_ADMIN)
 
@@ -133,12 +196,18 @@ async def _tg_answer_callback(
     telegram: aiohttp.ClientSession,
     base: str,
     callback_id: str | None,
+    text: str = "",
+    show_alert: bool = False,
 ) -> None:
     if not callback_id:
         return
+    payload = {"callback_query_id": callback_id}
+    if text:
+        payload["text"] = text
+        payload["show_alert"] = bool(show_alert)
     async with telegram.post(
         f"{base}/answerCallbackQuery",
-        json={"callback_query_id": callback_id},
+        json=payload,
     ) as response:
         if response.status != 200:
             log.warning(f"TG answerCallbackQuery failed: {await response.text()}")
@@ -413,6 +482,28 @@ def _telegram_sender_data(message: dict) -> dict:
     }
 
 
+async def _submit_print_job(
+    job_id: str,
+    user_id: int,
+    suffix: str,
+    payload: bytes,
+    metadata: dict,
+    chat_id: str | int,
+) -> str:
+    event_folder = str(
+        metadata.get("event_folder") or yadisk_poll.current_event_folder())
+    stored_files = await yadisk_poll.store_print_job(
+        job_id,
+        user_id,
+        suffix,
+        payload,
+        metadata,
+        event_folder=event_folder,
+    )
+    metadata.update(stored_files)
+    return await _send_disk_command("print_image", chat_id, metadata)
+
+
 async def _tg_handle_print_message(
     telegram: aiohttp.ClientSession,
     base: str,
@@ -442,6 +533,7 @@ async def _tg_handle_print_message(
             )
         return True
 
+    job_id = uuid.uuid4().hex
     try:
         file_info = _telegram_print_file(message)
         if file_info is None:
@@ -451,33 +543,190 @@ async def _tg_handle_print_message(
             raise ValueError("файл больше 20 МБ")
 
         payload = await _tg_download_file(telegram, base, file_id)
-        job_id = uuid.uuid4().hex
+        preview = await asyncio.to_thread(print_jobs.build_choice_preview, payload)
         metadata = _telegram_sender_data(message)
         metadata.update({
             "job_id": job_id,
             "source_size": len(payload),
+            "source_width": preview.source_size[0],
+            "source_height": preview.source_size[1],
+            "print_orientation": preview.orientation,
+            "print_target_size": list(preview.target_size),
+            "event_folder": yadisk_poll.current_event_folder(),
         })
-        stored_files = await yadisk_poll.store_print_job(
-            job_id, user_id, suffix, payload, metadata)
-        metadata.update(stored_files)
-        await _send_disk_command("print_image", chat_id, metadata)
-    except Exception as exc:
-        log.warning("TG print job rejected user=%s: %s", user_id, exc)
-        await _tg_send_text(telegram, base, chat_id, f"❌ Фото не принято: {exc}")
-        return True
 
-    label = f"@{metadata['username']}" if metadata["username"] else metadata["sender_name"]
-    label = label or str(user_id)
-    try:
-        await _tg_send_text(
-            telegram, base, chat_id,
-            f"⏳ Фото от {label} принято и передано фотобудке; жду подтверждение печати",
+        if preview.exact_ratio:
+            metadata.update({
+                "print_mode": "fit",
+                "print_choice": "automatic_exact_ratio",
+            })
+            await _submit_print_job(
+                job_id, user_id, suffix, payload, metadata, chat_id)
+            await _tg_send_text(
+                telegram,
+                base,
+                chat_id,
+                "⏳ Фото подходит под формат 10×15 и передано на печать",
+            )
+            log.info(
+                "TG print job sent without choice job=%s user=%s source=%sx%s",
+                job_id, user_id, preview.source_size[0], preview.source_size[1],
+            )
+            return True
+
+        await asyncio.to_thread(
+            print_jobs.save_pending,
+            job_id,
+            suffix,
+            payload,
+            metadata,
+        )
+        keyboard = {
+            "inline_keyboard": [[
+                {
+                    "text": "1️⃣ Как есть",
+                    "callback_data": f"print:fit:{job_id}",
+                },
+                {
+                    "text": "2️⃣ Без полей",
+                    "callback_data": f"print:fill:{job_id}",
+                },
+            ]],
+        }
+        caption = (
+            "Фото не совпадает с форматом 10×15.\n\n"
+            "1 — напечатать всё фото с белыми полями.\n"
+            "2 — заполнить весь лист; затемнённые части не напечатаются."
+        )
+        sent = await _tg_send_photo(
+            telegram,
+            base,
+            chat_id,
+            preview.payload or b"",
+            caption,
+            keyboard,
+            message.get("message_id"),
+        )
+        if not sent:
+            await asyncio.to_thread(print_jobs.delete_pending, job_id)
+            raise RuntimeError("не удалось показать варианты печати")
+        log.info(
+            "TG print choice requested job=%s user=%s source=%sx%s "
+            "orientation=%s overflow=%s",
+            job_id, user_id,
+            preview.source_size[0], preview.source_size[1],
+            preview.orientation, preview.overflow_axis,
         )
     except Exception as exc:
-        # The Disk command is already durable. A failed optional acknowledgement
-        # must not make Telegram deliver the same image as a second print job.
-        log.warning("TG print acknowledgement failed job=%s: %s", job_id, exc)
-    log.info("TG print job sent job=%s user=%s size=%s", job_id, user_id, len(payload))
+        log.warning("TG print job rejected user=%s job=%s: %s", user_id, job_id, exc)
+        await _tg_send_text(telegram, base, chat_id, f"❌ Фото не принято: {exc}")
+    return True
+
+
+async def _tg_handle_print_callback(
+    telegram: aiohttp.ClientSession,
+    base: str,
+    callback: dict,
+) -> bool:
+    matched = PRINT_CALLBACK_RE.fullmatch(str(callback.get("data") or ""))
+    if not matched:
+        return False
+    mode, job_id = matched.groups()
+    callback_id = callback.get("id")
+    user_id = (callback.get("from") or {}).get("id")
+    message = callback.get("message") or {}
+    chat_id = (message.get("chat") or {}).get("id", user_id)
+
+    if user_id not in PRINT_ALLOWED_USER_IDS:
+        await _tg_answer_callback(
+            telegram, base, callback_id,
+            "Эта печать недоступна", show_alert=True)
+        return True
+    if job_id in _print_callbacks_in_progress:
+        await _tg_answer_callback(
+            telegram, base, callback_id, "Уже отправляем на печать")
+        return True
+
+    try:
+        payload, metadata = await asyncio.to_thread(print_jobs.load_pending, job_id)
+    except Exception:
+        await _tg_answer_callback(
+            telegram, base, callback_id,
+            "Кнопка уже неактивна. Для новой печати пришли фото ещё раз.",
+            show_alert=True,
+        )
+        return True
+
+    if int(metadata.get("sender_id") or 0) != user_id:
+        await _tg_answer_callback(
+            telegram, base, callback_id,
+            "Выбрать может только отправитель фото", show_alert=True)
+        return True
+    status = str(metadata.get("pending_status") or "")
+    if status in ("submitting", "submitted"):
+        await _tg_answer_callback(
+            telegram, base, callback_id,
+            "Фото уже передаётся или передано на печать")
+        return True
+
+    _print_callbacks_in_progress.add(job_id)
+    selected_text = "как есть, с полями" if mode == "fit" else "без полей, с обрезкой"
+    await _tg_answer_callback(
+        telegram, base, callback_id, "Принято, отправляю на печать")
+    try:
+        metadata = await asyncio.to_thread(
+            print_jobs.update_pending,
+            job_id,
+            pending_status="submitting",
+            print_mode=mode,
+            print_choice="telegram_button",
+            print_selected_at=time.time(),
+        )
+        suffix = str(metadata["source_suffix"])
+        command_id = await _submit_print_job(
+            job_id, user_id, suffix, payload, metadata, chat_id)
+        await asyncio.to_thread(
+            print_jobs.update_pending,
+            job_id,
+            pending_status="submitted",
+            command_id=command_id,
+        )
+    except Exception as exc:
+        log.exception("TG print choice submission failed job=%s mode=%s", job_id, mode)
+        try:
+            await asyncio.to_thread(
+                print_jobs.update_pending,
+                job_id,
+                pending_status="awaiting_choice",
+            )
+        except Exception:
+            log.exception("Could not restore pending print choice job=%s", job_id)
+        await _tg_send_text(
+            telegram,
+            base,
+            chat_id,
+            f"❌ Не удалось передать фото на печать: {exc}. Нажми вариант ещё раз.",
+        )
+        return True
+    finally:
+        _print_callbacks_in_progress.discard(job_id)
+
+    if isinstance(message.get("message_id"), int):
+        await _tg_edit_print_caption(
+            telegram,
+            base,
+            chat_id,
+            message["message_id"],
+            f"✅ Выбрано: {selected_text}. Фото передано на печать.",
+        )
+    try:
+        await asyncio.to_thread(print_jobs.delete_pending, job_id)
+    except Exception:
+        log.exception("Could not remove submitted pending print job=%s", job_id)
+    log.info(
+        "TG print choice submitted job=%s user=%s mode=%s command=%s",
+        job_id, user_id, mode, command_id,
+    )
     return True
 
 
@@ -615,7 +864,9 @@ async def tg_poll_commands() -> None:
                         callback = update.get("callback_query")
                         if callback:
                             user_id = callback.get("from", {}).get("id")
-                            if is_admin(user_id):
+                            print_callback_handled = await _tg_handle_print_callback(
+                                telegram, base, callback)
+                            if not print_callback_handled and is_admin(user_id):
                                 await _tg_answer_callback(
                                     telegram, base, callback.get("id"))
                                 chat_id = callback.get("message", {}).get(

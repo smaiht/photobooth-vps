@@ -309,6 +309,7 @@ async def store_print_job(
     suffix: str,
     image_payload: bytes,
     metadata: dict,
+    event_folder: str | None = None,
 ) -> dict:
     """Store one Telegram image and its TXT metadata on Yandex.Disk."""
     normalized_suffix = str(suffix or "").lower()
@@ -322,8 +323,9 @@ async def store_print_job(
     if not await _connect():
         raise RuntimeError("Yandex.Disk poller is unavailable")
 
-    event_folder = _folder
-    sessions_root = f"{event_folder}_by_sessions"
+    event_name = validate_event_name(event_folder or _folder.lstrip("/"))
+    selected_event_folder = f"/{event_name}"
+    sessions_root = f"{selected_event_folder}_by_sessions"
     jobs_root = f"{sessions_root}/0000_print_jobs"
     for path in (sessions_root, jobs_root):
         if not await _ensure_directory(path):
@@ -338,7 +340,7 @@ async def store_print_job(
     info.update({
         "job_id": job_id,
         "status": "received_by_vps",
-        "event_folder": event_folder.lstrip("/"),
+        "event_folder": event_name,
         "stored_at": now.isoformat(),
         "image_path": image_path,
         "info_path": info_path,
@@ -355,7 +357,7 @@ async def store_print_job(
         job_id, user_id, image_path, info_path,
     )
     return {
-        "event_folder": event_folder.lstrip("/"),
+        "event_folder": event_name,
         "artifact_path": image_path,
         "info_path": info_path,
     }
