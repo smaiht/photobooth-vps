@@ -30,10 +30,10 @@ JOB_ID_RE = re.compile(r"^[a-f0-9]{32}$")
 SUFFIX_RE = re.compile(r"^\.[a-z0-9]{1,10}$")
 
 _BACKGROUND = (20, 21, 25)
-_TILE_BACKGROUND = (36, 38, 44)
 _PAPER = (255, 255, 255)
-_PAPER_OUTLINE = (210, 213, 220)
 _TEXT = (246, 247, 250)
+_FIT_LABEL = "Как есть\n(будут белые поля)"
+_FILL_LABEL = "Увеличить под размер\n(обрежутся края)"
 
 
 @dataclass(frozen=True)
@@ -82,7 +82,7 @@ def _font(size: int) -> ImageFont.FreeTypeFont | ImageFont.ImageFont:
 
 def _paper_preview_size(target_size: tuple[int, int]) -> tuple[int, int]:
     target_w, target_h = target_size
-    long_side = 520
+    long_side = 800
     if target_w > target_h:
         return long_side, round(long_side * target_h / target_w)
     return round(long_side * target_w / target_h), long_side
@@ -104,7 +104,7 @@ def _contain(image: Image.Image, size: tuple[int, int]) -> Image.Image:
 def _cover_view(
     image: Image.Image,
     paper_size: tuple[int, int],
-) -> tuple[Image.Image, tuple[int, int, int, int], str]:
+) -> tuple[Image.Image, str]:
     """Show the printed center normally and discarded overflow in dark red."""
     paper_w, paper_h = paper_size
     scale = max(paper_w / image.width, paper_h / image.height)
@@ -154,62 +154,53 @@ def _cover_view(
     darkened.paste(printed, (visible_x, visible_y))
     printed.close()
     normal.close()
-    ImageDraw.Draw(darkened).rectangle(
-        (paper_box[0], paper_box[1], paper_box[2] - 1, paper_box[3] - 1),
-        outline=_PAPER_OUTLINE,
-        width=4,
-    )
-    return darkened, paper_box, axis
+    return darkened, axis
 
 
 def _tile(
     visual: Image.Image,
-    paper_box: tuple[int, int, int, int],
     label: str,
     number: str,
 ) -> Image.Image:
-    padding = 28
-    label_height = 64
+    label_height = 116
     tile = Image.new(
         "RGB",
-        (visual.width + padding * 2, visual.height + padding * 2 + label_height),
-        _TILE_BACKGROUND,
+        (visual.width, visual.height + label_height),
+        _BACKGROUND,
     )
     draw = ImageDraw.Draw(tile)
-    draw.rounded_rectangle(
-        (0, 0, tile.width - 1, tile.height - 1),
-        radius=22,
-        outline=(62, 65, 74),
-        width=2,
-    )
-    tile.paste(visual, (padding, padding))
+    tile.paste(visual, (0, 0))
 
-    badge_font = _font(28)
-    badge_center = (padding + 25, padding + 25)
+    badge_font = _font(42)
+    badge_radius = 34
+    badge_center = (badge_radius + 10, badge_radius + 10)
     draw.ellipse(
-        (badge_center[0] - 21, badge_center[1] - 21,
-         badge_center[0] + 21, badge_center[1] + 21),
+        (badge_center[0] - badge_radius, badge_center[1] - badge_radius,
+         badge_center[0] + badge_radius, badge_center[1] + badge_radius),
         fill=(10, 11, 14),
-        outline=(235, 237, 242),
-        width=2,
     )
     number_box = draw.textbbox((0, 0), number, font=badge_font)
     draw.text(
-        (badge_center[0] - (number_box[2] - number_box[0]) / 2,
-         badge_center[1] - (number_box[3] - number_box[1]) / 2 - 2),
+        (badge_center[0] - (number_box[0] + number_box[2]) / 2,
+         badge_center[1] - (number_box[1] + number_box[3]) / 2),
         number,
         fill=_TEXT,
         font=badge_font,
     )
 
-    label_font = _font(24)
-    label_box = draw.textbbox((0, 0), label, font=label_font)
-    draw.text(
-        ((tile.width - (label_box[2] - label_box[0])) / 2,
-         visual.height + padding * 2 + 8),
+    label_font = _font(42)
+    label_spacing = 4
+    label_box = draw.multiline_textbbox(
+        (0, 0), label, font=label_font, spacing=label_spacing, align="center")
+    draw.multiline_text(
+        ((tile.width - (label_box[0] + label_box[2])) / 2,
+         visual.height
+         + (label_height - (label_box[1] + label_box[3])) / 2),
         label,
         fill=_TEXT,
         font=label_font,
+        spacing=label_spacing,
+        align="center",
     )
     return tile
 
@@ -237,57 +228,55 @@ def build_choice_preview(payload: bytes) -> PrintPreview:
         preview_source.thumbnail((2200, 2200), Image.Resampling.LANCZOS)
         paper_size = _paper_preview_size(target_size)
 
-        fit_paper = _contain(preview_source, paper_size)
-        cover_visual, cover_paper_box, overflow_axis = _cover_view(
+        cover_visual, overflow_axis = _cover_view(
             preview_source, paper_size)
+
+        # Scale the fit canvas to the full comparison width/height. This keeps
+        # the white sheet itself as the visual boundary instead of padding it
+        # with dark areas merely to match the crop preview's dimensions.
+        if overflow_axis == "horizontal":
+            fit_scale = cover_visual.width / paper_size[0]
+        else:
+            fit_scale = cover_visual.height / paper_size[1]
+        fit_size = (
+            round(paper_size[0] * fit_scale),
+            round(paper_size[1] * fit_scale),
+        )
+        fit_paper = _contain(preview_source, fit_size)
         preview_source.close()
 
-        extra_x = (cover_visual.width - paper_size[0]) // 2
-        extra_y = (cover_visual.height - paper_size[1]) // 2
-        fit_visual = Image.new("RGB", cover_visual.size, _BACKGROUND)
-        fit_visual.paste(fit_paper, (extra_x, extra_y))
-        fit_paper.close()
-        ImageDraw.Draw(fit_visual).rectangle(
-            (extra_x, extra_y,
-             extra_x + paper_size[0] - 1, extra_y + paper_size[1] - 1),
-            outline=_PAPER_OUTLINE,
-            width=4,
-        )
         fit_tile = _tile(
-            fit_visual,
-            (extra_x, extra_y, extra_x + paper_size[0], extra_y + paper_size[1]),
-            "КАК ЕСТЬ, С ПОЛЯМИ",
+            fit_paper,
+            _FIT_LABEL,
             "1",
         )
         cover_tile = _tile(
             cover_visual,
-            cover_paper_box,
-            "БЕЗ ПОЛЕЙ, С ОБРЕЗКОЙ",
+            _FILL_LABEL,
             "2",
         )
-        fit_visual.close()
+        fit_paper.close()
         cover_visual.close()
 
-        outer = 28
-        gap = 28
+        gap = 24
         if overflow_axis == "vertical":
             collage = Image.new(
                 "RGB",
-                (fit_tile.width + cover_tile.width + gap + outer * 2,
-                 max(fit_tile.height, cover_tile.height) + outer * 2),
+                (fit_tile.width + cover_tile.width + gap,
+                 max(fit_tile.height, cover_tile.height)),
                 _BACKGROUND,
             )
-            collage.paste(fit_tile, (outer, outer))
-            collage.paste(cover_tile, (outer + fit_tile.width + gap, outer))
+            collage.paste(fit_tile, (0, 0))
+            collage.paste(cover_tile, (fit_tile.width + gap, 0))
         else:
             collage = Image.new(
                 "RGB",
-                (max(fit_tile.width, cover_tile.width) + outer * 2,
-                 fit_tile.height + cover_tile.height + gap + outer * 2),
+                (max(fit_tile.width, cover_tile.width),
+                 fit_tile.height + cover_tile.height + gap),
                 _BACKGROUND,
             )
-            collage.paste(fit_tile, (outer, outer))
-            collage.paste(cover_tile, (outer, outer + fit_tile.height + gap))
+            collage.paste(fit_tile, (0, 0))
+            collage.paste(cover_tile, (0, fit_tile.height + gap))
         fit_tile.close()
         cover_tile.close()
 

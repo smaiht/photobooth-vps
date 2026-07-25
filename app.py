@@ -588,15 +588,15 @@ async def _tg_handle_print_message(
                     "callback_data": f"print:fit:{job_id}",
                 },
                 {
-                    "text": "2️⃣ Без полей",
+                    "text": "2️⃣ Увеличить под размер",
                     "callback_data": f"print:fill:{job_id}",
                 },
             ]],
         }
         caption = (
             "Фото не совпадает с форматом 10×15.\n\n"
-            "1 — напечатать всё фото с белыми полями.\n"
-            "2 — заполнить весь лист; затемнённые части не напечатаются."
+            "1 — как есть (будут белые поля).\n"
+            "2 — увеличить под размер (обрежутся затемнённые края)."
         )
         sent = await _tg_send_photo(
             telegram,
@@ -670,7 +670,11 @@ async def _tg_handle_print_callback(
         return True
 
     _print_callbacks_in_progress.add(job_id)
-    selected_text = "как есть, с полями" if mode == "fit" else "без полей, с обрезкой"
+    selected_text = (
+        "как есть, с белыми полями"
+        if mode == "fit"
+        else "увеличить под размер, края обрежутся"
+    )
     await _tg_answer_callback(
         telegram, base, callback_id, "Принято, отправляю на печать")
     try:
