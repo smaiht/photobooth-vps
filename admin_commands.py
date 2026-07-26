@@ -27,23 +27,11 @@ KNOWN_COMMANDS = {
     "/event": "set_event",
 }
 
-COMMAND_BUTTONS = (
-    "/run",
-    "/status",
-    "/unblock",
-    "/logs",
-    "/get_config",
-    "/clear_logs",
-    "/restart",
-    "/update",
+HELP_MESSAGE = (
+    "Не понял команду. Доступные команды:\n\n"
+    + "\n\n".join(KNOWN_COMMANDS)
+    + "\n\nНастройка камеры, например: /iso 100"
 )
-
-COMMAND_KEYBOARD = {
-    "inline_keyboard": [
-        [{"text": command, "callback_data": command}]
-        for command in COMMAND_BUTTONS
-    ],
-}
 
 
 def _parse_event(

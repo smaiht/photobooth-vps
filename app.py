@@ -120,20 +120,6 @@ async def _telegram_user_has_print_access(
     )
 
 
-async def _tg_show_keyboard(
-    telegram: aiohttp.ClientSession,
-    base: str,
-    chat_id: str | int,
-) -> None:
-    await _tg_send_text(
-        telegram,
-        base,
-        chat_id,
-        "Не понял команду. Выбери действие кнопкой:",
-        reply_markup=admin_commands.COMMAND_KEYBOARD,
-    )
-
-
 def _parse_start_command(text: str) -> tuple[bool, str | None]:
     """Return (is_start, parameter); None is valid for an empty /start."""
     parts = (text or "").strip().split(maxsplit=1)
@@ -1368,7 +1354,12 @@ async def _tg_handle_admin_command(
         return
 
     if parsed is None:
-        await _tg_show_keyboard(telegram, base, chat_id)
+        await _tg_send_text(
+            telegram,
+            base,
+            chat_id,
+            admin_commands.HELP_MESSAGE,
+        )
         return
 
     command, data = parsed
@@ -1435,26 +1426,26 @@ async def _tg_route_callback_update(
     base: str,
     callback: dict,
 ) -> None:
-    """Route one button press: print choice, cashier decision, admin command."""
-    if await _tg_handle_print_callback(telegram, base, callback):
-        return
-    if await _tg_handle_print_admin_callback(telegram, base, callback):
+    """Route a button press to its print callback namespace."""
+    callback_kind = str(callback.get("data") or "").partition(":")[0]
+
+    # Select exactly one flow here; its handler validates the full payload.
+    if callback_kind == "print":
+        handled = await _tg_handle_print_callback(telegram, base, callback)
+    elif callback_kind == "print_admin":
+        handled = await _tg_handle_print_admin_callback(telegram, base, callback)
+    else:
+        handled = False
+
+    if handled:
         return
 
-    user_id = (callback.get("from") or {}).get("id")
-    if not is_admin(user_id):
-        return
-
-    # Admin command buttons carry the same text as their slash commands.
-    await _tg_answer_callback(telegram, base, callback.get("id"))
-    chat_id = (
-        (callback.get("message") or {}).get("chat") or {}
-    ).get("id", user_id)
-    await _tg_handle_admin_command(
+    # Acknowledge stale buttons without interpreting their data as a command.
+    await _tg_answer_callback(
         telegram,
         base,
-        chat_id,
-        callback.get("data", ""),
+        callback.get("id"),
+        "Эта кнопка больше недоступна.",
     )
 
 
