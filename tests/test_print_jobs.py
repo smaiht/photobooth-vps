@@ -391,15 +391,21 @@ class TelegramPrintChoiceTests(unittest.IsolatedAsyncioTestCase):
             calls.append("edit_user")
             return True
 
+        async def send_payment(*_args, **_kwargs):
+            calls.append("send_payment")
+            return True
+
         async def send_admin(*_args, **_kwargs):
             calls.append("send_admin")
             return 501
 
+        telegram = object()
         with TemporaryDirectory() as tmpdir, \
              patch.object(print_jobs, "PENDING_ROOT", Path(tmpdir)), \
              patch("app.yadisk_poll.current_event_folder", return_value="Кафе"), \
              patch("app._tg_answer_callback", side_effect=answer) as answer_mock, \
              patch("app._tg_edit_print_caption", side_effect=edit) as edit_mock, \
+             patch("app._tg_send_text", side_effect=send_payment) as send_text, \
              patch("app._send_admin_print_request", side_effect=send_admin):
             print_jobs.save_pending(
                 job_id,
@@ -409,15 +415,23 @@ class TelegramPrintChoiceTests(unittest.IsolatedAsyncioTestCase):
             )
 
             self.assertTrue(await app._tg_handle_print_callback(
-                object(), "https://telegram.test", callback))
+                telegram, "https://telegram.test", callback))
 
-        self.assertEqual(calls, ["answer_user", "edit_user", "send_admin"])
+        self.assertEqual(
+            calls,
+            ["answer_user", "edit_user", "send_payment", "send_admin"],
+        )
         self.assertEqual(answer_mock.await_args.args[3], "Вариант сохранён")
         self.assertEqual(
             edit_mock.await_args.args[4],
-            "✅ Выбрано: увеличить под размер, края обрежутся.\n"
-            "⏳ Оплатите печать администратору; "
-            "фото ожидает его подтверждения.",
+            "✅ Выбрано: увеличить под размер, края обрежутся.",
+        )
+        send_text.assert_awaited_once_with(
+            telegram,
+            "https://telegram.test",
+            owner_id,
+            "💳 Оплатите печать администратору.\n"
+            "После подтверждения оплаты фото будет добавлено в очередь.",
         )
 
     async def test_admin_approval_notifies_user_once_before_dispatch(self):

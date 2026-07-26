@@ -311,6 +311,85 @@ class LogDeliveryTests(unittest.IsolatedAsyncioTestCase):
         delete.assert_awaited_once_with("/control/logs/test.log")
 
 
+class PrintCommandResponseTests(unittest.IsolatedAsyncioTestCase):
+    async def test_success_updates_queue_without_duplicate_user_message(self):
+        command_id = "a" * 32
+        response = {
+            "status": "ok",
+            "command": "print_image",
+            "command_id": command_id,
+            "message": "Ваше фото добавлено в очередь",
+            "reply_chat_id": 123,
+        }
+        queued = {
+            "outcome": "queued",
+            "status": "queued",
+            "command_id": command_id,
+        }
+        with patch.object(
+            app.database,
+            "mark_print_job_queued",
+            AsyncMock(return_value=queued),
+        ) as mark_queued, patch(
+            "app._tg_send_text",
+            new_callable=AsyncMock,
+        ) as send_text, patch(
+            "app.aiohttp.ClientSession",
+            side_effect=AssertionError("Telegram session must not be opened"),
+        ):
+            self.assertTrue(await app._handle_control_response(response))
+
+        mark_queued.assert_awaited_once_with(command_id=command_id)
+        send_text.assert_not_awaited()
+
+    async def test_booth_error_is_still_reported_to_user(self):
+        command_id = "b" * 32
+        response = {
+            "status": "error",
+            "command": "print_image",
+            "command_id": command_id,
+            "message": "Принтер не готов",
+            "reply_chat_id": 123,
+        }
+        failed = {
+            "outcome": "failed",
+            "status": "failed",
+            "command_id": command_id,
+        }
+        telegram = object()
+
+        class ClientSession:
+            async def __aenter__(self):
+                return telegram
+
+            async def __aexit__(self, *_args):
+                return False
+
+        with patch.object(app, "TG_TOKEN", "token"), patch.object(
+            app.database,
+            "mark_print_job_failed",
+            AsyncMock(return_value=failed),
+        ) as mark_failed, patch(
+            "app.aiohttp.ClientSession",
+            return_value=ClientSession(),
+        ), patch(
+            "app._tg_send_text",
+            AsyncMock(return_value=True),
+        ) as send_text:
+            self.assertTrue(await app._handle_control_response(response))
+
+        mark_failed.assert_awaited_once_with(
+            command_id=command_id,
+            last_error="Принтер не готов",
+        )
+        send_text.assert_awaited_once_with(
+            telegram,
+            "https://api.telegram.org/bottoken",
+            123,
+            "❌ Принтер не готов",
+        )
+
+
 class ConfigDeliveryTests(unittest.IsolatedAsyncioTestCase):
     async def test_sends_combined_config_as_plain_text_document(self):
         class Response:

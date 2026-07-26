@@ -49,16 +49,10 @@ EVENT_KEY = os.environ.get("EVENT_KEY", "")
 TECHNICAL_EVENT_NAME = "Кафе"
 EVENT_NAME_RE = re.compile(r"^(\d{4}-\d{2}-\d{2}) (.+)$")
 
-# MVP allowlist for printing without guest/admin authorization. The configured
-# Telegram admin is always included; set union avoids duplicating their ID in
-# the small list of additional trusted users.
-_ADDITIONAL_PRINT_ALLOWED_USER_IDS = {6634566969, 5683598562}
-_TG_ADMIN_USER_ID = (
-    int(TG_ADMIN.strip()) if TG_ADMIN.strip().isdigit() else None
-)
-PRINT_ALLOWED_USER_IDS = frozenset(
-    _ADDITIONAL_PRINT_ALLOWED_USER_IDS
-    | ({_TG_ADMIN_USER_ID} if _TG_ADMIN_USER_ID is not None else set())
+PRINT_ALLOWED_USER_IDS = (
+    TG_ADMIN,
+    "6634566969",
+    "5683598562",
 )
 MAX_TELEGRAM_PRINT_FILE_SIZE = 20 * 1024 * 1024
 PRINT_MIME_SUFFIXES = {
@@ -215,10 +209,7 @@ def is_admin(user_id) -> bool:
 
 
 def _is_print_allowlisted(user_id) -> bool:
-    try:
-        return int(user_id) in PRINT_ALLOWED_USER_IDS
-    except (TypeError, ValueError):
-        return False
+    return user_id is not None and str(user_id) in PRINT_ALLOWED_USER_IDS
 
 
 async def _tg_show_keyboard(
@@ -1281,13 +1272,22 @@ async def _tg_handle_print_callback(
                         base,
                         chat_id,
                         message["message_id"],
-                        f"✅ Выбрано: {selected_text}.\n\n"
-                        "⏳ <b>Оплатите печать администратору;</b> "
-                        "фото ожидает его подтверждения.",
+                        f"✅ Выбрано: {selected_text}.",
                     )
                 except Exception:
                     log.exception(
                         "Could not update cafe print choice job=%s", job_id)
+            try:
+                await _tg_send_text(
+                    telegram,
+                    base,
+                    chat_id,
+                    "💳 Оплатите печать администратору.\n"
+                    "После подтверждения оплаты фото будет добавлено в очередь.",
+                )
+            except Exception:
+                log.exception(
+                    "Could not send cafe payment instructions job=%s", job_id)
             try:
                 payload, metadata = await asyncio.to_thread(
                     print_jobs.load_pending,
@@ -1984,6 +1984,12 @@ async def _handle_control_response(response: dict) -> bool:
                 transition.get("status"),
             )
             return False
+        if response.get("status") == "ok":
+            # The user was already notified when the cashier authorized the
+            # job (or when an authorized job was submitted).  The booth's
+            # success response is still required for the durable `queued`
+            # transition, but forwarding its text would duplicate that UI.
+            return True
 
     chat_id = response.get("reply_chat_id") or TG_ADMIN
     if not chat_id or not TG_TOKEN:
@@ -2064,7 +2070,7 @@ async def _handle_control_response(response: dict) -> bool:
     if response["status"] == "ok" and response["command"] == "set_event":
         event_name = str(response.get("event_folder") or "")
         if event_public_url:
-            response_message += f"\nПубличная папка: {event_public_url}"
+            response_message += f"\n\nПубличная папка: {event_public_url}"
         elif event_publish_error:
             response_message += (
                 "\n⚠️ Event активирован, но папку не удалось "
