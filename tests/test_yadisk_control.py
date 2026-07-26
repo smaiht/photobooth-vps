@@ -88,8 +88,8 @@ class EventSwitchTests(unittest.IsolatedAsyncioTestCase):
                 app._event_access_token("2026-08-17 свадьба ивановых"),
             )
 
-        self.assertEqual(len(token), 46)
-        self.assertRegex(token, r"^ev_[A-Za-z0-9_-]{43}$")
+        self.assertEqual(len(token), 12)
+        self.assertRegex(token, r"^[A-Za-z0-9_-]{12}$")
 
 
 class CafeUnblockCommandTests(unittest.IsolatedAsyncioTestCase):

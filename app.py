@@ -142,23 +142,29 @@ async def _tg_send_photo(
     chat_id: str | int,
     photo: bytes,
     caption: str,
-    reply_markup: dict,
+    reply_markup: dict | None,
     reply_to_message_id: int | None,
+    *,
+    filename: str = "print_options.jpg",
+    content_type: str = "image/jpeg",
+    parse_mode: str | None = "HTML",
 ) -> int | None:
     form = aiohttp.FormData()
     form.add_field("chat_id", str(chat_id))
     form.add_field("caption", caption)
-    form.add_field("parse_mode", "HTML")
+    if parse_mode:
+        form.add_field("parse_mode", parse_mode)
     form.add_field(
         "photo",
         photo,
-        filename="print_options.jpg",
-        content_type="image/jpeg",
+        filename=filename,
+        content_type=content_type,
     )
-    form.add_field(
-        "reply_markup",
-        json.dumps(reply_markup, ensure_ascii=False, separators=(",", ":")),
-    )
+    if reply_markup:
+        form.add_field(
+            "reply_markup",
+            json.dumps(reply_markup, ensure_ascii=False, separators=(",", ":")),
+        )
     if isinstance(reply_to_message_id, int):
         form.add_field(
             "reply_parameters",
@@ -170,19 +176,19 @@ async def _tg_send_photo(
         )
     async with session.post(f"{base}/sendPhoto", data=form) as response:
         if response.status != 200:
-            log.warning("TG print preview send failed: %s", await response.text())
+            log.warning("TG photo send failed: %s", await response.text())
             return None
         try:
             body = await response.json()
         except Exception as exc:
-            log.warning("TG print preview returned invalid JSON: %s", exc)
+            log.warning("TG photo response returned invalid JSON: %s", exc)
             return None
         result = body.get("result") if isinstance(body, dict) else None
         message_id = result.get("message_id") if isinstance(result, dict) else None
         if (not isinstance(body, dict) or not body.get("ok")
                 or not isinstance(message_id, int)
                 or isinstance(message_id, bool)):
-            log.warning("TG print preview response has no valid message_id")
+            log.warning("TG photo response has no valid message_id")
             return None
         return message_id
 
@@ -403,10 +409,41 @@ def _event_access_token(event_name: str) -> str:
         canonical_name.encode("utf-8"),
         hashlib.sha256,
     ).digest()
-    token = "ev_" + base64.urlsafe_b64encode(digest).decode("ascii").rstrip("=")
-    if len(token) > 64:
-        raise RuntimeError("ключ доступа event превышает лимит Telegram")
-    return token
+    # Nine HMAC bytes encode to exactly 12 URL-safe Base64 characters.
+    return base64.urlsafe_b64encode(digest[:9]).decode("ascii")
+
+
+def _event_start_link(event_name: str) -> str:
+    if not TG_BOT_USERNAME:
+        raise RuntimeError("TG_BOT_USERNAME не настроен")
+    return (
+        f"https://t.me/{TG_BOT_USERNAME}"
+        f"?start={_event_access_token(event_name)}"
+    )
+
+
+def _validate_event_access_configuration() -> None:
+    if not EVENT_KEY.strip():
+        raise RuntimeError("EVENT_KEY не настроен")
+    if not TG_BOT_USERNAME:
+        raise RuntimeError("TG_BOT_USERNAME не настроен")
+
+
+def _qr_code_png(payload: str) -> bytes:
+    qr = qrcode.QRCode(
+        error_correction=qrcode.constants.ERROR_CORRECT_M,
+        box_size=12,
+        border=4,
+    )
+    qr.add_data(payload)
+    qr.make(fit=True)
+    image = qr.make_image(fill_color="black", back_color="white").get_image()
+    try:
+        output = io.BytesIO()
+        image.save(output, format="PNG")
+        return output.getvalue()
+    finally:
+        image.close()
 
 
 def _event_name_from_command(text: str) -> str | None:
@@ -1710,7 +1747,7 @@ async def _tg_handle_admin_command(
     if event_name is not None:
         try:
             if event_name != TECHNICAL_EVENT_NAME:
-                _event_access_token(event_name)
+                _validate_event_access_configuration()
             await _send_disk_command("set_event", chat_id, {"name": event_name})
             await _tg_send_text(
                 telegram, base, chat_id,
@@ -2115,6 +2152,7 @@ async def _handle_control_response(response: dict) -> bool:
 
     prefix = "✅" if response["status"] == "ok" else "❌"
     response_message = response["message"]
+    event_qr_png: bytes | None = None
     if response["status"] == "ok" and response["command"] == "set_event":
         event_name = str(response.get("event_folder") or "")
         if event_public_url:
@@ -2126,18 +2164,39 @@ async def _handle_control_response(response: dict) -> bool:
             )
         if event_name and event_name != TECHNICAL_EVENT_NAME:
             try:
-                event_token = _event_access_token(event_name)
-            except RuntimeError as exc:
-                log.warning("Control: event access token unavailable: %s", exc)
+                start_link = _event_start_link(event_name)
+                event_qr_png = await asyncio.to_thread(
+                    _qr_code_png,
+                    start_link,
+                )
+            except Exception as exc:
+                log.warning("Control: event QR unavailable: %s", exc)
+                response_message += f"\n⚠️ QR-код не создан: {exc}"
             else:
-                response_message += f"\nStart-параметр для QR: {event_token}"
+                response_message += f"\n\nСсылка для гостей:\n{start_link}"
     async with aiohttp.ClientSession() as telegram:
-        delivered = await _tg_send_text(
-            telegram,
-            f"https://api.telegram.org/bot{TG_TOKEN}",
-            chat_id,
-            f"{prefix} {response_message}",
-        )
+        telegram_base = f"https://api.telegram.org/bot{TG_TOKEN}"
+        if event_qr_png is not None:
+            message_id = await _tg_send_photo(
+                telegram,
+                telegram_base,
+                chat_id,
+                event_qr_png,
+                f"{prefix} {response_message}",
+                None,
+                None,
+                filename="event_access_qr.png",
+                content_type="image/png",
+                parse_mode=None,
+            )
+            delivered = message_id is not None
+        else:
+            delivered = await _tg_send_text(
+                telegram,
+                telegram_base,
+                chat_id,
+                f"{prefix} {response_message}",
+            )
     if not delivered:
         return False
     return True
