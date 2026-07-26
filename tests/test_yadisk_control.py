@@ -2,7 +2,9 @@ import json
 import unittest
 from unittest.mock import AsyncMock, MagicMock, patch
 
+import admin_commands
 import app
+import event_access
 import yadisk_control
 import yadisk_poll
 
@@ -63,13 +65,25 @@ class EventSwitchTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(yadisk_poll._folder, "/Свадьба Ивановых 2026")
 
     def test_event_command_requires_iso_date_except_cafe(self):
+        with patch.object(
+            event_access,
+            "EVENT_KEY",
+            "test-event-key",
+        ), patch.object(
+            event_access.telegram_api,
+            "BOT_USERNAME",
+            "photobooth_bot",
+        ):
+            self.assertEqual(
+                admin_commands.parse(
+                    "/event   2026-08-17   Свадьба   Ивановых  "
+                ),
+                ("set_event", {"name": "2026-08-17 Свадьба Ивановых"}),
+            )
         self.assertEqual(
-            app._event_name_from_command(
-                "/event   2026-08-17   Свадьба   Ивановых  "
-            ),
-            "2026-08-17 Свадьба Ивановых",
+            admin_commands.parse("/event Кафе"),
+            ("set_event", {"name": "Кафе"}),
         )
-        self.assertEqual(app._event_name_from_command("/event Кафе"), "Кафе")
         for command in (
             "/event Свадьба Ивановых",
             "/event 2026-02-31 Свадьба Ивановых",
@@ -77,15 +91,15 @@ class EventSwitchTests(unittest.IsolatedAsyncioTestCase):
             "/event ../bad",
         ):
             with self.subTest(command=command), self.assertRaises(ValueError):
-                app._event_name_from_command(command)
+                admin_commands.parse(command)
 
     def test_event_access_token_is_stable_url_safe_and_fixed_length(self):
-        with patch.object(app, "EVENT_KEY", "test-event-key"):
-            token = app._event_access_token(
+        with patch.object(event_access, "EVENT_KEY", "test-event-key"):
+            token = event_access.access_token(
                 "  2026-08-17   СВАДЬБА Ивановых  ")
             self.assertEqual(
                 token,
-                app._event_access_token("2026-08-17 свадьба ивановых"),
+                event_access.access_token("2026-08-17 свадьба ивановых"),
             )
 
         self.assertEqual(len(token), 12)
@@ -94,35 +108,41 @@ class EventSwitchTests(unittest.IsolatedAsyncioTestCase):
 
 class CafeUnblockCommandTests(unittest.IsolatedAsyncioTestCase):
     def test_parses_default_and_explicit_session_count(self):
-        self.assertEqual(app._unblock_sessions_from_command("/unblock"), 1)
-        self.assertEqual(app._unblock_sessions_from_command("/unblock 25"), 25)
         self.assertEqual(
-            app._unblock_sessions_from_command("/unblock@photobooth_bot 1000"),
-            1000,
+            admin_commands.parse("/unblock"),
+            ("unblock", {"sessions": 1}),
         )
-        self.assertIsNone(app._unblock_sessions_from_command("/status"))
+        self.assertEqual(
+            admin_commands.parse("/unblock 25"),
+            ("unblock", {"sessions": 25}),
+        )
+        self.assertEqual(
+            admin_commands.parse("/unblock@photobooth_bot 1000"),
+            ("unblock", {"sessions": 1000}),
+        )
+
+    def test_block_and_unblock_zero_parse_to_same_booth_command(self):
+        expected = ("unblock", {"sessions": 0})
+        self.assertEqual(admin_commands.parse("/block"), expected)
+        self.assertEqual(
+            admin_commands.parse("/block@photobooth_bot"), expected)
+        self.assertEqual(admin_commands.parse("/unblock 0"), expected)
 
     def test_rejects_invalid_session_count(self):
         for command in (
-            "/unblock 0",
             "/unblock 1001",
             "/unblock -1",
             "/unblock 1.5",
             "/unblock many",
             "/unblock 2 extra",
+            "/block 1",
         ):
             with self.subTest(command=command), self.assertRaises(ValueError):
-                app._unblock_sessions_from_command(command)
+                admin_commands.parse(command)
 
-    def test_is_registered_as_fixed_command_and_keyboard_button(self):
-        self.assertEqual(app.TG_COMMANDS["/unblock"], "unblock")
-        callbacks = [
-            button["callback_data"]
-            for row in app.TG_COMMAND_KEYBOARD["inline_keyboard"]
-            for button in row
-        ]
-        self.assertIn("/unblock", callbacks)
-        self.assertIsNone(app._camera_setting_from_command("/unblock 2"))
+    def test_block_is_registered_in_command_map_and_help(self):
+        self.assertEqual(admin_commands.KNOWN_COMMANDS["/block"], "unblock")
+        self.assertIn("/block", admin_commands.HELP_MESSAGE)
 
     async def test_forwards_session_count_to_booth(self):
         with patch(
@@ -152,6 +172,34 @@ class CafeUnblockCommandTests(unittest.IsolatedAsyncioTestCase):
 
         send.assert_awaited_once_with("unblock", 123, {"sessions": 1})
 
+    async def test_block_forwards_zero_with_lock_message(self):
+        with patch(
+            "app._send_disk_command",
+            AsyncMock(return_value="a" * 32),
+        ) as send, patch(
+            "app._tg_send_text",
+            AsyncMock(return_value=True),
+        ) as send_text:
+            await app._tg_handle_admin_command(
+                object(), "https://telegram.test", 123, "/block")
+
+        send.assert_awaited_once_with("unblock", 123, {"sessions": 0})
+        self.assertIn("блокирую", send_text.await_args.args[3])
+        self.assertIn("подтверждение будки", send_text.await_args.args[3])
+
+    async def test_unblock_zero_forwards_zero(self):
+        with patch(
+            "app._send_disk_command",
+            AsyncMock(return_value="a" * 32),
+        ) as send, patch(
+            "app._tg_send_text",
+            AsyncMock(return_value=True),
+        ):
+            await app._tg_handle_admin_command(
+                object(), "https://telegram.test", 123, "/unblock 0")
+
+        send.assert_awaited_once_with("unblock", 123, {"sessions": 0})
+
     async def test_invalid_count_is_reported_without_disk_command(self):
         with patch(
             "app._send_disk_command",
@@ -164,30 +212,35 @@ class CafeUnblockCommandTests(unittest.IsolatedAsyncioTestCase):
                 object(), "https://telegram.test", 123, "/unblock 1001")
 
         send.assert_not_awaited()
-        self.assertIn("от 1 до 1000", send_text.await_args.args[3])
+        self.assertIn("от 0 до 1000", send_text.await_args.args[3])
 
 
 class CameraSettingCommandTests(unittest.IsolatedAsyncioTestCase):
     def test_parses_dynamic_camera_setting(self):
         self.assertEqual(
-            app._camera_setting_from_command("/iso 200"),
-            ("iso", "200"),
+            admin_commands.parse("/iso 200"),
+            ("set_camera_config", {"field": "iso", "value": "200"}),
         )
         self.assertEqual(
-            app._camera_setting_from_command(
+            admin_commands.parse(
                 "/white_balance@photobooth_bot AUTO"),
-            ("white_balance", "AUTO"),
+            (
+                "set_camera_config",
+                {"field": "white_balance", "value": "AUTO"},
+            ),
         )
 
     def test_does_not_intercept_reserved_or_plain_commands(self):
-        self.assertIsNone(app._camera_setting_from_command("/status"))
-        self.assertIsNone(app._camera_setting_from_command("/get_config"))
-        self.assertIsNone(app._camera_setting_from_command("/event Wedding"))
-        self.assertIsNone(app._camera_setting_from_command("plain text"))
+        self.assertEqual(admin_commands.parse("/status"), ("status", None))
+        self.assertEqual(
+            admin_commands.parse("/get_config"), ("get_config", None))
+        with self.assertRaises(ValueError):
+            admin_commands.parse("/event Wedding")
+        self.assertIsNone(admin_commands.parse("plain text"))
 
     def test_requires_value_for_dynamic_camera_setting(self):
         with self.assertRaisesRegex(ValueError, "Использование"):
-            app._camera_setting_from_command("/continuous_af")
+            admin_commands.parse("/continuous_af")
 
     async def test_forwards_raw_value_to_booth(self):
         with patch(
@@ -232,7 +285,7 @@ class CameraSettingCommandTests(unittest.IsolatedAsyncioTestCase):
             await app._tg_handle_admin_command(
                 object(), "https://telegram.test", 123, "/get_config")
 
-        send.assert_awaited_once_with("get_config", 123)
+        send.assert_awaited_once_with("get_config", 123, None)
         self.assertEqual(
             send_text.await_args.args[3],
             "⏳ Запрашиваю конфиги фотобудки...",
@@ -241,11 +294,14 @@ class CameraSettingCommandTests(unittest.IsolatedAsyncioTestCase):
 
 class UpdateCommandTests(unittest.IsolatedAsyncioTestCase):
     async def test_update_does_not_restart_automatically(self):
-        async def update(progress_callback):
+        async def update(_updates_folder, progress_callback):
             await progress_callback("retry notice")
             return "published"
 
-        with patch("app._do_update", AsyncMock(side_effect=update)) as do_update, \
+        with patch(
+            "app.vps_update.publish_latest_release",
+            AsyncMock(side_effect=update),
+        ) as do_update, \
              patch("app._send_disk_command", AsyncMock(return_value="a" * 32)) as send, \
              patch("app._tg_send_text", AsyncMock(return_value=True)) as send_text:
             await app._tg_handle_admin_command(
@@ -282,7 +338,7 @@ class LogDeliveryTests(unittest.IsolatedAsyncioTestCase):
                 return False
 
         form = MagicMock()
-        with patch.object(app, "TG_TOKEN", "token"), \
+        with patch.object(app.telegram_api, "BOT_TOKEN", "token"), \
              patch("app.aiohttp.FormData", return_value=form), \
              patch("app.aiohttp.ClientSession", return_value=ClientSession()):
             self.assertTrue(await app._tg_send_log(5683598562, b"log"))
@@ -297,7 +353,7 @@ class LogDeliveryTests(unittest.IsolatedAsyncioTestCase):
             "artifact_path": "/control/logs/test.log",
             "reply_chat_id": 5683598562,
         }
-        with patch.object(app, "TG_TOKEN", "token"), \
+        with patch.object(app.telegram_api, "BOT_TOKEN", "token"), \
              patch.object(app, "TG_ADMIN", "admin"), \
              patch("app.yadisk_control.download_bytes", AsyncMock(return_value=b"log")), \
              patch("app._tg_send_log", AsyncMock(return_value=True)) as send_log, \
@@ -365,7 +421,15 @@ class PrintCommandResponseTests(unittest.IsolatedAsyncioTestCase):
             async def __aexit__(self, *_args):
                 return False
 
-        with patch.object(app, "TG_TOKEN", "token"), patch.object(
+        with patch.object(
+            app.telegram_api,
+            "BOT_TOKEN",
+            "token",
+        ), patch.object(
+            app.telegram_api,
+            "BOT_API_BASE",
+            "https://api.telegram.org/bottoken",
+        ), patch.object(
             app.database,
             "mark_print_job_failed",
             AsyncMock(return_value=failed),
@@ -413,7 +477,7 @@ class ConfigDeliveryTests(unittest.IsolatedAsyncioTestCase):
                 return False
 
         form = MagicMock()
-        with patch.object(app, "TG_TOKEN", "token"), \
+        with patch.object(app.telegram_api, "BOT_TOKEN", "token"), \
              patch("app.aiohttp.FormData", return_value=form), \
              patch("app.aiohttp.ClientSession", return_value=ClientSession()):
             self.assertTrue(await app._tg_send_document(
@@ -441,7 +505,7 @@ class ConfigDeliveryTests(unittest.IsolatedAsyncioTestCase):
         }
         export = b"===== config_app.json =====\n{}\n"
         vps_config = b'{"yadisk_folder":"event"}\n'
-        with patch.object(app, "TG_TOKEN", "token"), \
+        with patch.object(app.telegram_api, "BOT_TOKEN", "token"), \
              patch.object(app, "CONFIG_PATH") as config_path, \
              patch("app.yadisk_control.download_bytes",
                    AsyncMock(return_value=export)), \

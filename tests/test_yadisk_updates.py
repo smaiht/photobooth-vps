@@ -5,6 +5,7 @@ import zipfile
 from unittest.mock import AsyncMock, call, patch
 
 import app
+import vps_update
 import yadisk_updates
 
 
@@ -205,15 +206,27 @@ class PublishUpdateTests(unittest.IsolatedAsyncioTestCase):
         }
 
         progress = AsyncMock()
-        with patch.object(app, "GITHUB_RELEASE_URL", "https://github.test/release.zip"), \
-             patch("app.aiohttp.ClientSession", return_value=_DownloadSession(payload)), \
-             patch("app.yadisk_updates.publish_update", AsyncMock(return_value=published)) as publish, \
-             self.assertLogs("app", level="INFO") as captured:
-            result = await app._do_update(progress)
+        updates_folder = app.CONFIG.get(
+            "yadisk_updates_folder", "photobooth_system/updates")
+        with patch.object(
+            vps_update,
+            "GITHUB_RELEASE_URL",
+            "https://github.test/release.zip",
+        ), patch(
+            "vps_update.aiohttp.ClientSession",
+            return_value=_DownloadSession(payload),
+        ), patch(
+            "vps_update.yadisk_updates.publish_update",
+            AsyncMock(return_value=published),
+        ) as publish, self.assertLogs("vps_update", level="INFO") as captured:
+            result = await vps_update.publish_latest_release(
+                updates_folder,
+                progress,
+            )
 
         publish.assert_awaited_once_with(
-            payload, app.CONFIG.get(
-                "yadisk_updates_folder", "photobooth_system/updates"),
+            payload,
+            updates_folder,
             source_url="https://release-assets.test/immutable.zip",
             progress_callback=progress,
         )

@@ -19,6 +19,7 @@ KNOWN_COMMANDS = {
     "/run": "run",
     "/status": "status",
     "/unblock": "unblock",
+    "/block": "unblock",
     "/logs": "send_logs",
     "/get_config": "get_config",
     "/clear_logs": "clear_logs",
@@ -63,12 +64,23 @@ def _parse_unblock(argument: str | None) -> ParsedCommand:
     if argument is None:
         sessions = DEFAULT_UNBLOCK_SESSIONS
     elif not re.fullmatch(r"[0-9]+", argument):
-        raise ValueError("Использование: /unblock [число от 1 до 1000]")
+        raise ValueError(
+            "Использование: /unblock [0 или число от 1 до 1000]"
+        )
     else:
         sessions = int(argument)
-    if not 1 <= sessions <= MAX_UNBLOCK_SESSIONS:
-        raise ValueError("Количество сессий должно быть от 1 до 1000")
+    if not 0 <= sessions <= MAX_UNBLOCK_SESSIONS:
+        raise ValueError(
+            "Количество сессий должно быть от 0 до 1000; "
+            "0 сразу блокирует запуск"
+        )
     return "unblock", {"sessions": sessions}
+
+
+def _parse_block(argument: str | None) -> ParsedCommand:
+    if argument is not None:
+        raise ValueError("Использование: /block")
+    return "unblock", {"sessions": 0}
 
 
 def parse(text: str) -> ParsedCommand | None:
@@ -83,6 +95,8 @@ def parse(text: str) -> ParsedCommand | None:
 
     if known_command == "set_event":
         return _parse_event(argument)
+    if command_name == "/block":
+        return _parse_block(argument)
     if known_command == "unblock":
         return _parse_unblock(argument)
     if known_command:
@@ -105,6 +119,11 @@ def sent_message(command: str, data: dict | None) -> str:
     if command == "set_event":
         return f"⏳ Переключаю event на будке и VPS: {data['name']}"
     if command == "unblock":
+        if data["sessions"] == 0:
+            return (
+                "⏳ Кафе: блокирую запуск новых сессий; "
+                "ожидаю подтверждение будки"
+            )
         return (
             "⏳ Кафе: задаю остаток разрешённых сессий — "
             f"{data['sessions']}; ожидаю подтверждение будки"
@@ -122,7 +141,7 @@ def sent_message(command: str, data: dict | None) -> str:
 def failed_message(command: str, error: Exception) -> str:
     label = {
         "set_event": "Event не отправлен",
-        "unblock": "Разблокировка не отправлена",
+        "unblock": "Изменение блокировки не отправлено",
         "set_camera_config": "Настройка камеры не отправлена",
     }.get(command, "Команда не отправлена")
     return f"❌ {label}: {error}"

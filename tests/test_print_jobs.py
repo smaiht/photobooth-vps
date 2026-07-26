@@ -188,7 +188,12 @@ class PendingPrintTests(unittest.TestCase):
 class TelegramPrintChoiceTests(unittest.IsolatedAsyncioTestCase):
     def setUp(self):
         app._print_callbacks_in_progress.clear()
-        self.event_key_patch = patch.object(app, "EVENT_KEY", "test-event-key")
+        app._print_background_tasks.clear()
+        self.event_key_patch = patch.object(
+            app.event_access,
+            "EVENT_KEY",
+            "test-event-key",
+        )
         self.event_key_patch.start()
         self.addCleanup(self.event_key_patch.stop)
 
@@ -308,6 +313,138 @@ class TelegramPrintChoiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(submit.await_args.args[4]["sender_id"], sender_id)
         self.assertTrue(
             all(call.args[2] == chat_id for call in send_text.await_args_list)
+        )
+
+    async def test_dispatched_print_is_also_sent_to_group(self):
+        job_id = "8" * 32
+        command_id = "e" * 32
+        payload = image_payload((461, 310))
+        metadata = {
+            "sender_id": 123,
+            "sender_name": "Иван Иванов",
+            "username": "ivan",
+            "source_filename": "photo.jpg",
+            "event_folder": "2026-12-31 Тест ивент",
+            "print_mode": "fit",
+        }
+        calls = []
+
+        async def store(*_args, **_kwargs):
+            calls.append("store")
+            return {
+                "artifact_path": "/event/photo.jpg",
+                "info_path": "/event/photo.txt",
+            }
+
+        async def send_command(*_args, **_kwargs):
+            calls.append("command")
+            return command_id
+
+        async def send_group(*_args, **_kwargs):
+            calls.append("group")
+            return True
+
+        with patch.object(app, "TG_CHAT", "-100123456789"), patch(
+            "app.yadisk_poll.store_print_job",
+            side_effect=store,
+        ), patch(
+            "app._send_disk_command",
+            side_effect=send_command,
+        ), patch(
+            "app._send_print_to_group",
+            side_effect=send_group,
+        ) as send_print, patch("app.uuid.uuid4") as uuid4:
+            uuid4.return_value.hex = command_id
+            result = await app._submit_print_job(
+                job_id,
+                123,
+                ".jpg",
+                payload,
+                metadata,
+                123,
+                object(),
+                "https://telegram.test",
+            )
+
+        self.assertEqual(result, command_id)
+        self.assertEqual(calls, ["store", "command", "group"])
+        send_print.assert_awaited_once()
+        self.assertEqual(send_print.await_args.kwargs["job_id"], job_id)
+        self.assertEqual(send_print.await_args.kwargs["payload"], payload)
+
+    async def test_group_delivery_failure_does_not_cancel_dispatched_print(self):
+        job_id = "1" * 32
+        command_id = "2" * 32
+        metadata = {
+            "sender_id": 123,
+            "event_folder": "event",
+            "print_mode": "fit",
+        }
+        with patch.object(app, "TG_CHAT", "-100123456789"), patch(
+            "app.yadisk_poll.store_print_job",
+            AsyncMock(return_value={
+                "artifact_path": "/event/photo.jpg",
+                "info_path": "/event/photo.txt",
+            }),
+        ), patch(
+            "app._send_disk_command",
+            AsyncMock(return_value=command_id),
+        ), patch(
+            "app._send_print_to_group",
+            AsyncMock(return_value=False),
+        ), patch("app.uuid.uuid4") as uuid4:
+            uuid4.return_value.hex = command_id
+            result = await app._submit_print_job(
+                job_id,
+                123,
+                ".jpg",
+                b"image",
+                metadata,
+                123,
+                object(),
+                "https://telegram.test",
+            )
+
+        self.assertEqual(result, command_id)
+
+    async def test_group_print_post_contains_sender_event_and_mode(self):
+        job_id = "3" * 32
+        payload = image_payload((461, 310))
+        metadata = {
+            "sender_id": 123,
+            "sender_name": "Иван <Иванов>",
+            "username": "ivan",
+            "source_filename": "photo.jpg",
+            "event_folder": "2026-12-31 Тест ивент",
+            "print_mode": "fill",
+            "telegram_chat": {"id": 123},
+        }
+        with patch.object(app, "TG_CHAT", "-100123456789"), patch(
+            "app.telegram_helpers.photo_jpeg_preview",
+            return_value=b"preview",
+        ), patch(
+            "app._tg_send_photo",
+            AsyncMock(return_value=700),
+        ) as send_photo:
+            delivered = await app._send_print_to_group(
+                object(),
+                "https://telegram.test",
+                job_id=job_id,
+                payload=payload,
+                metadata=metadata,
+            )
+
+        self.assertTrue(delivered)
+        self.assertEqual(send_photo.await_args.args[2], "-100123456789")
+        self.assertEqual(send_photo.await_args.args[3], b"preview")
+        caption = send_photo.await_args.args[4]
+        self.assertIn("Фото отправлено на печать", caption)
+        self.assertIn("2026-12-31 Тест ивент", caption)
+        self.assertIn("Иван &lt;Иванов&gt; (@ivan)", caption)
+        self.assertIn("увеличить под размер", caption)
+        self.assertEqual(
+            send_photo.await_args.kwargs["filename"],
+            f"print_{job_id}.jpg",
         )
 
     async def test_only_sender_can_choose_and_second_click_does_not_resubmit(self):
@@ -439,11 +576,25 @@ class TelegramPrintChoiceTests(unittest.IsolatedAsyncioTestCase):
         user_chat_id = 111222333
         owner_id = 444555666
         job_id = "5" * 32
+        original_caption = (
+            "Новая печать в «Кафе»\n"
+            f"Job: {job_id}\n"
+            "Выбор: увеличить под размер, края обрежутся\n"
+            "Пользователь: Иван (@ivan)\n"
+            f"Telegram ID: {owner_id}\n"
+            "Файл: telegram_photo.jpg"
+        )
+        caption_entities = [{"type": "bold", "offset": 0, "length": 22}]
         callback = {
             "id": "callback-admin-approve",
             "data": f"print_admin:approve:{job_id}",
             "from": {"id": admin_id},
-            "message": {"message_id": 88, "chat": {"id": admin_id}},
+            "message": {
+                "message_id": 88,
+                "chat": {"id": admin_id},
+                "caption": original_caption,
+                "caption_entities": caption_entities,
+            },
         }
         approval = {
             "outcome": "authorized",
@@ -458,8 +609,17 @@ class TelegramPrintChoiceTests(unittest.IsolatedAsyncioTestCase):
             calls.append(("send_text", args[2], args[3]))
             return True
 
+        async def edit_caption(*args, **kwargs):
+            calls.append(("edit", args[4], kwargs.get("caption_entities")))
+            return True
+
+        submit_started = asyncio.Event()
+        release_submit = asyncio.Event()
+
         async def submit(*_args, **_kwargs):
             calls.append(("submit",))
+            submit_started.set()
+            await release_submit.wait()
             return "e" * 32
 
         telegram = object()
@@ -474,7 +634,7 @@ class TelegramPrintChoiceTests(unittest.IsolatedAsyncioTestCase):
              ), \
              patch("app._tg_answer_callback", AsyncMock(return_value=True)), \
              patch("app._tg_send_text", side_effect=send_text) as send_text_mock, \
-             patch("app._tg_edit_print_caption", AsyncMock(return_value=True)) as edit, \
+             patch("app._tg_edit_print_caption", side_effect=edit_caption) as edit, \
              patch("app._submit_print_job", side_effect=submit):
             print_jobs.save_pending(
                 job_id,
@@ -489,21 +649,115 @@ class TelegramPrintChoiceTests(unittest.IsolatedAsyncioTestCase):
 
             self.assertTrue(await app._tg_handle_print_admin_callback(
                 telegram, "https://telegram.test", callback))
+            background_tasks = tuple(app._print_background_tasks)
+            self.assertEqual(len(background_tasks), 1)
+            await asyncio.wait_for(submit_started.wait(), timeout=1)
+            self.assertFalse(background_tasks[0].done())
+            release_submit.set()
+            await asyncio.wait_for(
+                asyncio.gather(*background_tasks),
+                timeout=1,
+            )
 
         expected_text = (
             "✅ Оплата подтверждена. Ваше фото добавлено в очередь "
             "и скоро будет распечатано."
         )
-        self.assertEqual(calls[0], ("send_text", user_chat_id, expected_text))
-        self.assertEqual(calls[1], ("submit",))
-        send_text_mock.assert_awaited_once()
-        edit.assert_awaited_once_with(
-            telegram,
-            "https://telegram.test",
-            admin_id,
-            88,
-            "✅ Печать разрешена и передана на будку.",
+        self.assertEqual(
+            calls,
+            [
+                (
+                    "edit",
+                    f"{original_caption}\n\n"
+                    "⏳ Печать разрешена. Добавляю фото в очередь…",
+                    caption_entities,
+                ),
+                ("send_text", user_chat_id, expected_text),
+                ("submit",),
+                (
+                    "edit",
+                    f"{original_caption}\n\n"
+                    "✅ Печать разрешена и передана на будку.",
+                    caption_entities,
+                ),
+            ],
         )
+        send_text_mock.assert_awaited_once()
+        self.assertEqual(edit.await_count, 2)
+
+    async def test_admin_rejection_updates_card_before_local_cleanup(self):
+        admin_id = 999
+        user_chat_id = 111222333
+        job_id = "4" * 32
+        original_caption = "Новая печать в «Кафе»\nПользователь: Иван"
+        callback = {
+            "id": "callback-admin-reject",
+            "data": f"print_admin:reject:{job_id}",
+            "from": {"id": admin_id},
+            "message": {
+                "message_id": 89,
+                "chat": {"id": admin_id},
+                "caption": original_caption,
+            },
+        }
+        rejected = {
+            "outcome": "cancelled",
+            "conversation_id": user_chat_id,
+        }
+        cleanup_started = asyncio.Event()
+        release_cleanup = asyncio.Event()
+
+        async def controlled_to_thread(function, *args, **kwargs):
+            if function is print_jobs.delete_pending:
+                cleanup_started.set()
+                await release_cleanup.wait()
+                return None
+            return function(*args, **kwargs)
+
+        telegram = object()
+        with patch.object(app, "TG_ADMIN", str(admin_id)), patch(
+            "app.yadisk_poll.current_event_folder",
+            return_value="Кафе",
+        ), patch.object(
+            app.database,
+            "reject_print_job_by_admin",
+            AsyncMock(return_value=rejected),
+        ), patch(
+            "app._tg_answer_callback",
+            AsyncMock(return_value=True),
+        ) as answer, patch(
+            "app._tg_edit_print_caption",
+            AsyncMock(return_value=True),
+        ) as edit, patch(
+            "app._tg_send_text",
+            AsyncMock(return_value=True),
+        ), patch(
+            "app.asyncio.to_thread",
+            side_effect=controlled_to_thread,
+        ):
+            handler = asyncio.create_task(app._tg_handle_print_admin_callback(
+                telegram,
+                "https://telegram.test",
+                callback,
+            ))
+            await asyncio.wait_for(cleanup_started.wait(), timeout=1)
+            self.assertFalse(handler.done())
+            answer.assert_awaited_once_with(
+                telegram,
+                "https://telegram.test",
+                "callback-admin-reject",
+                "Печать отклонена",
+            )
+            edit.assert_awaited_once_with(
+                telegram,
+                "https://telegram.test",
+                admin_id,
+                89,
+                f"{original_caption}\n\n🚫 Печать отклонена администратором.",
+                caption_entities=None,
+            )
+            release_cleanup.set()
+            self.assertTrue(await asyncio.wait_for(handler, timeout=1))
 
     async def test_cancel_removes_pending_without_submitting(self):
         owner_id = 6634566969
@@ -697,6 +951,39 @@ class TelegramPhotoDeliveryTests(unittest.IsolatedAsyncioTestCase):
             ))
 
         form.add_field.assert_any_call("parse_mode", "HTML")
+
+    async def test_caption_edit_preserves_existing_entities(self):
+        class Response:
+            status = 200
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *_args):
+                return False
+
+        class Telegram:
+            payload = None
+
+            def post(self, *_args, **kwargs):
+                self.payload = kwargs["json"]
+                return Response()
+
+        telegram = Telegram()
+        entities = [{"type": "bold", "offset": 0, "length": 12}]
+        self.assertTrue(await app._tg_edit_print_caption(
+            telegram,
+            "https://telegram.test",
+            123,
+            456,
+            "Исходный текст\n\n✅ Готово",
+            caption_entities=entities,
+        ))
+
+        self.assertEqual(telegram.payload["caption_entities"], entities)
+        self.assertEqual(telegram.payload["reply_markup"], {
+            "inline_keyboard": [],
+        })
 
 
 if __name__ == "__main__":

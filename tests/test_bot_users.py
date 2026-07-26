@@ -6,16 +6,16 @@ import app
 
 class StartParameterTests(unittest.TestCase):
     def test_parses_start_with_and_without_parameter(self):
-        self.assertEqual(app._start_parameter_from_command("/start"), (True, None))
+        self.assertEqual(app._parse_start_command("/start"), (True, None))
         self.assertEqual(
-            app._start_parameter_from_command("/start wedding_A1-b2"),
+            app._parse_start_command("/start wedding_A1-b2"),
             (True, "wedding_A1-b2"),
         )
         self.assertEqual(
-            app._start_parameter_from_command("/start@photobooth_bot cafe_key"),
+            app._parse_start_command("/start@photobooth_bot cafe_key"),
             (True, "cafe_key"),
         )
-        self.assertEqual(app._start_parameter_from_command("hello"), (False, None))
+        self.assertEqual(app._parse_start_command("hello"), (False, None))
 
 
 class TelegramStartTests(unittest.IsolatedAsyncioTestCase):
@@ -47,7 +47,6 @@ class TelegramStartTests(unittest.IsolatedAsyncioTestCase):
             username="guest",
             first_name="Иван",
             last_name="Иванов",
-            profile={},
         )
 
     async def test_ignores_non_start_messages(self):

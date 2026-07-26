@@ -97,6 +97,8 @@ async def edit_print_caption(
     chat_id: str | int,
     message_id: int,
     caption: str,
+    *,
+    caption_entities: list[dict] | None = None,
 ) -> bool:
     payload = {
         "chat_id": chat_id,
@@ -104,6 +106,8 @@ async def edit_print_caption(
         "caption": caption,
         "reply_markup": {"inline_keyboard": []},
     }
+    if caption_entities:
+        payload["caption_entities"] = caption_entities
     async with session.post(
         f"{base}/editMessageCaption",
         json=payload,
