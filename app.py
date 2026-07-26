@@ -1,18 +1,25 @@
 """Photobooth VPS: Yandex.Disk media/control bridge to Telegram."""
 
 import asyncio
+import base64
+import hashlib
+import hmac
+import html
 import io
 import json
 import logging
 import os
 import re
 import time
+import unicodedata
 import uuid
 import zipfile
+from datetime import date
 from pathlib import Path
 from typing import Awaitable, Callable
 
 import aiohttp
+from PIL import Image, ImageOps
 
 import database
 import migrate
@@ -36,12 +43,23 @@ def _load_config() -> dict:
 CONFIG = _load_config()
 TG_TOKEN = os.environ.get("TG_BOT_TOKEN", "")
 TG_CHAT = os.environ.get("TG_CHAT_ID", "")
-TG_ADMIN = os.environ.get("TG_ADMIN_ID", "")
+TG_ADMIN = os.environ.get("TG_ADMIN_ID", "").strip()
 GITHUB_RELEASE_URL = os.environ.get("GITHUB_RELEASE_URL", "")
+EVENT_KEY = os.environ.get("EVENT_KEY", "")
+TECHNICAL_EVENT_NAME = "Кафе"
+EVENT_NAME_RE = re.compile(r"^(\d{4}-\d{2}-\d{2}) (.+)$")
 
-# MVP allowlist for arbitrary Telegram image printing. Admin commands still use
-# TG_ADMIN_ID; these IDs only grant access to the print-by-image flow.
-PRINT_ALLOWED_USER_IDS = frozenset({6634566969, 5683598562})
+# MVP allowlist for printing without guest/admin authorization. The configured
+# Telegram admin is always included; set union avoids duplicating their ID in
+# the small list of additional trusted users.
+_ADDITIONAL_PRINT_ALLOWED_USER_IDS = {6634566969, 5683598562}
+_TG_ADMIN_USER_ID = (
+    int(TG_ADMIN.strip()) if TG_ADMIN.strip().isdigit() else None
+)
+PRINT_ALLOWED_USER_IDS = frozenset(
+    _ADDITIONAL_PRINT_ALLOWED_USER_IDS
+    | ({_TG_ADMIN_USER_ID} if _TG_ADMIN_USER_ID is not None else set())
+)
 MAX_TELEGRAM_PRINT_FILE_SIZE = 20 * 1024 * 1024
 PRINT_MIME_SUFFIXES = {
     "image/jpeg": ".jpg",
@@ -72,17 +90,22 @@ SAFE_PRINT_SUFFIX_RE = re.compile(r"^\.[a-z0-9]{1,10}$")
 _rejected_media_groups: set[str] = set()
 _print_callbacks_in_progress: set[str] = set()
 PRINT_CALLBACK_RE = re.compile(r"^print:(fit|fill|cancel):([a-f0-9]{32})$")
+PRINT_ADMIN_CALLBACK_RE = re.compile(
+    r"^print_admin:(approve|reject):([a-f0-9]{32})$"
+)
 
 TG_COMMANDS = {
     "/run": "run",
     "/status": "status",
+    "/unblock": "unblock",
     "/logs": "send_logs",
     "/get_config": "get_config",
     "/clear_logs": "clear_logs",
     "/restart": "restart",
-    "/link": "link",
     "/update": "update",
 }
+DEFAULT_UNBLOCK_SESSIONS = 1
+MAX_UNBLOCK_SESSIONS = 1000
 CAMERA_SETTING_COMMAND_RE = re.compile(
     r"^/([a-z][a-z0-9_]{0,63})(?:@[a-z0-9_]+)?$",
     re.IGNORECASE,
@@ -122,7 +145,7 @@ async def _tg_send_photo(
     caption: str,
     reply_markup: dict,
     reply_to_message_id: int | None,
-) -> bool:
+) -> int | None:
     form = aiohttp.FormData()
     form.add_field("chat_id", str(chat_id))
     form.add_field("caption", caption)
@@ -149,8 +172,20 @@ async def _tg_send_photo(
     async with session.post(f"{base}/sendPhoto", data=form) as response:
         if response.status != 200:
             log.warning("TG print preview send failed: %s", await response.text())
-            return False
-        return True
+            return None
+        try:
+            body = await response.json()
+        except Exception as exc:
+            log.warning("TG print preview returned invalid JSON: %s", exc)
+            return None
+        result = body.get("result") if isinstance(body, dict) else None
+        message_id = result.get("message_id") if isinstance(result, dict) else None
+        if (not isinstance(body, dict) or not body.get("ok")
+                or not isinstance(message_id, int)
+                or isinstance(message_id, bool)):
+            log.warning("TG print preview response has no valid message_id")
+            return None
+        return message_id
 
 
 async def _tg_edit_print_caption(
@@ -177,6 +212,13 @@ async def _tg_edit_print_caption(
 
 def is_admin(user_id) -> bool:
     return bool(TG_ADMIN and user_id is not None and str(user_id) == TG_ADMIN)
+
+
+def _is_print_allowlisted(user_id) -> bool:
+    try:
+        return int(user_id) in PRINT_ALLOWED_USER_IDS
+    except (TypeError, ValueError):
+        return False
 
 
 async def _tg_show_keyboard(
@@ -328,13 +370,63 @@ async def _do_update(
     )
 
 
+def _normalize_event_name(name: str) -> str:
+    normalized = unicodedata.normalize("NFKC", str(name or ""))
+    return yadisk_poll.validate_event_name(" ".join(normalized.split()))
+
+
+def _event_access_token(event_name: str) -> str:
+    key = EVENT_KEY.strip()
+    if not key:
+        raise RuntimeError("EVENT_KEY не настроен")
+    canonical_name = _normalize_event_name(event_name).casefold()
+    digest = hmac.new(
+        key.encode("utf-8"),
+        canonical_name.encode("utf-8"),
+        hashlib.sha256,
+    ).digest()
+    token = "ev_" + base64.urlsafe_b64encode(digest).decode("ascii").rstrip("=")
+    if len(token) > 64:
+        raise RuntimeError("ключ доступа event превышает лимит Telegram")
+    return token
+
+
 def _event_name_from_command(text: str) -> str | None:
     command, separator, argument = (text or "").strip().partition(" ")
     if command.split("@", 1)[0] != "/event":
         return None
     if not separator or not argument.strip():
-        raise ValueError("Использование: /event Название события")
-    return yadisk_poll.validate_event_name(argument.strip())
+        raise ValueError(
+            "Использование: /event 2026-08-17 Свадьба Ивановых"
+        )
+    name = _normalize_event_name(argument)
+    if name == TECHNICAL_EVENT_NAME:
+        return name
+    matched = EVENT_NAME_RE.fullmatch(name)
+    if not matched or not matched.group(2).strip():
+        raise ValueError(
+            "Название должно начинаться с даты: "
+            "/event 2026-08-17 Свадьба Ивановых"
+        )
+    try:
+        date.fromisoformat(matched.group(1))
+    except ValueError as exc:
+        raise ValueError("В начале названия указана неверная дата") from exc
+    return name
+
+
+def _unblock_sessions_from_command(text: str) -> int | None:
+    parts = (text or "").strip().split()
+    if not parts or parts[0].split("@", 1)[0].lower() != "/unblock":
+        return None
+    if len(parts) == 1:
+        return DEFAULT_UNBLOCK_SESSIONS
+    if len(parts) != 2 or not re.fullmatch(r"[0-9]+", parts[1]):
+        raise ValueError("Использование: /unblock [число от 1 до 1000]")
+    sessions = int(parts[1])
+    if not 1 <= sessions <= MAX_UNBLOCK_SESSIONS:
+        raise ValueError("Количество сессий должно быть от 1 до 1000")
+    return sessions
 
 
 def _camera_setting_from_command(text: str) -> tuple[str, str] | None:
@@ -384,12 +476,65 @@ async def _record_telegram_start(update: dict, message: dict) -> bool:
     return True
 
 
+async def _tg_reply_to_start(
+    telegram: aiohttp.ClientSession,
+    base: str,
+    message: dict,
+) -> None:
+    sender = message.get("from") or {}
+    user_id = sender.get("id")
+    chat_id = (message.get("chat") or {}).get("id", sender.get("id"))
+    try:
+        event_name, event_token, cafe_mode = _current_print_event()
+        has_access = (
+            _is_print_allowlisted(user_id)
+            or cafe_mode
+            or await database.user_has_current_start_parameter(
+                provider="telegram",
+                provider_user_id=user_id,
+                start_parameter=event_token,
+            )
+        )
+    except Exception as exc:
+        log.warning("TG /start access check failed: %s", exc)
+        await _tg_send_text(
+            telegram,
+            base,
+            chat_id,
+            "⚠️ Печать временно недоступна. Попробуйте чуть позже.",
+        )
+        return
+
+    if has_access:
+        text = (
+            "Отправьте фотографию, чтобы напечатать её."
+            if cafe_mode
+            else f'✅ Вы подключены к мероприятию «{event_name}». '
+                 "Теперь можно отправить фотографию."
+        )
+        await _tg_send_text(telegram, base, chat_id, text)
+        return
+    await _tg_send_text(
+        telegram,
+        base,
+        chat_id,
+        "Для печати сначала отсканируйте QR-код текущего мероприятия.",
+    )
+
+
 async def _send_disk_command(
     command: str,
     chat_id: str | int,
     data: dict | str | None = None,
+    *,
+    command_id: str | None = None,
 ) -> str:
-    body = await yadisk_control.send_command(command, data, reply_chat_id=chat_id)
+    body = await yadisk_control.send_command(
+        command,
+        data,
+        reply_chat_id=chat_id,
+        command_id=command_id,
+    )
     return body["command_id"]
 
 
@@ -483,6 +628,162 @@ def _telegram_sender_data(message: dict) -> dict:
     }
 
 
+async def _ensure_telegram_bot_user(sender: dict) -> int:
+    user_id = sender.get("id")
+    if user_id is None:
+        raise ValueError("Telegram не передал ID пользователя")
+    return await database.ensure_bot_user(
+        provider="telegram",
+        provider_user_id=user_id,
+        username=sender.get("username"),
+        first_name=sender.get("first_name"),
+        last_name=sender.get("last_name"),
+        profile={},
+    )
+
+
+def _current_print_event() -> tuple[str, str | None, bool]:
+    event_name = _normalize_event_name(yadisk_poll.current_event_folder())
+    cafe_mode = event_name == TECHNICAL_EVENT_NAME
+    event_token = None if cafe_mode else _event_access_token(event_name)
+    return event_name, event_token, cafe_mode
+
+
+def _telegram_photo_jpeg_preview(payload: bytes) -> bytes:
+    """Convert any supported input image into a Telegram-friendly JPEG."""
+    with Image.open(io.BytesIO(payload)) as source:
+        source.seek(0)
+        oriented = ImageOps.exif_transpose(source)
+        try:
+            if oriented.mode in ("RGBA", "LA") or "transparency" in oriented.info:
+                rgba = oriented.convert("RGBA")
+                image = Image.new("RGB", rgba.size, (255, 255, 255))
+                image.paste(rgba, mask=rgba.getchannel("A"))
+                rgba.close()
+            else:
+                image = oriented.convert("RGB")
+        finally:
+            if oriented is not source:
+                oriented.close()
+    try:
+        image.thumbnail((1600, 1600), Image.Resampling.LANCZOS)
+        output = io.BytesIO()
+        image.save(output, "JPEG", quality=88, optimize=True)
+        return output.getvalue()
+    finally:
+        image.close()
+
+
+def _print_mode_text(mode: str) -> str:
+    if mode == "fit":
+        return "как есть, с белыми полями"
+    if mode == "fill":
+        return "увеличить под размер, края обрежутся"
+    raise ValueError("неизвестный вариант печати")
+
+
+def _admin_print_caption(job_id: str, metadata: dict, mode: str) -> str:
+    sender_name = html.escape(str(metadata.get("sender_name") or "—"))
+    username = str(metadata.get("username") or "").strip().lstrip("@")
+    username_line = f" (@{html.escape(username)})" if username else ""
+    sender_id = html.escape(str(metadata.get("sender_id") or "—"))
+    source_filename = html.escape(
+        str(metadata.get("source_filename") or "telegram_photo.jpg")
+    )
+    return (
+        "<b>Новая печать в «Кафе»</b>\n"
+        f"Job: <code>{html.escape(job_id)}</code>\n"
+        f"Выбор: <b>{html.escape(_print_mode_text(mode))}</b>\n"
+        f"Пользователь: {sender_name}{username_line}\n"
+        f"Telegram ID: <code>{sender_id}</code>\n"
+        f"Файл: {source_filename}"
+    )
+
+
+async def _send_admin_print_request(
+    telegram: aiohttp.ClientSession,
+    base: str,
+    *,
+    job_id: str,
+    payload: bytes,
+    metadata: dict,
+    mode: str,
+) -> int:
+    if not TG_ADMIN:
+        raise RuntimeError("TG_ADMIN_ID не настроен")
+    photo = await asyncio.to_thread(_telegram_photo_jpeg_preview, payload)
+    keyboard = {
+        "inline_keyboard": [[
+            {
+                "text": "✅ РАЗРЕШИТЬ",
+                "callback_data": f"print_admin:approve:{job_id}",
+            },
+            {
+                "text": "❌ ОТКЛОНИТЬ",
+                "callback_data": f"print_admin:reject:{job_id}",
+            },
+        ]],
+    }
+    message_id = await _tg_send_photo(
+        telegram,
+        base,
+        TG_ADMIN,
+        photo,
+        _admin_print_caption(job_id, metadata, mode),
+        keyboard,
+        None,
+    )
+    if message_id is None:
+        raise RuntimeError("не удалось отправить запрос администратору")
+    try:
+        await asyncio.to_thread(
+            print_jobs.update_pending,
+            job_id,
+            admin_chat_id=str(TG_ADMIN),
+            admin_message_id=message_id,
+            pending_status="awaiting_authorization",
+        )
+    except Exception:
+        # The actionable Telegram message was already delivered; local IDs are
+        # only useful for diagnostics and must not invalidate that request.
+        log.exception("Could not save admin print message id job=%s", job_id)
+    return message_id
+
+
+async def _tg_reply_to_plain_user_message(
+    telegram: aiohttp.ClientSession,
+    base: str,
+    message: dict,
+) -> None:
+    sender = message.get("from") or {}
+    user_id = sender.get("id")
+    chat_id = (message.get("chat") or {}).get("id", user_id)
+    try:
+        _event_name, event_token, cafe_mode = _current_print_event()
+        has_access = (
+            cafe_mode
+            or _is_print_allowlisted(user_id)
+            or await database.user_has_current_start_parameter(
+                provider="telegram",
+                provider_user_id=user_id,
+                start_parameter=event_token,
+            )
+        )
+    except Exception as exc:
+        log.warning("Could not resolve access for Telegram user=%s: %s", user_id, exc)
+        await _tg_send_text(
+            telegram, base, chat_id,
+            "⚠️ Печать временно недоступна. Попробуйте чуть позже.",
+        )
+        return
+    text = (
+        "Пришлите одну фотографию отдельным сообщением."
+        if has_access
+        else "Для печати сначала отсканируйте QR-код текущего мероприятия."
+    )
+    await _tg_send_text(telegram, base, chat_id, text)
+
+
 async def _submit_print_job(
     job_id: str,
     user_id: int,
@@ -502,7 +803,48 @@ async def _submit_print_job(
         event_folder=event_folder,
     )
     metadata.update(stored_files)
-    return await _send_disk_command("print_image", chat_id, metadata)
+    command_id = uuid.uuid4().hex
+    dispatch = await database.mark_print_job_dispatching(
+        job_id=job_id,
+        command_id=command_id,
+    )
+    dispatch_outcome = dispatch.get("outcome")
+    if dispatch_outcome == "already_dispatching" or (
+        dispatch_outcome != "dispatching"
+        and dispatch.get("status") == "dispatching"
+    ):
+        raise RuntimeError(
+            "задание уже отправляется или было отправлено"
+        )
+    if dispatch_outcome != "dispatching":
+        raise RuntimeError(
+            "задание не удалось зарезервировать для отправки: "
+            f"{dispatch_outcome or 'неизвестный статус'}"
+        )
+
+    try:
+        published_command_id = await _send_disk_command(
+            "print_image",
+            chat_id,
+            metadata,
+            command_id=command_id,
+        )
+    except Exception as exc:
+        try:
+            await database.mark_print_job_failed(
+                command_id=command_id,
+                last_error=str(exc),
+            )
+        except Exception:
+            log.exception("Could not close unpublished print command=%s", command_id)
+        raise RuntimeError("не удалось отправить команду на будку") from exc
+    if published_command_id != command_id:
+        await database.mark_print_job_failed(
+            command_id=command_id,
+            last_error="Диск вернул неожиданный command_id",
+        )
+        raise RuntimeError("Диск вернул неверный ID команды")
+    return command_id
 
 
 async def _tg_handle_print_message(
@@ -516,12 +858,7 @@ async def _tg_handle_print_message(
     sender = message.get("from") or {}
     user_id = sender.get("id")
     chat_id = (message.get("chat") or {}).get("id", user_id)
-    if user_id not in PRINT_ALLOWED_USER_IDS:
-        await _tg_send_text(
-            telegram, base, chat_id,
-            "❌ Печать изображений для этого аккаунта не разрешена",
-        )
-        return True
+    allowlisted = _is_print_allowlisted(user_id)
 
     media_group_id = message.get("media_group_id")
     if media_group_id:
@@ -535,6 +872,8 @@ async def _tg_handle_print_message(
         return True
 
     job_id = uuid.uuid4().hex
+    database_user_id: int | None = None
+    database_job_created = False
     try:
         file_info = _telegram_print_file(message)
         if file_info is None:
@@ -542,6 +881,42 @@ async def _tg_handle_print_message(
         file_id, suffix, declared_size = file_info
         if declared_size is not None and int(declared_size) > MAX_TELEGRAM_PRINT_FILE_SIZE:
             raise ValueError("файл больше 20 МБ")
+
+        event_name, event_token, cafe_mode = _current_print_event()
+        database_user_id = await _ensure_telegram_bot_user(sender)
+        if not cafe_mode and not allowlisted:
+            has_event_access = await database.user_has_current_start_parameter(
+                provider="telegram",
+                provider_user_id=user_id,
+                start_parameter=event_token,
+            )
+            if not has_event_access:
+                await _tg_send_text(
+                    telegram,
+                    base,
+                    chat_id,
+                    "❌ Для печати сначала отсканируйте "
+                    "QR-код текущего мероприятия.",
+                )
+                return True
+        created = await database.create_print_job(
+            job_id=job_id,
+            user_id=database_user_id,
+            event_name=event_name,
+            conversation_id=chat_id,
+            source_message_id=message.get("message_id"),
+        )
+        if created["outcome"] == "already_open":
+            await _tg_send_text(
+                telegram,
+                base,
+                chat_id,
+                "❌ Сначала завершите или отмените предыдущее задание печати.",
+            )
+            return True
+        if created["outcome"] != "created":
+            raise RuntimeError("не удалось создать задание печати")
+        database_job_created = True
 
         await _tg_send_text(
             telegram,
@@ -559,22 +934,97 @@ async def _tg_handle_print_message(
             "source_height": preview.source_size[1],
             "print_orientation": preview.orientation,
             "print_target_size": list(preview.target_size),
-            "event_folder": yadisk_poll.current_event_folder(),
+            "event_folder": event_name,
         })
 
         if preview.exact_ratio:
             metadata.update({
                 "print_mode": "fit",
                 "print_choice": "automatic_exact_ratio",
+                "print_selected_at": time.time(),
             })
-            await _submit_print_job(
-                job_id, user_id, suffix, payload, metadata, chat_id)
-            await _tg_send_text(
-                telegram,
-                base,
-                chat_id,
-                "⏳ Фото подходит под формат 10×15 и передано на печать",
+            if cafe_mode and not allowlisted:
+                await asyncio.to_thread(
+                    print_jobs.save_pending,
+                    job_id,
+                    suffix,
+                    payload,
+                    metadata,
+                )
+            current_event_name, current_event_token, current_cafe_mode = (
+                _current_print_event()
             )
+            claim = await database.claim_print_job_choice(
+                job_id=job_id,
+                user_id=database_user_id,
+                current_event_name=current_event_name,
+                print_mode="fit",
+                current_event_token=current_event_token,
+                cafe_mode=current_cafe_mode,
+                allowlisted=allowlisted,
+                automatic=True,
+            )
+            if claim["outcome"] == "awaiting_authorization":
+                await asyncio.to_thread(
+                    print_jobs.update_pending,
+                    job_id,
+                    pending_status="awaiting_authorization",
+                )
+                await _send_admin_print_request(
+                    telegram,
+                    base,
+                    job_id=job_id,
+                    payload=payload,
+                    metadata=metadata,
+                    mode="fit",
+                )
+                try:
+                    await _tg_send_text(
+                        telegram,
+                        base,
+                        chat_id,
+                        "✅ Фото подходит под формат 10×15. "
+                        "Оплатите печать администратору; "
+                        "фото ожидает его подтверждения.",
+                    )
+                except Exception:
+                    # The admin already has a durable, actionable request.
+                    log.exception(
+                        "Could not notify user about exact cafe job=%s", job_id)
+                return True
+            if claim["outcome"] != "authorized":
+                await database.cancel_print_job(
+                    job_id=job_id,
+                    user_id=database_user_id,
+                    close_reason=claim["outcome"],
+                )
+                if claim["outcome"] == "cooldown":
+                    retry_seconds = int(claim.get("retry_after_seconds") or 0)
+                    raise ValueError(
+                        "следующую фотографию можно напечатать через "
+                        f"{max(1, (retry_seconds + 59) // 60)} мин."
+                    )
+                if claim["outcome"] == "access_denied":
+                    raise ValueError(
+                        "сначала отсканируйте QR текущего мероприятия"
+                    )
+                raise ValueError("event изменился; отправьте фотографию ещё раз")
+            command_id = await _submit_print_job(
+                job_id, user_id, suffix, payload, metadata, chat_id)
+            try:
+                await _tg_send_text(
+                    telegram,
+                    base,
+                    chat_id,
+                    "⏳ Фото подходит под формат 10×15 и передано на печать",
+                )
+            except Exception:
+                # The durable command is already published. A Telegram failure
+                # must not turn this into a rejection/retry path.
+                log.exception(
+                    "Could not report exact-ratio print submission job=%s",
+                    job_id,
+                )
             log.info(
                 "TG print job sent without choice job=%s user=%s source=%sx%s",
                 job_id, user_id, preview.source_size[0], preview.source_size[1],
@@ -611,7 +1061,7 @@ async def _tg_handle_print_message(
             "1 — <b>как есть</b> — будут белые поля.\n"
             "2 — <b>увеличить под размер</b> — обрежутся затемнённые края."
         )
-        sent = await _tg_send_photo(
+        choice_message_id = await _tg_send_photo(
             telegram,
             base,
             chat_id,
@@ -620,9 +1070,15 @@ async def _tg_handle_print_message(
             keyboard,
             message.get("message_id"),
         )
-        if not sent:
+        if choice_message_id is None:
             await asyncio.to_thread(print_jobs.delete_pending, job_id)
             raise RuntimeError("не удалось показать варианты печати")
+        awaiting = await database.mark_print_job_awaiting_choice(
+            job_id=job_id,
+            choice_message_id=choice_message_id,
+        )
+        if awaiting["outcome"] != "awaiting_choice":
+            raise RuntimeError("задание не перешло к выбору режима")
         log.info(
             "TG print choice requested job=%s user=%s source=%sx%s "
             "orientation=%s overflow=%s",
@@ -632,6 +1088,18 @@ async def _tg_handle_print_message(
         )
     except Exception as exc:
         log.warning("TG print job rejected user=%s job=%s: %s", user_id, job_id, exc)
+        if database_job_created:
+            try:
+                await database.fail_print_job_before_dispatch(
+                    job_id=job_id,
+                    last_error=str(exc),
+                )
+            except Exception:
+                log.exception("Could not close failed print job=%s", job_id)
+        try:
+            await asyncio.to_thread(print_jobs.delete_pending, job_id)
+        except Exception:
+            log.exception("Could not remove failed pending print job=%s", job_id)
         await _tg_send_text(telegram, base, chat_id, f"❌ Фото не принято: {exc}")
     return True
 
@@ -646,15 +1114,11 @@ async def _tg_handle_print_callback(
         return False
     mode, job_id = matched.groups()
     callback_id = callback.get("id")
-    user_id = (callback.get("from") or {}).get("id")
+    sender = callback.get("from") or {}
+    user_id = sender.get("id")
     message = callback.get("message") or {}
     chat_id = (message.get("chat") or {}).get("id", user_id)
 
-    if user_id not in PRINT_ALLOWED_USER_IDS:
-        await _tg_answer_callback(
-            telegram, base, callback_id,
-            "Эта печать недоступна", show_alert=True)
-        return True
     if job_id in _print_callbacks_in_progress:
         await _tg_answer_callback(
             telegram, base, callback_id, "Задание уже обрабатывается")
@@ -662,43 +1126,49 @@ async def _tg_handle_print_callback(
     _print_callbacks_in_progress.add(job_id)
     try:
         try:
-            payload, metadata = await asyncio.to_thread(
-                print_jobs.load_pending, job_id)
-        except Exception:
+            database_user_id = await _ensure_telegram_bot_user(sender)
+        except Exception as exc:
+            log.exception("Could not prepare print callback job=%s", job_id)
             await _tg_answer_callback(
                 telegram,
                 base,
                 callback_id,
-                "Кнопка уже неактивна. Для новой печати пришли фото ещё раз.",
+                f"Печать временно недоступна: {exc}",
                 show_alert=True,
             )
             return True
 
-        if int(metadata.get("sender_id") or 0) != user_id:
-            await _tg_answer_callback(
-                telegram, base, callback_id,
-                "Выбрать может только отправитель фото", show_alert=True)
-            return True
-        status = str(metadata.get("pending_status") or "")
-        if status in ("submitting", "submitted"):
-            await _tg_answer_callback(
-                telegram, base, callback_id,
-                "Фото уже передаётся или передано на печать")
-            return True
-
         if mode == "cancel":
             try:
-                await asyncio.to_thread(print_jobs.delete_pending, job_id)
-            except Exception:
-                log.exception("Could not cancel pending print job=%s", job_id)
+                cancelled = await database.cancel_print_job(
+                    job_id=job_id,
+                    user_id=database_user_id,
+                )
+            except Exception as exc:
+                log.exception("Could not cancel durable print job=%s", job_id)
                 await _tg_answer_callback(
                     telegram,
                     base,
                     callback_id,
-                    "Не удалось отменить печать. Попробуй ещё раз.",
+                    f"Не удалось отменить печать: {exc}",
                     show_alert=True,
                 )
                 return True
+
+            if cancelled["outcome"] == "not_owner":
+                await _tg_answer_callback(
+                    telegram, base, callback_id,
+                    "Отменить может только отправитель фото", show_alert=True)
+                return True
+            if cancelled["outcome"] != "cancelled":
+                await _tg_answer_callback(
+                    telegram, base, callback_id,
+                    "Задание уже неактивно", show_alert=True)
+                return True
+            try:
+                await asyncio.to_thread(print_jobs.delete_pending, job_id)
+            except Exception:
+                log.exception("Could not remove cancelled print files job=%s", job_id)
 
             await _tg_answer_callback(
                 telegram, base, callback_id, "Печать отменена")
@@ -713,14 +1183,172 @@ async def _tg_handle_print_callback(
             log.info("TG print choice cancelled job=%s user=%s", job_id, user_id)
             return True
 
-        selected_text = (
-            "как есть, с белыми полями"
-            if mode == "fit"
-            else "увеличить под размер, края обрежутся"
-        )
+        try:
+            event_name, event_token, cafe_mode = _current_print_event()
+        except Exception as exc:
+            log.exception("Could not resolve current print event job=%s", job_id)
+            await _tg_answer_callback(
+                telegram,
+                base,
+                callback_id,
+                f"Печать временно недоступна: {exc}",
+                show_alert=True,
+            )
+            return True
+
+        selected_text = _print_mode_text(mode)
+        try:
+            claim = await database.claim_print_job_choice(
+                job_id=job_id,
+                user_id=database_user_id,
+                current_event_name=event_name,
+                print_mode=mode,
+                current_event_token=event_token,
+                cafe_mode=cafe_mode,
+                allowlisted=_is_print_allowlisted(user_id),
+            )
+        except Exception as exc:
+            log.exception("Could not claim print choice job=%s mode=%s", job_id, mode)
+            await _tg_answer_callback(
+                telegram, base, callback_id,
+                f"Не удалось сохранить выбор: {exc}", show_alert=True)
+            return True
+
+        outcome = claim["outcome"]
+        if outcome == "not_owner":
+            await _tg_answer_callback(
+                telegram, base, callback_id,
+                "Выбрать может только отправитель фото", show_alert=True)
+            return True
+        if outcome == "not_found":
+            await _tg_answer_callback(
+                telegram, base, callback_id,
+                "Кнопка уже неактивна. Пришлите фото ещё раз.", show_alert=True)
+            return True
+        if outcome == "event_changed":
+            await database.cancel_print_job(
+                job_id=job_id,
+                user_id=database_user_id,
+                close_reason="event_changed",
+            )
+            try:
+                await asyncio.to_thread(print_jobs.delete_pending, job_id)
+            except Exception:
+                log.exception("Could not remove stale-event print files job=%s", job_id)
+            await _tg_answer_callback(
+                telegram, base, callback_id,
+                "Мероприятие уже изменилось. Пришлите фото ещё раз.",
+                show_alert=True,
+            )
+            return True
+        if outcome == "access_denied":
+            await _tg_answer_callback(
+                telegram, base, callback_id,
+                "Сначала отсканируйте QR текущего мероприятия.",
+                show_alert=True,
+            )
+            return True
+        if outcome == "cooldown":
+            retry_seconds = int(claim.get("retry_after_seconds") or 0)
+            retry_minutes = max(1, (retry_seconds + 59) // 60)
+            await _tg_answer_callback(
+                telegram, base, callback_id,
+                f"Следующую фотографию можно напечатать через {retry_minutes} мин.",
+                show_alert=True,
+            )
+            return True
+        if outcome == "already_claimed":
+            status = claim.get("status")
+            text = (
+                "Фото ожидает оплаты или подтверждения."
+                if status == "awaiting_authorization"
+                else "Задание уже обрабатывается или передано на печать."
+            )
+            await _tg_answer_callback(telegram, base, callback_id, text)
+            return True
+        if outcome == "awaiting_authorization":
+            try:
+                payload, metadata = await asyncio.to_thread(
+                    print_jobs.load_pending,
+                    job_id,
+                )
+                metadata = await asyncio.to_thread(
+                    print_jobs.update_pending,
+                    job_id,
+                    print_mode=mode,
+                    print_choice="telegram_button",
+                    print_selected_at=time.time(),
+                    pending_status="awaiting_authorization",
+                )
+                await _send_admin_print_request(
+                    telegram,
+                    base,
+                    job_id=job_id,
+                    payload=payload,
+                    metadata=metadata,
+                    mode=mode,
+                )
+            except Exception as exc:
+                log.exception("Could not request admin print approval job=%s", job_id)
+                try:
+                    await database.fail_print_job_before_dispatch(
+                        job_id=job_id,
+                        last_error=str(exc),
+                    )
+                except Exception:
+                    log.exception("Could not close failed cafe print job=%s", job_id)
+                try:
+                    await asyncio.to_thread(print_jobs.delete_pending, job_id)
+                except Exception:
+                    log.exception("Could not remove failed cafe print job=%s", job_id)
+                await _tg_answer_callback(
+                    telegram, base, callback_id,
+                    "Не удалось отправить запрос администратору.",
+                    show_alert=True,
+                )
+                return True
+            await _tg_answer_callback(
+                telegram, base, callback_id, "Вариант сохранён")
+            if isinstance(message.get("message_id"), int):
+                await _tg_edit_print_caption(
+                    telegram,
+                    base,
+                    chat_id,
+                    message["message_id"],
+                    f"✅ Выбрано: {selected_text}.\n"
+                    "⏳ Оплатите печать администратору; "
+                    "фото ожидает его подтверждения.",
+                )
+            return True
+        if outcome != "authorized":
+            log.error("Unexpected print choice outcome job=%s outcome=%s", job_id, outcome)
+            await _tg_answer_callback(
+                telegram, base, callback_id,
+                "Не удалось обработать выбранный вариант.", show_alert=True)
+            return True
+
         try:
             await _tg_answer_callback(
                 telegram, base, callback_id, "Принято, отправляю на печать")
+        except Exception:
+            log.exception(
+                "Could not acknowledge authorized print callback job=%s", job_id)
+        if isinstance(message.get("message_id"), int):
+            try:
+                await _tg_edit_print_caption(
+                    telegram,
+                    base,
+                    chat_id,
+                    message["message_id"],
+                    f"✅ Выбрано: {selected_text}.\n⏳ Передаём на печать…",
+                )
+            except Exception:
+                log.exception(
+                    "Could not update authorized print caption job=%s", job_id)
+
+        try:
+            payload, metadata = await asyncio.to_thread(
+                print_jobs.load_pending, job_id)
             metadata = await asyncio.to_thread(
                 print_jobs.update_pending,
                 job_id,
@@ -732,39 +1360,40 @@ async def _tg_handle_print_callback(
             suffix = str(metadata["source_suffix"])
             command_id = await _submit_print_job(
                 job_id, user_id, suffix, payload, metadata, chat_id)
-            await asyncio.to_thread(
-                print_jobs.update_pending,
-                job_id,
-                pending_status="submitted",
-                command_id=command_id,
-            )
         except Exception as exc:
             log.exception(
                 "TG print choice submission failed job=%s mode=%s", job_id, mode)
             try:
-                await asyncio.to_thread(
-                    print_jobs.update_pending,
-                    job_id,
-                    pending_status="awaiting_choice",
+                await database.fail_print_job_before_dispatch(
+                    job_id=job_id,
+                    last_error=str(exc),
                 )
             except Exception:
-                log.exception("Could not restore pending print choice job=%s", job_id)
+                log.exception("Could not close failed print job=%s", job_id)
+            try:
+                await asyncio.to_thread(print_jobs.delete_pending, job_id)
+            except Exception:
+                log.exception("Could not remove failed print files job=%s", job_id)
             await _tg_send_text(
                 telegram,
                 base,
                 chat_id,
-                f"❌ Не удалось передать фото на печать: {exc}. Нажми вариант ещё раз.",
+                f"❌ Не удалось передать фото на печать: {exc}. Пришлите фото ещё раз.",
             )
             return True
 
         if isinstance(message.get("message_id"), int):
-            await _tg_edit_print_caption(
-                telegram,
-                base,
-                chat_id,
-                message["message_id"],
-                f"✅ Выбрано: {selected_text}. Фото передано на печать.",
-            )
+            try:
+                await _tg_edit_print_caption(
+                    telegram,
+                    base,
+                    chat_id,
+                    message["message_id"],
+                    f"✅ Выбрано: {selected_text}. Фото передано на печать.",
+                )
+            except Exception:
+                log.exception(
+                    "Could not update submitted print caption job=%s", job_id)
         try:
             await asyncio.to_thread(print_jobs.delete_pending, job_id)
         except Exception:
@@ -772,6 +1401,290 @@ async def _tg_handle_print_callback(
         log.info(
             "TG print choice submitted job=%s user=%s mode=%s command=%s",
             job_id, user_id, mode, command_id,
+        )
+        return True
+    finally:
+        _print_callbacks_in_progress.discard(job_id)
+
+
+def _telegram_message_id(value) -> int | None:
+    try:
+        message_id = int(value)
+    except (TypeError, ValueError):
+        return None
+    return message_id if message_id > 0 else None
+
+
+async def _tg_handle_print_admin_callback(
+    telegram: aiohttp.ClientSession,
+    base: str,
+    callback: dict,
+) -> bool:
+    matched = PRINT_ADMIN_CALLBACK_RE.fullmatch(str(callback.get("data") or ""))
+    if not matched:
+        return False
+    action, job_id = matched.groups()
+    callback_id = callback.get("id")
+    sender = callback.get("from") or {}
+    message = callback.get("message") or {}
+    admin_chat_id = (message.get("chat") or {}).get("id", sender.get("id"))
+    admin_message_id = _telegram_message_id(message.get("message_id"))
+
+    if not is_admin(sender.get("id")):
+        await _tg_answer_callback(
+            telegram,
+            base,
+            callback_id,
+            "Это действие доступно только администратору.",
+            show_alert=True,
+        )
+        return True
+    if job_id in _print_callbacks_in_progress:
+        await _tg_answer_callback(
+            telegram, base, callback_id, "Задание уже обрабатывается")
+        return True
+
+    _print_callbacks_in_progress.add(job_id)
+    try:
+        try:
+            current_event_name, _event_token, cafe_mode = _current_print_event()
+        except Exception as exc:
+            log.exception("Could not resolve event for admin callback job=%s", job_id)
+            await _tg_answer_callback(
+                telegram, base, callback_id,
+                f"Печать временно недоступна: {exc}", show_alert=True)
+            return True
+        if not cafe_mode:
+            await _tg_answer_callback(
+                telegram,
+                base,
+                callback_id,
+                "Режим «Кафе» уже завершён; задание не отправлено.",
+                show_alert=True,
+            )
+            return True
+
+        if action == "reject":
+            try:
+                result = await database.reject_print_job_by_admin(
+                    job_id=job_id,
+                    current_event_name=current_event_name,
+                )
+            except Exception as exc:
+                log.exception("Could not reject cafe print job=%s", job_id)
+                await _tg_answer_callback(
+                    telegram, base, callback_id,
+                    f"Не удалось отклонить: {exc}", show_alert=True)
+                return True
+            if result.get("outcome") != "cancelled":
+                await _tg_answer_callback(
+                    telegram,
+                    base,
+                    callback_id,
+                    "Задание уже неактивно или event изменился.",
+                    show_alert=True,
+                )
+                return True
+            try:
+                await asyncio.to_thread(print_jobs.delete_pending, job_id)
+            except Exception:
+                log.exception("Could not remove rejected pending job=%s", job_id)
+            try:
+                await _tg_answer_callback(
+                    telegram, base, callback_id, "Печать отклонена")
+            except Exception:
+                log.exception("Could not acknowledge rejected print job=%s", job_id)
+            if admin_message_id is not None:
+                try:
+                    await _tg_edit_print_caption(
+                        telegram,
+                        base,
+                        admin_chat_id,
+                        admin_message_id,
+                        "🚫 Печать отклонена администратором.",
+                    )
+                except Exception:
+                    log.exception("Could not edit rejected admin request job=%s", job_id)
+            user_chat_id = result.get("conversation_id")
+            if user_chat_id:
+                try:
+                    await _tg_send_text(
+                        telegram,
+                        base,
+                        user_chat_id,
+                        "❌ Печать фотографии отклонена администратором.",
+                    )
+                except Exception:
+                    log.exception("Could not notify user about rejection job=%s", job_id)
+            user_choice_message_id = _telegram_message_id(
+                result.get("choice_message_id")
+            )
+            if user_chat_id and user_choice_message_id is not None:
+                try:
+                    await _tg_edit_print_caption(
+                        telegram,
+                        base,
+                        user_chat_id,
+                        user_choice_message_id,
+                        "🚫 Печать отклонена администратором.",
+                    )
+                except Exception:
+                    log.exception("Could not edit rejected user choice job=%s", job_id)
+            return True
+
+        try:
+            result = await database.authorize_print_job_by_admin(
+                job_id=job_id,
+                current_event_name=current_event_name,
+            )
+        except Exception as exc:
+            log.exception("Could not authorize cafe print job=%s", job_id)
+            await _tg_answer_callback(
+                telegram, base, callback_id,
+                f"Не удалось разрешить печать: {exc}", show_alert=True)
+            return True
+        if result.get("outcome") != "authorized":
+            await _tg_answer_callback(
+                telegram,
+                base,
+                callback_id,
+                "Задание уже обработано или event изменился.",
+                show_alert=True,
+            )
+            return True
+
+        user_chat_id = result.get("conversation_id")
+        try:
+            await _tg_answer_callback(
+                telegram,
+                base,
+                callback_id,
+                "Печать разрешена, передаю на будку",
+            )
+        except Exception:
+            log.exception("Could not acknowledge approved print job=%s", job_id)
+        if admin_message_id is not None:
+            try:
+                await _tg_edit_print_caption(
+                    telegram,
+                    base,
+                    admin_chat_id,
+                    admin_message_id,
+                    "⏳ Печать разрешена, передаю на будку…",
+                )
+            except Exception:
+                log.exception("Could not edit submitting admin request job=%s", job_id)
+        try:
+            payload, metadata = await asyncio.to_thread(print_jobs.load_pending, job_id)
+            mode = str(result.get("print_mode") or metadata.get("print_mode") or "")
+            metadata = await asyncio.to_thread(
+                print_jobs.update_pending,
+                job_id,
+                pending_status="submitting",
+                print_mode=mode,
+                print_choice=str(metadata.get("print_choice") or "admin_approved"),
+                print_authorized_at=time.time(),
+            )
+            suffix = str(metadata["source_suffix"])
+            external_user_id = int(
+                result.get("provider_user_id")
+                or result.get("user_provider_user_id")
+                or metadata["sender_id"]
+            )
+            command_id = await _submit_print_job(
+                job_id,
+                external_user_id,
+                suffix,
+                payload,
+                metadata,
+                user_chat_id,
+            )
+        except Exception as exc:
+            log.exception("Could not submit admin-approved print job=%s", job_id)
+            try:
+                await database.fail_print_job_before_dispatch(
+                    job_id=job_id,
+                    last_error=str(exc),
+                )
+            except Exception:
+                log.exception("Could not close admin-approved print job=%s", job_id)
+            try:
+                await asyncio.to_thread(print_jobs.delete_pending, job_id)
+            except Exception:
+                log.exception("Could not delete failed admin print job=%s", job_id)
+            try:
+                await _tg_send_text(
+                    telegram,
+                    base,
+                    admin_chat_id,
+                    f"❌ Job {job_id}: команда на будку не отправлена: {exc}",
+                )
+                if admin_message_id is not None:
+                    await _tg_edit_print_caption(
+                        telegram,
+                        base,
+                        admin_chat_id,
+                        admin_message_id,
+                        "❌ Печать была разрешена, но команда на будку не отправлена.",
+                    )
+            except Exception:
+                log.exception("Could not report failed admin dispatch job=%s", job_id)
+            if user_chat_id:
+                try:
+                    await _tg_send_text(
+                        telegram,
+                        base,
+                        user_chat_id,
+                        "❌ Не удалось передать фото на печать. "
+                        "Обратитесь к администратору.",
+                    )
+                except Exception:
+                    log.exception("Could not report failed cafe print job=%s", job_id)
+            return True
+
+        try:
+            await asyncio.to_thread(print_jobs.delete_pending, job_id)
+        except Exception:
+            log.exception("Could not delete submitted cafe print job=%s", job_id)
+        if admin_message_id is not None:
+            try:
+                await _tg_edit_print_caption(
+                    telegram,
+                    base,
+                    admin_chat_id,
+                    admin_message_id,
+                    "✅ Печать разрешена и передана на будку.",
+                )
+            except Exception:
+                log.exception("Could not edit approved admin request job=%s", job_id)
+        if user_chat_id:
+            try:
+                await _tg_send_text(
+                    telegram,
+                    base,
+                    user_chat_id,
+                    "✅ Оплата подтверждена. "
+                    "Фото передано на фотобудку.",
+                )
+            except Exception:
+                log.exception("Could not notify user about approval job=%s", job_id)
+        user_choice_message_id = _telegram_message_id(result.get("choice_message_id"))
+        if user_chat_id and user_choice_message_id is not None:
+            try:
+                await _tg_edit_print_caption(
+                    telegram,
+                    base,
+                    user_chat_id,
+                    user_choice_message_id,
+                    "✅ Печать оплачена и передана на будку.",
+                )
+            except Exception:
+                log.exception("Could not edit approved user choice job=%s", job_id)
+        log.info(
+            "Admin approved cafe print job=%s user=%s command=%s",
+            job_id,
+            result.get("provider_user_id"),
+            command_id,
         )
         return True
     finally:
@@ -793,12 +1706,43 @@ async def _tg_handle_admin_command(
 
     if event_name is not None:
         try:
+            if event_name != TECHNICAL_EVENT_NAME:
+                _event_access_token(event_name)
             await _send_disk_command("set_event", chat_id, {"name": event_name})
             await _tg_send_text(
                 telegram, base, chat_id,
                 f"⏳ Переключаю event на будке и VPS: {event_name}")
         except Exception as exc:
             await _tg_send_text(telegram, base, chat_id, f"❌ Event не отправлен: {exc}")
+        return
+
+    try:
+        unblock_sessions = _unblock_sessions_from_command(text)
+    except ValueError as exc:
+        await _tg_send_text(telegram, base, chat_id, f"❌ {exc}")
+        return
+
+    if unblock_sessions is not None:
+        try:
+            await _send_disk_command(
+                "unblock",
+                chat_id,
+                {"sessions": unblock_sessions},
+            )
+            await _tg_send_text(
+                telegram,
+                base,
+                chat_id,
+                f"⏳ Кафе: открываю {unblock_sessions} сессий; "
+                "ожидаю подтверждение будки",
+            )
+        except Exception as exc:
+            await _tg_send_text(
+                telegram,
+                base,
+                chat_id,
+                f"❌ Разблокировка не отправлена: {exc}",
+            )
         return
 
     try:
@@ -854,16 +1798,6 @@ async def _tg_handle_admin_command(
         await _tg_send_text(telegram, base, chat_id, result)
         return
 
-    if command == "link":
-        try:
-            public_url = await yadisk_poll.publish_current_folder()
-            await _tg_send_text(
-                telegram, base, chat_id,
-                f"Event: {yadisk_poll.current_event_folder()}\n{public_url}")
-        except Exception as exc:
-            await _tg_send_text(telegram, base, chat_id, f"❌ Ссылка не создана: {exc}")
-        return
-
     try:
         await _send_disk_command(command, chat_id)
         message = (
@@ -900,21 +1834,43 @@ async def tg_poll_commands() -> None:
                     next_offset = update["update_id"] + 1
                     message = update.get("message")
                     if message:
-                        await _record_telegram_start(update, message)
-                        user_id = message.get("from", {}).get("id")
-                        print_handled = await _tg_handle_print_message(
-                            telegram, base, message)
-                        if not print_handled and is_admin(user_id):
-                            chat_id = message.get("chat", {}).get("id", user_id)
-                            await _tg_handle_admin_command(
-                                telegram, base, chat_id, message.get("text", ""))
+                        start_handled = await _record_telegram_start(update, message)
+                        if start_handled:
+                            await _tg_reply_to_start(telegram, base, message)
+                        else:
+                            user_id = message.get("from", {}).get("id")
+                            print_handled = await _tg_handle_print_message(
+                                telegram, base, message)
+                            if not print_handled:
+                                if is_admin(user_id):
+                                    chat_id = message.get("chat", {}).get(
+                                        "id", user_id)
+                                    await _tg_handle_admin_command(
+                                        telegram,
+                                        base,
+                                        chat_id,
+                                        message.get("text", ""),
+                                    )
+                                else:
+                                    await _tg_reply_to_plain_user_message(
+                                        telegram, base, message)
                     else:
                         callback = update.get("callback_query")
                         if callback:
                             user_id = callback.get("from", {}).get("id")
                             print_callback_handled = await _tg_handle_print_callback(
                                 telegram, base, callback)
-                            if not print_callback_handled and is_admin(user_id):
+                            admin_print_callback_handled = False
+                            if not print_callback_handled:
+                                admin_print_callback_handled = (
+                                    await _tg_handle_print_admin_callback(
+                                        telegram, base, callback)
+                                )
+                            if (
+                                not print_callback_handled
+                                and not admin_print_callback_handled
+                                and is_admin(user_id)
+                            ):
                                 await _tg_answer_callback(
                                     telegram, base, callback.get("id"))
                                 chat_id = callback.get("message", {}).get(
@@ -1013,10 +1969,48 @@ async def _tg_send_log(chat_id: str | int, payload: bytes) -> bool:
 
 
 async def _handle_control_response(response: dict) -> bool:
+    if response.get("command") == "print_image":
+        try:
+            if response.get("status") == "ok":
+                transition = await database.mark_print_job_queued(
+                    command_id=response["command_id"],
+                )
+                expected_status = "queued"
+            else:
+                transition = await database.mark_print_job_failed(
+                    command_id=response["command_id"],
+                    last_error=str(response.get("message") or "ошибка будки"),
+                )
+                expected_status = "failed"
+        except Exception as exc:
+            # Keep the durable control response on Disk and retry it instead of
+            # losing the queue/cooldown transition in PostgreSQL.
+            log.warning("Control: cannot persist print response: %s", exc)
+            return False
+        transition_outcome = transition.get("outcome")
+        transition_is_expected = (
+            transition_outcome == expected_status
+            or (
+                transition_outcome == "already_finished"
+                and transition.get("status") == expected_status
+            )
+        )
+        if not transition_is_expected:
+            log.warning(
+                "Control: unexpected print response transition command=%s "
+                "outcome=%s status=%s",
+                response.get("command_id"),
+                transition_outcome,
+                transition.get("status"),
+            )
+            return False
+
     chat_id = response.get("reply_chat_id") or TG_ADMIN
     if not chat_id or not TG_TOKEN:
         return False
 
+    event_public_url: str | None = None
+    event_publish_error: str | None = None
     if response["status"] == "ok" and response["command"] == "set_event":
         event_name = response.get("event_folder")
         if not event_name:
@@ -1027,6 +2021,11 @@ async def _handle_control_response(response: dict) -> bool:
         except Exception as exc:
             log.warning(f"Control: cannot activate event on VPS: {exc}")
             return False
+        try:
+            event_public_url = await yadisk_poll.publish_current_folder()
+        except Exception as exc:
+            event_publish_error = str(exc)
+            log.warning("Control: event activated but sharing failed: %s", exc)
 
     artifact_path = response.get("artifact_path")
     if artifact_path:
@@ -1081,12 +2080,29 @@ async def _handle_control_response(response: dict) -> bool:
         return True
 
     prefix = "✅" if response["status"] == "ok" else "❌"
+    response_message = response["message"]
+    if response["status"] == "ok" and response["command"] == "set_event":
+        event_name = str(response.get("event_folder") or "")
+        if event_public_url:
+            response_message += f"\nПубличная папка: {event_public_url}"
+        elif event_publish_error:
+            response_message += (
+                "\n⚠️ Event активирован, но папку не удалось "
+                f"опубликовать: {event_publish_error}"
+            )
+        if event_name and event_name != TECHNICAL_EVENT_NAME:
+            try:
+                event_token = _event_access_token(event_name)
+            except RuntimeError as exc:
+                log.warning("Control: event access token unavailable: %s", exc)
+            else:
+                response_message += f"\nStart-параметр для QR: {event_token}"
     async with aiohttp.ClientSession() as telegram:
         delivered = await _tg_send_text(
             telegram,
             f"https://api.telegram.org/bot{TG_TOKEN}",
             chat_id,
-            f"{prefix} {response['message']}",
+            f"{prefix} {response_message}",
         )
     if not delivered:
         return False
@@ -1097,6 +2113,12 @@ async def main() -> None:
     log.info("Database: applying pending migrations")
     await asyncio.to_thread(migrate.apply_migrations)
     log.info("Database: schema is ready")
+    recovered_jobs = await database.recover_interrupted_print_jobs()
+    if recovered_jobs:
+        log.warning(
+            "Database: closed %d interrupted local print jobs after restart",
+            recovered_jobs,
+        )
 
     yadisk_folder = CONFIG.get("yadisk_folder", "")
     control_folder = CONFIG.get("yadisk_control_folder", "photobooth_system/control")

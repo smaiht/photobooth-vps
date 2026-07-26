@@ -33,7 +33,6 @@ _BACKGROUND = (20, 21, 25)
 _PAPER = (255, 255, 255)
 _TEXT = (246, 247, 250)
 _BADGE_FILL = (10, 11, 14)
-_PRINT_BORDER = (157, 161, 170)
 _FIT_TITLE = "Как есть"
 _FIT_DETAIL = "(будут белые поля)"
 _FILL_TITLE = "Увеличить под размер"
@@ -46,8 +45,6 @@ _LABEL_LINE_GAP = 10
 _LABEL_BOTTOM_MARGIN = 38
 _BADGE_RADIUS = 34
 _BADGE_INSET = 10
-_BADGE_OUTLINE_WIDTH = 4
-_PRINT_BORDER_WIDTH = 4
 
 
 @dataclass(frozen=True)
@@ -108,7 +105,7 @@ def _font(
 
 def _paper_preview_size(target_size: tuple[int, int]) -> tuple[int, int]:
     target_w, target_h = target_size
-    long_side = 800
+    long_side = 960
     if target_w > target_h:
         return long_side, round(long_side * target_h / target_w)
     return round(long_side * target_w / target_h), long_side
@@ -124,19 +121,7 @@ def _contain(image: Image.Image, size: tuple[int, int]) -> Image.Image:
     )
     result.paste(fitted, position)
     fitted.close()
-    _draw_print_border(result, (0, 0, size[0] - 1, size[1] - 1))
     return result
-
-
-def _draw_print_border(
-    image: Image.Image,
-    box: tuple[int, int, int, int],
-) -> None:
-    ImageDraw.Draw(image).rectangle(
-        box,
-        outline=_PRINT_BORDER,
-        width=_PRINT_BORDER_WIDTH,
-    )
 
 
 def _cover_view(
@@ -192,15 +177,6 @@ def _cover_view(
     darkened.paste(printed, (visible_x, visible_y))
     printed.close()
     normal.close()
-    _draw_print_border(
-        darkened,
-        (
-            visible_x,
-            visible_y,
-            visible_x + paper_w - 1,
-            visible_y + paper_h - 1,
-        ),
-    )
     return darkened, axis
 
 
@@ -263,8 +239,6 @@ def _tile(
             badge_center[1] + _BADGE_RADIUS,
         ),
         fill=_BADGE_FILL,
-        outline=_TEXT,
-        width=_BADGE_OUTLINE_WIDTH,
     )
     number_box = badge_font.getbbox(number)
     number_width = number_box[2] - number_box[0]

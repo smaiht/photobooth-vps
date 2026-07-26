@@ -47,7 +47,7 @@ class PrintPreviewTests(unittest.TestCase):
         with Image.open(io.BytesIO(preview.payload)) as collage:
             self.assertGreater(collage.width, collage.height * 0.8)
 
-    def test_tiles_share_print_area_alignment_border_and_bottom_whitespace(self):
+    def test_tiles_share_print_area_without_borders_and_keep_bottom_whitespace(self):
         paper_size = (200, 100)
         fit_source = Image.new("RGB", (100, 100), "royalblue")
         cover_source = Image.new("RGB", (300, 100), "royalblue")
@@ -97,8 +97,8 @@ class PrintPreviewTests(unittest.TestCase):
                 badge_center[0],
                 badge_center[1] - print_jobs._BADGE_RADIUS,
             )
-            self.assertEqual(fit_tile.getpixel(badge_top), print_jobs._TEXT)
-            self.assertEqual(cover_tile.getpixel(badge_top), print_jobs._TEXT)
+            self.assertEqual(fit_tile.getpixel(badge_top), print_jobs._BADGE_FILL)
+            self.assertEqual(cover_tile.getpixel(badge_top), print_jobs._BADGE_FILL)
 
             paper_left = (
                 print_jobs._TILE_PADDING
@@ -111,11 +111,11 @@ class PrintPreviewTests(unittest.TestCase):
             )
             self.assertEqual(
                 fit_tile.getpixel((paper_left, paper_middle_y)),
-                print_jobs._PRINT_BORDER,
+                print_jobs._PAPER,
             )
             self.assertEqual(
                 cover_tile.getpixel((paper_left, paper_middle_y)),
-                print_jobs._PRINT_BORDER,
+                (65, 105, 225),
             )
 
             background = Image.new(
@@ -167,6 +167,50 @@ class PendingPrintTests(unittest.TestCase):
 class TelegramPrintChoiceTests(unittest.IsolatedAsyncioTestCase):
     def setUp(self):
         app._print_callbacks_in_progress.clear()
+        self.event_key_patch = patch.object(app, "EVENT_KEY", "test-event-key")
+        self.event_key_patch.start()
+        self.addCleanup(self.event_key_patch.stop)
+
+        self.ensure_user = AsyncMock(return_value=101)
+        self.create_job = AsyncMock(return_value={
+            "outcome": "created",
+            "job_id": "job-id",
+            "status": "processing",
+        })
+        self.awaiting_choice = AsyncMock(return_value={
+            "outcome": "awaiting_choice",
+            "status": "awaiting_choice",
+        })
+        self.claim_choice = AsyncMock(return_value={
+            "outcome": "authorized",
+            "status": "authorized",
+            "authorization_kind": "allowlist",
+        })
+        self.cancel_job = AsyncMock(return_value={
+            "outcome": "cancelled",
+            "status": "cancelled",
+        })
+        self.fail_job = AsyncMock(return_value={
+            "outcome": "failed",
+            "status": "failed",
+        })
+        self.dispatch_job = AsyncMock(return_value={
+            "outcome": "dispatching",
+            "status": "dispatching",
+        })
+        database_mocks = {
+            "ensure_bot_user": self.ensure_user,
+            "create_print_job": self.create_job,
+            "mark_print_job_awaiting_choice": self.awaiting_choice,
+            "claim_print_job_choice": self.claim_choice,
+            "cancel_print_job": self.cancel_job,
+            "fail_print_job_before_dispatch": self.fail_job,
+            "mark_print_job_dispatching": self.dispatch_job,
+        }
+        for name, mocked in database_mocks.items():
+            started = patch.object(app.database, name, mocked)
+            started.start()
+            self.addCleanup(started.stop)
 
     async def test_mismatched_ratio_stays_local_until_user_selects(self):
         message = {
@@ -179,7 +223,7 @@ class TelegramPrintChoiceTests(unittest.IsolatedAsyncioTestCase):
         with TemporaryDirectory() as tmpdir, \
              patch.object(print_jobs, "PENDING_ROOT", Path(tmpdir)), \
              patch("app._tg_download_file", AsyncMock(return_value=payload)), \
-             patch("app._tg_send_photo", AsyncMock(return_value=True)) as send_photo, \
+             patch("app._tg_send_photo", AsyncMock(return_value=501)) as send_photo, \
              patch("app._tg_send_text", AsyncMock(return_value=True)), \
              patch("app.yadisk_poll.current_event_folder", return_value="event"), \
              patch("app.yadisk_poll.store_print_job", new_callable=AsyncMock) as store, \
@@ -255,6 +299,19 @@ class TelegramPrintChoiceTests(unittest.IsolatedAsyncioTestCase):
             "from": {"id": owner_id},
             "message": {"message_id": 44, "chat": {"id": owner_id}},
         }
+        self.claim_choice.side_effect = [
+            {"outcome": "not_owner"},
+            {
+                "outcome": "authorized",
+                "status": "authorized",
+                "authorization_kind": "allowlist",
+            },
+            {
+                "outcome": "already_claimed",
+                "status": "dispatching",
+                "print_mode": "fill",
+            },
+        ]
         with TemporaryDirectory() as tmpdir, \
              patch.object(print_jobs, "PENDING_ROOT", Path(tmpdir)), \
              patch("app._tg_answer_callback", new_callable=AsyncMock) as answer, \
@@ -342,16 +399,15 @@ class TelegramPrintChoiceTests(unittest.IsolatedAsyncioTestCase):
         load_started = asyncio.Event()
         release_load = asyncio.Event()
 
-        async def controlled_to_thread(function, *args, **kwargs):
-            result = function(*args, **kwargs)
-            if function is print_jobs.load_pending and not load_started.is_set():
-                load_started.set()
-                await release_load.wait()
-            return result
+        async def controlled_cancel(**_kwargs):
+            load_started.set()
+            await release_load.wait()
+            return {"outcome": "cancelled", "status": "cancelled"}
+
+        self.cancel_job.side_effect = controlled_cancel
 
         with TemporaryDirectory() as tmpdir, \
              patch.object(print_jobs, "PENDING_ROOT", Path(tmpdir)), \
-             patch("app.asyncio.to_thread", side_effect=controlled_to_thread), \
              patch("app._tg_answer_callback", new_callable=AsyncMock) as answer, \
              patch("app._tg_edit_print_caption", AsyncMock(return_value=True)), \
              patch("app._submit_print_job", new_callable=AsyncMock) as submit:
@@ -399,7 +455,7 @@ class TelegramPrintChoiceTests(unittest.IsolatedAsyncioTestCase):
         with TemporaryDirectory() as tmpdir, \
              patch.object(print_jobs, "PENDING_ROOT", Path(tmpdir)), \
              patch("app._tg_download_file", AsyncMock(return_value=payload)), \
-             patch("app._tg_send_photo", AsyncMock(return_value=True)) as send_photo, \
+             patch("app._tg_send_photo", AsyncMock(return_value=502)) as send_photo, \
              patch("app._tg_send_text", AsyncMock(return_value=True)) as send_text, \
              patch("app.yadisk_poll.current_event_folder", return_value="event"), \
              patch("app.uuid.uuid4") as uuid4:
@@ -418,7 +474,7 @@ class TelegramPrintChoiceTests(unittest.IsolatedAsyncioTestCase):
             all(call.args[2] == chat_id for call in send_text.await_args_list)
         )
 
-    async def test_forward_origin_does_not_grant_print_permission(self):
+    async def test_forward_origin_does_not_replace_requesting_user(self):
         message = {
             "message_id": 78,
             "from": {"id": 111111111},
@@ -429,13 +485,25 @@ class TelegramPrintChoiceTests(unittest.IsolatedAsyncioTestCase):
                 "sender_user": {"id": 6634566969, "first_name": "Allowed"},
             },
         }
-        with patch("app._tg_download_file", new_callable=AsyncMock) as download, \
-             patch("app._tg_send_text", AsyncMock(return_value=True)) as send_text:
+        payload = image_payload((1000, 1000))
+        with TemporaryDirectory() as tmpdir, \
+             patch.object(print_jobs, "PENDING_ROOT", Path(tmpdir)), \
+             patch("app._tg_download_file", AsyncMock(return_value=payload)), \
+             patch("app._tg_send_photo", AsyncMock(return_value=503)), \
+             patch("app._tg_send_text", AsyncMock(return_value=True)), \
+             patch("app.yadisk_poll.current_event_folder", return_value="event"):
             self.assertTrue(await app._tg_handle_print_message(
                 object(), "https://telegram.test", message))
 
-        download.assert_not_awaited()
-        self.assertEqual(send_text.await_args.args[2], message["chat"]["id"])
+        self.ensure_user.assert_awaited_once()
+        self.assertEqual(
+            self.ensure_user.await_args.kwargs["provider_user_id"],
+            message["from"]["id"],
+        )
+        self.assertNotEqual(
+            self.ensure_user.await_args.kwargs["provider_user_id"],
+            message["forward_origin"]["sender_user"]["id"],
+        )
 
 
 class TelegramPhotoDeliveryTests(unittest.IsolatedAsyncioTestCase):
@@ -449,13 +517,16 @@ class TelegramPhotoDeliveryTests(unittest.IsolatedAsyncioTestCase):
             async def __aexit__(self, *_args):
                 return False
 
+            async def json(self):
+                return {"ok": True, "result": {"message_id": 504}}
+
         class Telegram:
             def post(self, *_args, **_kwargs):
                 return Response()
 
         form = MagicMock()
         with patch("app.aiohttp.FormData", return_value=form):
-            self.assertTrue(await app._tg_send_photo(
+            self.assertEqual(504, await app._tg_send_photo(
                 Telegram(),
                 "https://telegram.test",
                 123,

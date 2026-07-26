@@ -666,7 +666,7 @@ def validate_event_name(folder: str) -> str:
 
 
 async def set_event_folder(folder: str) -> None:
-    """Activate the event folder used by /link and persisted VPS state."""
+    """Activate the event folder used for delivery and persisted VPS state."""
     global _folder
     name = validate_event_name(folder)
     target = "/" + name

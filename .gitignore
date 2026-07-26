@@ -1,5 +1,6 @@
 .env
 __pycache__/
+.ruff_cache/
 nginx.conf
 .DS_Store
 vps_yadisk_state.json

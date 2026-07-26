@@ -149,15 +149,23 @@ async def _upload_bytes(payload: bytes, remote_path: str) -> None:
         raise RuntimeError(f"uploaded control file did not verify: {remote_path}")
 
 
-async def send_command(command: str, data: dict | str | None = None,
-                       reply_chat_id: int | str | None = None) -> dict:
+async def send_command(
+    command: str,
+    data: dict | str | None = None,
+    reply_chat_id: int | str | None = None,
+    *,
+    command_id: str | None = None,
+) -> dict:
     if not isinstance(command, str) or not command or len(command) > 50:
         raise ValueError("invalid command")
     if data is not None and not isinstance(data, (dict, str)):
         raise ValueError("invalid command data")
+    if command_id is None:
+        command_id = uuid.uuid4().hex
+    elif not isinstance(command_id, str) or not COMMAND_ID_RE.fullmatch(command_id):
+        raise ValueError("invalid command_id")
     if not await _connect():
         raise RuntimeError("Yandex.Disk control is unavailable")
-    command_id = uuid.uuid4().hex
     body = {
         "schema_version": SCHEMA_VERSION,
         "message_type": "command",

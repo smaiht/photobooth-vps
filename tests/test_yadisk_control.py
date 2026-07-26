@@ -62,13 +62,34 @@ class EventSwitchTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(yadisk_poll._folder, "/Свадьба Ивановых 2026")
 
-    def test_parses_event_command_with_spaces(self):
+    def test_event_command_requires_iso_date_except_cafe(self):
         self.assertEqual(
-            app._event_name_from_command("/event Свадьба Ивановых 2026"),
-            "Свадьба Ивановых 2026",
+            app._event_name_from_command(
+                "/event   2026-08-17   Свадьба   Ивановых  "
+            ),
+            "2026-08-17 Свадьба Ивановых",
         )
-        with self.assertRaises(ValueError):
-            app._event_name_from_command("/event ../bad")
+        self.assertEqual(app._event_name_from_command("/event Кафе"), "Кафе")
+        for command in (
+            "/event Свадьба Ивановых",
+            "/event 2026-02-31 Свадьба Ивановых",
+            "/event 2026-08-17",
+            "/event ../bad",
+        ):
+            with self.subTest(command=command), self.assertRaises(ValueError):
+                app._event_name_from_command(command)
+
+    def test_event_access_token_is_stable_url_safe_and_fixed_length(self):
+        with patch.object(app, "EVENT_KEY", "test-event-key"):
+            token = app._event_access_token(
+                "  2026-08-17   СВАДЬБА Ивановых  ")
+            self.assertEqual(
+                token,
+                app._event_access_token("2026-08-17 свадьба ивановых"),
+            )
+
+        self.assertEqual(len(token), 46)
+        self.assertRegex(token, r"^ev_[A-Za-z0-9_-]{43}$")
 
 
 class CameraSettingCommandTests(unittest.IsolatedAsyncioTestCase):
