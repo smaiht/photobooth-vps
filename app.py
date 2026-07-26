@@ -19,6 +19,7 @@ from pathlib import Path
 from typing import Awaitable, Callable
 
 import aiohttp
+import qrcode
 from PIL import Image, ImageOps
 
 import database
@@ -42,12 +43,16 @@ def _load_config() -> dict:
 
 CONFIG = _load_config()
 TG_TOKEN = os.environ.get("TG_BOT_TOKEN", "")
+TG_BOT_USERNAME = os.environ.get("TG_BOT_USERNAME", "").strip().lstrip("@")
 TG_CHAT = os.environ.get("TG_CHAT_ID", "")
 TG_ADMIN = os.environ.get("TG_ADMIN_ID", "").strip()
 GITHUB_RELEASE_URL = os.environ.get("GITHUB_RELEASE_URL", "")
 EVENT_KEY = os.environ.get("EVENT_KEY", "")
 TECHNICAL_EVENT_NAME = "Кафе"
 EVENT_NAME_RE = re.compile(r"^(\d{4}-\d{2}-\d{2}) (.+)$")
+PRINT_EVENT_ACCESS_REQUIRED_MESSAGE = (
+    "Для печати сначала отсканируйте QR-код текущего мероприятия."
+)
 
 PRINT_ALLOWED_USER_IDS = (
     TG_ADMIN,
@@ -210,6 +215,28 @@ def is_admin(user_id) -> bool:
 
 def _is_print_allowlisted(user_id) -> bool:
     return user_id is not None and str(user_id) in PRINT_ALLOWED_USER_IDS
+
+
+async def _telegram_user_has_print_access(
+    user_id,
+    *,
+    event_token: str | None,
+    cafe_mode: bool,
+) -> bool:
+    """Check access before accepting work from a Telegram user.
+
+    Choice callbacks repeat this check transactionally because access or the
+    current event can change while the user is looking at the preview.
+    """
+    if cafe_mode or _is_print_allowlisted(user_id):
+        return True
+    if event_token is None:
+        raise RuntimeError("у текущего event отсутствует токен доступа")
+    return await database.user_has_current_start_parameter(
+        provider="telegram",
+        provider_user_id=user_id,
+        start_parameter=event_token,
+    )
 
 
 async def _tg_show_keyboard(
@@ -436,16 +463,23 @@ def _camera_setting_from_command(text: str) -> tuple[str, str] | None:
     return field, parts[1].strip()
 
 
-def _start_parameter_from_command(text: str) -> tuple[bool, str | None]:
-    command, separator, argument = (text or "").strip().partition(" ")
-    if command.split("@", 1)[0].lower() != "/start":
+def _parse_start_command(text: str) -> tuple[bool, str | None]:
+    """Return (is_start, parameter); None is valid for an empty /start."""
+    parts = (text or "").strip().split(maxsplit=1)
+    if not parts or parts[0].split("@", 1)[0].lower() != "/start":
         return False, None
-    parameter = argument.strip() if separator else ""
-    return True, parameter or None
+    parameter = parts[1] if len(parts) == 2 else None
+    return True, parameter
 
 
 async def _record_telegram_start(update: dict, message: dict) -> bool:
-    matched, parameter = _start_parameter_from_command(message.get("text", ""))
+    """Persist a /start update and report whether this message was consumed.
+
+    Every non-empty parameter is stored, even if it is not the current event
+    token. An empty /start is also recorded in history, but database upsert
+    rules keep the user's previous current_start_parameter unchanged.
+    """
+    matched, parameter = _parse_start_command(message.get("text", ""))
     if not matched:
         return False
     sender = message.get("from") or {}
@@ -472,19 +506,16 @@ async def _tg_reply_to_start(
     base: str,
     message: dict,
 ) -> None:
+    """Reply using access to the current event after /start was persisted."""
     sender = message.get("from") or {}
     user_id = sender.get("id")
     chat_id = (message.get("chat") or {}).get("id", sender.get("id"))
     try:
         event_name, event_token, cafe_mode = _current_print_event()
-        has_access = (
-            _is_print_allowlisted(user_id)
-            or cafe_mode
-            or await database.user_has_current_start_parameter(
-                provider="telegram",
-                provider_user_id=user_id,
-                start_parameter=event_token,
-            )
+        has_access = await _telegram_user_has_print_access(
+            user_id,
+            event_token=event_token,
+            cafe_mode=cafe_mode,
         )
     except Exception as exc:
         log.warning("TG /start access check failed: %s", exc)
@@ -509,7 +540,7 @@ async def _tg_reply_to_start(
         telegram,
         base,
         chat_id,
-        "Для печати сначала отсканируйте QR-код текущего мероприятия.",
+        PRINT_EVENT_ACCESS_REQUIRED_MESSAGE,
     )
 
 
@@ -751,14 +782,10 @@ async def _tg_reply_to_plain_user_message(
     chat_id = (message.get("chat") or {}).get("id", user_id)
     try:
         _event_name, event_token, cafe_mode = _current_print_event()
-        has_access = (
-            cafe_mode
-            or _is_print_allowlisted(user_id)
-            or await database.user_has_current_start_parameter(
-                provider="telegram",
-                provider_user_id=user_id,
-                start_parameter=event_token,
-            )
+        has_access = await _telegram_user_has_print_access(
+            user_id,
+            event_token=event_token,
+            cafe_mode=cafe_mode,
         )
     except Exception as exc:
         log.warning("Could not resolve access for Telegram user=%s: %s", user_id, exc)
@@ -770,7 +797,7 @@ async def _tg_reply_to_plain_user_message(
     text = (
         "Пришлите одну фотографию отдельным сообщением."
         if has_access
-        else "Для печати сначала отсканируйте QR-код текущего мероприятия."
+        else PRINT_EVENT_ACCESS_REQUIRED_MESSAGE
     )
     await _tg_send_text(telegram, base, chat_id, text)
 
@@ -875,21 +902,19 @@ async def _tg_handle_print_message(
 
         event_name, event_token, cafe_mode = _current_print_event()
         database_user_id = await _ensure_telegram_bot_user(sender)
-        if not cafe_mode and not allowlisted:
-            has_event_access = await database.user_has_current_start_parameter(
-                provider="telegram",
-                provider_user_id=user_id,
-                start_parameter=event_token,
+        has_event_access = await _telegram_user_has_print_access(
+            user_id,
+            event_token=event_token,
+            cafe_mode=cafe_mode,
+        )
+        if not has_event_access:
+            await _tg_send_text(
+                telegram,
+                base,
+                chat_id,
+                f"❌ {PRINT_EVENT_ACCESS_REQUIRED_MESSAGE}",
             )
-            if not has_event_access:
-                await _tg_send_text(
-                    telegram,
-                    base,
-                    chat_id,
-                    "❌ Для печати сначала отсканируйте "
-                    "QR-код текущего мероприятия.",
-                )
-                return True
+            return True
         created = await database.create_print_job(
             job_id=job_id,
             user_id=database_user_id,
@@ -997,9 +1022,7 @@ async def _tg_handle_print_message(
                         f"{max(1, (retry_seconds + 59) // 60)} мин."
                     )
                 if claim["outcome"] == "access_denied":
-                    raise ValueError(
-                        "сначала отсканируйте QR текущего мероприятия"
-                    )
+                    raise ValueError(PRINT_EVENT_ACCESS_REQUIRED_MESSAGE)
                 raise ValueError("event изменился; отправьте фотографию ещё раз")
             command_id = await _submit_print_job(
                 job_id, user_id, suffix, payload, metadata, chat_id)
@@ -1236,7 +1259,7 @@ async def _tg_handle_print_callback(
         if outcome == "access_denied":
             await _tg_answer_callback(
                 telegram, base, callback_id,
-                "Сначала отсканируйте QR текущего мероприятия.",
+                PRINT_EVENT_ACCESS_REQUIRED_MESSAGE,
                 show_alert=True,
             )
             return True
@@ -1691,7 +1714,7 @@ async def _tg_handle_admin_command(
             await _send_disk_command("set_event", chat_id, {"name": event_name})
             await _tg_send_text(
                 telegram, base, chat_id,
-                f"⏳ Переключаю event на будке и VPS: {event_name}")
+                f"⏳ Переключаю event на будке и VPS: <b>{event_name}</b>")
         except Exception as exc:
             await _tg_send_text(telegram, base, chat_id, f"❌ Event не отправлен: {exc}")
         return
@@ -1790,7 +1813,68 @@ async def _tg_handle_admin_command(
         await _tg_send_text(telegram, base, chat_id, f"❌ Команда не отправлена: {exc}")
 
 
+async def _tg_route_message_update(
+    telegram: aiohttp.ClientSession,
+    base: str,
+    update: dict,
+    message: dict,
+) -> None:
+    """Route one Telegram message in priority order: start, photo, text."""
+    # /start must be stored before access is checked, so a freshly scanned
+    # event QR grants access in this same update.
+    if await _record_telegram_start(update, message):
+        await _tg_reply_to_start(telegram, base, message)
+        return
+
+    # Photos and image documents use the same print flow for admins and users.
+    # Cafe/event authorization stays inside that flow, not in this router.
+    if await _tg_handle_print_message(telegram, base, message):
+        return
+
+    user_id = (message.get("from") or {}).get("id")
+    if is_admin(user_id):
+        chat_id = (message.get("chat") or {}).get("id", user_id)
+        await _tg_handle_admin_command(
+            telegram,
+            base,
+            chat_id,
+            message.get("text", ""),
+        )
+        return
+
+    await _tg_reply_to_plain_user_message(telegram, base, message)
+
+
+async def _tg_route_callback_update(
+    telegram: aiohttp.ClientSession,
+    base: str,
+    callback: dict,
+) -> None:
+    """Route one button press: print choice, cashier decision, admin command."""
+    if await _tg_handle_print_callback(telegram, base, callback):
+        return
+    if await _tg_handle_print_admin_callback(telegram, base, callback):
+        return
+
+    user_id = (callback.get("from") or {}).get("id")
+    if not is_admin(user_id):
+        return
+
+    # Admin command buttons carry the same text as their slash commands.
+    await _tg_answer_callback(telegram, base, callback.get("id"))
+    chat_id = (
+        (callback.get("message") or {}).get("chat") or {}
+    ).get("id", user_id)
+    await _tg_handle_admin_command(
+        telegram,
+        base,
+        chat_id,
+        callback.get("data", ""),
+    )
+
+
 async def tg_poll_commands() -> None:
+    """Long-poll Telegram and sequentially route bot messages and callbacks."""
     if not TG_TOKEN or not TG_ADMIN:
         log.warning("Telegram bot/admin is not configured")
         return
@@ -1814,49 +1898,13 @@ async def tg_poll_commands() -> None:
                     next_offset = update["update_id"] + 1
                     message = update.get("message")
                     if message:
-                        start_handled = await _record_telegram_start(update, message)
-                        if start_handled:
-                            await _tg_reply_to_start(telegram, base, message)
-                        else:
-                            user_id = message.get("from", {}).get("id")
-                            print_handled = await _tg_handle_print_message(
-                                telegram, base, message)
-                            if not print_handled:
-                                if is_admin(user_id):
-                                    chat_id = message.get("chat", {}).get(
-                                        "id", user_id)
-                                    await _tg_handle_admin_command(
-                                        telegram,
-                                        base,
-                                        chat_id,
-                                        message.get("text", ""),
-                                    )
-                                else:
-                                    await _tg_reply_to_plain_user_message(
-                                        telegram, base, message)
+                        await _tg_route_message_update(
+                            telegram, base, update, message)
                     else:
                         callback = update.get("callback_query")
                         if callback:
-                            user_id = callback.get("from", {}).get("id")
-                            print_callback_handled = await _tg_handle_print_callback(
+                            await _tg_route_callback_update(
                                 telegram, base, callback)
-                            admin_print_callback_handled = False
-                            if not print_callback_handled:
-                                admin_print_callback_handled = (
-                                    await _tg_handle_print_admin_callback(
-                                        telegram, base, callback)
-                                )
-                            if (
-                                not print_callback_handled
-                                and not admin_print_callback_handled
-                                and is_admin(user_id)
-                            ):
-                                await _tg_answer_callback(
-                                    telegram, base, callback.get("id"))
-                                chat_id = callback.get("message", {}).get(
-                                    "chat", {}).get("id", user_id)
-                                await _tg_handle_admin_command(
-                                    telegram, base, chat_id, callback.get("data", ""))
                     # Confirm an update only after every durable side effect succeeded.
                     # A DB failure therefore retries /start instead of silently losing it.
                     offset = next_offset
