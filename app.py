@@ -1,9 +1,6 @@
 """Photobooth VPS: Yandex.Disk media/control bridge to Telegram."""
 
 import asyncio
-import base64
-import hashlib
-import hmac
 import html
 import io
 import json
@@ -11,24 +8,21 @@ import logging
 import os
 import re
 import time
-import unicodedata
 import uuid
-import zipfile
-from datetime import date
 from pathlib import Path
-from typing import Awaitable, Callable
 
 import aiohttp
-import qrcode
 from PIL import Image, ImageOps
 
+import admin_commands
 import database
+import event_access
 import migrate
 import print_jobs
 import telegram_api
+import vps_update
 import yadisk_control
 import yadisk_poll
-import yadisk_updates
 from telegram_api import (
     answer_callback as _tg_answer_callback,
     download_file as _tg_download_file,
@@ -54,10 +48,6 @@ def _load_config() -> dict:
 CONFIG = _load_config()
 TG_CHAT = os.environ.get("TG_CHAT_ID", "")
 TG_ADMIN = os.environ.get("TG_ADMIN_ID", "").strip()
-GITHUB_RELEASE_URL = os.environ.get("GITHUB_RELEASE_URL", "")
-EVENT_KEY = os.environ.get("EVENT_KEY", "")
-TECHNICAL_EVENT_NAME = "Кафе"
-EVENT_NAME_RE = re.compile(r"^(\d{4}-\d{2}-\d{2}) (.+)$")
 PRINT_EVENT_ACCESS_REQUIRED_MESSAGE = (
     "Для печати сначала отсканируйте QR-код текущего мероприятия."
 )
@@ -100,32 +90,6 @@ PRINT_ADMIN_CALLBACK_RE = re.compile(
     r"^print_admin:(approve|reject):([a-f0-9]{32})$"
 )
 
-TG_COMMANDS = {
-    "/run": "run",
-    "/status": "status",
-    "/unblock": "unblock",
-    "/logs": "send_logs",
-    "/get_config": "get_config",
-    "/clear_logs": "clear_logs",
-    "/restart": "restart",
-    "/update": "update",
-}
-DEFAULT_UNBLOCK_SESSIONS = 1
-MAX_UNBLOCK_SESSIONS = 1000
-CAMERA_SETTING_COMMAND_RE = re.compile(
-    r"^/([a-z][a-z0-9_]{0,63})(?:@[a-z0-9_]+)?$",
-    re.IGNORECASE,
-)
-RESERVED_TELEGRAM_COMMANDS = set(TG_COMMANDS) | {"/event", "/start"}
-UpdateProgressCallback = Callable[[str], Awaitable[None]]
-TG_COMMAND_KEYBOARD = {
-    "inline_keyboard": [
-        [{"text": text, "callback_data": text}]
-        for text in TG_COMMANDS
-    ],
-}
-
-
 def is_admin(user_id) -> bool:
     return bool(TG_ADMIN and user_id is not None and str(user_id) == TG_ADMIN)
 
@@ -166,228 +130,8 @@ async def _tg_show_keyboard(
         base,
         chat_id,
         "Не понял команду. Выбери действие кнопкой:",
-        reply_markup=TG_COMMAND_KEYBOARD,
+        reply_markup=admin_commands.COMMAND_KEYBOARD,
     )
-
-
-async def _do_update(
-    progress_callback: UpdateProgressCallback | None = None,
-) -> str:
-    if not GITHUB_RELEASE_URL:
-        raise RuntimeError("GITHUB_RELEASE_URL не задан")
-
-    started_at = time.monotonic()
-    log.info("Update: requested, downloading full release from GITHUB_RELEASE_URL")
-    async with aiohttp.ClientSession() as download_session:
-        async with download_session.get(
-            GITHUB_RELEASE_URL, timeout=aiohttp.ClientTimeout(total=300),
-        ) as response:
-            content_length = response.content_length
-            expected_text = (
-                f"{content_length / 1048576:.1f} MiB"
-                if content_length is not None else "unknown size"
-            )
-            log.info(
-                "Update: GitHub responded HTTP %s, content-length=%s",
-                response.status, expected_text,
-            )
-            if response.status != 200:
-                raise RuntimeError(f"GitHub вернул HTTP {response.status}")
-            resolved_release_url = str(response.url)
-
-            download_started = time.monotonic()
-            last_report_at = download_started
-            last_report_bytes = 0
-            next_report_bytes = 10 * 1024 * 1024
-            downloaded = io.BytesIO()
-            async for chunk in response.content.iter_chunked(1024 * 1024):
-                downloaded.write(chunk)
-                total = downloaded.tell()
-                now = time.monotonic()
-                if total >= next_report_bytes or now - last_report_at >= 5:
-                    interval = max(now - last_report_at, 0.001)
-                    elapsed = max(now - download_started, 0.001)
-                    current_speed = (total - last_report_bytes) / interval / 1048576
-                    average_speed = total / elapsed / 1048576
-                    progress = (
-                        f", {total * 100 / content_length:.1f}%"
-                        if content_length else ""
-                    )
-                    log.info(
-                        "Update: GitHub download %.1f MiB%s, "
-                        "speed=%.1f MiB/s, average=%.1f MiB/s",
-                        total / 1048576, progress,
-                        current_speed, average_speed,
-                    )
-                    last_report_at = now
-                    last_report_bytes = total
-                    next_report_bytes = total + 10 * 1024 * 1024
-
-            zip_data = downloaded.getvalue()
-            download_elapsed = max(time.monotonic() - download_started, 0.001)
-            if content_length is not None and len(zip_data) != content_length:
-                raise RuntimeError(
-                    f"GitHub download size mismatch: {len(zip_data)}/{content_length}")
-            log.info(
-                "Update: GitHub download complete, %.1f MiB in %.1fs "
-                "(average %.1f MiB/s)",
-                len(zip_data) / 1048576, download_elapsed,
-                len(zip_data) / download_elapsed / 1048576,
-            )
-
-    validation_started = time.monotonic()
-    log.info("Update: validating downloaded ZIP CRC")
-    try:
-        with zipfile.ZipFile(io.BytesIO(zip_data)) as downloaded_zip:
-            bad_member = downloaded_zip.testzip()
-            if bad_member:
-                raise ValueError(f"ZIP CRC failed: {bad_member}")
-            downloaded_names = downloaded_zip.namelist()
-    except zipfile.BadZipFile as exc:
-        raise RuntimeError("GitHub вернул невалидный ZIP") from exc
-    log.info(
-        "Update: source ZIP valid, %d entries checked in %.1fs",
-        len(downloaded_names), time.monotonic() - validation_started,
-    )
-
-    with zipfile.ZipFile(io.BytesIO(zip_data)) as release_zip:
-        names = [name.replace("\\", "/") for name in release_zip.namelist()]
-        if "app.py" not in names:
-            raise RuntimeError("ZIP не содержит app.py в корне")
-    log.info(
-        "Update: release ZIP structure accepted, entries=%d, size=%.1f MiB",
-        len(names), len(zip_data) / 1048576,
-    )
-
-    updates_folder = CONFIG.get("yadisk_updates_folder", "photobooth_system/updates")
-    log.info(
-        "Update: publishing to Yandex.Disk folder /%s",
-        str(updates_folder).strip("/"),
-    )
-    status = await yadisk_updates.publish_update(
-        zip_data,
-        updates_folder,
-        source_url=resolved_release_url,
-        progress_callback=progress_callback,
-    )
-    artifact = status["artifacts"]["full"]
-    log.info(
-        "Update: finished successfully in %.1fs, sha256=%s, size=%.1f MiB",
-        time.monotonic() - started_at, artifact["sha256"][:16],
-        len(zip_data) / 1048576,
-    )
-    return (
-        "✅ Полное обновление загружено на Диск\n"
-        f"ZIP: {len(zip_data) / 1048576:.1f} MB\n"
-        f"SHA: {artifact['sha256'][:16]}\n"
-        "Для установки отправь /restart"
-    )
-
-
-def _normalize_event_name(name: str) -> str:
-    normalized = unicodedata.normalize("NFKC", str(name or ""))
-    return yadisk_poll.validate_event_name(" ".join(normalized.split()))
-
-
-def _event_access_token(event_name: str) -> str:
-    key = EVENT_KEY.strip()
-    if not key:
-        raise RuntimeError("EVENT_KEY не настроен")
-    canonical_name = _normalize_event_name(event_name).casefold()
-    digest = hmac.new(
-        key.encode("utf-8"),
-        canonical_name.encode("utf-8"),
-        hashlib.sha256,
-    ).digest()
-    # Nine HMAC bytes encode to exactly 12 URL-safe Base64 characters.
-    return base64.urlsafe_b64encode(digest[:9]).decode("ascii")
-
-
-def _event_start_link(event_name: str) -> str:
-    if not telegram_api.BOT_USERNAME:
-        raise RuntimeError("TG_BOT_USERNAME не настроен")
-    return (
-        f"https://t.me/{telegram_api.BOT_USERNAME}"
-        f"?start={_event_access_token(event_name)}"
-    )
-
-
-def _validate_event_access_configuration() -> None:
-    if not EVENT_KEY.strip():
-        raise RuntimeError("EVENT_KEY не настроен")
-    if not telegram_api.BOT_USERNAME:
-        raise RuntimeError("TG_BOT_USERNAME не настроен")
-
-
-def _qr_code_png(payload: str) -> bytes:
-    qr = qrcode.QRCode(
-        error_correction=qrcode.constants.ERROR_CORRECT_M,
-        box_size=12,
-        border=4,
-    )
-    qr.add_data(payload)
-    qr.make(fit=True)
-    image = qr.make_image(fill_color="black", back_color="white").get_image()
-    try:
-        output = io.BytesIO()
-        image.save(output, format="PNG")
-        return output.getvalue()
-    finally:
-        image.close()
-
-
-def _event_name_from_command(text: str) -> str | None:
-    command, separator, argument = (text or "").strip().partition(" ")
-    if command.split("@", 1)[0] != "/event":
-        return None
-    if not separator or not argument.strip():
-        raise ValueError(
-            "Использование: /event 2026-08-17 Свадьба Ивановых"
-        )
-    name = _normalize_event_name(argument)
-    if name == TECHNICAL_EVENT_NAME:
-        return name
-    matched = EVENT_NAME_RE.fullmatch(name)
-    if not matched or not matched.group(2).strip():
-        raise ValueError(
-            "Название должно начинаться с даты: "
-            "/event 2026-08-17 Свадьба Ивановых"
-        )
-    try:
-        date.fromisoformat(matched.group(1))
-    except ValueError as exc:
-        raise ValueError("В начале названия указана неверная дата") from exc
-    return name
-
-
-def _unblock_sessions_from_command(text: str) -> int | None:
-    parts = (text or "").strip().split()
-    if not parts or parts[0].split("@", 1)[0].lower() != "/unblock":
-        return None
-    if len(parts) == 1:
-        return DEFAULT_UNBLOCK_SESSIONS
-    if len(parts) != 2 or not re.fullmatch(r"[0-9]+", parts[1]):
-        raise ValueError("Использование: /unblock [число от 1 до 1000]")
-    sessions = int(parts[1])
-    if not 1 <= sessions <= MAX_UNBLOCK_SESSIONS:
-        raise ValueError("Количество сессий должно быть от 1 до 1000")
-    return sessions
-
-
-def _camera_setting_from_command(text: str) -> tuple[str, str] | None:
-    parts = (text or "").strip().split(maxsplit=1)
-    if not parts:
-        return None
-    matched = CAMERA_SETTING_COMMAND_RE.fullmatch(parts[0])
-    if not matched:
-        return None
-
-    field = matched.group(1).lower()
-    if f"/{field}" in RESERVED_TELEGRAM_COMMANDS:
-        return None
-    if len(parts) != 2 or not parts[1].strip():
-        raise ValueError(f"Использование: /{field} значение")
-    return field, parts[1].strip()
 
 
 def _parse_start_command(text: str) -> tuple[bool, str | None]:
@@ -438,7 +182,7 @@ async def _tg_reply_to_start(
     user_id = sender.get("id")
     chat_id = (message.get("chat") or {}).get("id", sender.get("id"))
     try:
-        event_name, event_token, cafe_mode = _current_print_event()
+        event_name, event_token, cafe_mode = event_access.current_event()
         has_access = await _telegram_user_has_print_access(
             user_id,
             event_token=event_token,
@@ -557,13 +301,6 @@ async def _ensure_telegram_bot_user(sender: dict) -> int:
     )
 
 
-def _current_print_event() -> tuple[str, str | None, bool]:
-    event_name = _normalize_event_name(yadisk_poll.current_event_folder())
-    cafe_mode = event_name == TECHNICAL_EVENT_NAME
-    event_token = None if cafe_mode else _event_access_token(event_name)
-    return event_name, event_token, cafe_mode
-
-
 def _telegram_photo_jpeg_preview(payload: bytes) -> bytes:
     """Convert any supported input image into a Telegram-friendly JPEG."""
     with Image.open(io.BytesIO(payload)) as source:
@@ -674,7 +411,7 @@ async def _tg_reply_to_plain_user_message(
     user_id = sender.get("id")
     chat_id = (message.get("chat") or {}).get("id", user_id)
     try:
-        _event_name, event_token, cafe_mode = _current_print_event()
+        _event_name, event_token, cafe_mode = event_access.current_event()
         has_access = await _telegram_user_has_print_access(
             user_id,
             event_token=event_token,
@@ -796,7 +533,7 @@ async def _tg_handle_print_message(
         ):
             raise ValueError("файл больше 20 МБ")
 
-        event_name, event_token, cafe_mode = _current_print_event()
+        event_name, event_token, cafe_mode = event_access.current_event()
         database_user_id = await _ensure_telegram_bot_user(sender)
         has_event_access = await _telegram_user_has_print_access(
             user_id,
@@ -864,7 +601,7 @@ async def _tg_handle_print_message(
                     metadata,
                 )
             current_event_name, current_event_token, current_cafe_mode = (
-                _current_print_event()
+                event_access.current_event()
             )
             claim = await database.claim_print_job_choice(
                 job_id=job_id,
@@ -1095,7 +832,7 @@ async def _tg_handle_print_callback(
             return True
 
         try:
-            event_name, event_token, cafe_mode = _current_print_event()
+            event_name, event_token, cafe_mode = event_access.current_event()
         except Exception as exc:
             log.exception("Could not resolve current print event job=%s", job_id)
             await _tg_answer_callback(
@@ -1383,7 +1120,9 @@ async def _tg_handle_print_admin_callback(
     _print_callbacks_in_progress.add(job_id)
     try:
         try:
-            current_event_name, _event_token, cafe_mode = _current_print_event()
+            current_event_name, _event_token, cafe_mode = (
+                event_access.current_event()
+            )
         except Exception as exc:
             log.exception("Could not resolve event for admin callback job=%s", job_id)
             await _tg_answer_callback(
@@ -1590,123 +1329,73 @@ async def _tg_handle_print_admin_callback(
         _print_callbacks_in_progress.discard(job_id)
 
 
+async def _tg_run_update_command(
+    telegram: aiohttp.ClientSession,
+    base: str,
+    chat_id: str | int,
+) -> None:
+    await _tg_send_text(telegram, base, chat_id, "⏳ Скачиваю полный релиз...")
+
+    async def report_progress(message: str) -> None:
+        await _tg_send_text(telegram, base, chat_id, message)
+
+    try:
+        updates_folder = CONFIG.get(
+            "yadisk_updates_folder",
+            "photobooth_system/updates",
+        )
+        result = await vps_update.publish_latest_release(
+            updates_folder,
+            report_progress,
+        )
+    except Exception as exc:
+        log.exception("VPS update failed")
+        result = f"❌ Ошибка: {exc}"
+    await _tg_send_text(telegram, base, chat_id, result)
+
+
 async def _tg_handle_admin_command(
     telegram: aiohttp.ClientSession,
     base: str,
     chat_id: str | int,
     text: str,
 ) -> None:
-    text = (text or "").strip()
+    """Parse and execute one command from an already authorized admin."""
     try:
-        event_name = _event_name_from_command(text)
-    except ValueError as exc:
+        parsed = admin_commands.parse(text)
+    except (ValueError, RuntimeError) as exc:
         await _tg_send_text(telegram, base, chat_id, f"❌ {exc}")
         return
 
-    if event_name is not None:
-        try:
-            if event_name != TECHNICAL_EVENT_NAME:
-                _validate_event_access_configuration()
-            await _send_disk_command("set_event", chat_id, {"name": event_name})
-            await _tg_send_text(
-                telegram, base, chat_id,
-                f"⏳ Переключаю event на будке и VPS: <b>{event_name}</b>")
-        except Exception as exc:
-            await _tg_send_text(telegram, base, chat_id, f"❌ Event не отправлен: {exc}")
-        return
-
-    try:
-        unblock_sessions = _unblock_sessions_from_command(text)
-    except ValueError as exc:
-        await _tg_send_text(telegram, base, chat_id, f"❌ {exc}")
-        return
-
-    if unblock_sessions is not None:
-        try:
-            await _send_disk_command(
-                "unblock",
-                chat_id,
-                {"sessions": unblock_sessions},
-            )
-            await _tg_send_text(
-                telegram,
-                base,
-                chat_id,
-                f"⏳ Кафе: задаю остаток разрешённых сессий — {unblock_sessions}; "
-                "ожидаю подтверждение будки",
-            )
-        except Exception as exc:
-            await _tg_send_text(
-                telegram,
-                base,
-                chat_id,
-                f"❌ Разблокировка не отправлена: {exc}",
-            )
-        return
-
-    try:
-        camera_setting = _camera_setting_from_command(text)
-    except ValueError as exc:
-        await _tg_send_text(telegram, base, chat_id, f"❌ {exc}")
-        return
-
-    if camera_setting is not None:
-        field, value = camera_setting
-        try:
-            await _send_disk_command(
-                "set_camera_config",
-                chat_id,
-                {"field": field, "value": value},
-            )
-            await _tg_send_text(
-                telegram,
-                base,
-                chat_id,
-                f"⏳ Камера: {field} → {value}; ожидаю подтверждение будки",
-            )
-        except Exception as exc:
-            await _tg_send_text(
-                telegram,
-                base,
-                chat_id,
-                f"❌ Настройка камеры не отправлена: {exc}",
-            )
-        return
-
-    command_token = text.split(maxsplit=1)[0] if text else ""
-    normalized = (
-        command_token.split("@", 1)[0].lower()
-        if command_token.startswith("/") else command_token
-    )
-    command = TG_COMMANDS.get(normalized)
-    if not command:
+    if parsed is None:
         await _tg_show_keyboard(telegram, base, chat_id)
         return
 
+    command, data = parsed
+
+    # /update runs on the VPS. Every other recognized command goes to the booth
+    # through the existing Yandex.Disk command channel.
     if command == "update":
-        await _tg_send_text(telegram, base, chat_id, "⏳ Скачиваю полный релиз...")
-
-        async def report_update_progress(message: str) -> None:
-            await _tg_send_text(telegram, base, chat_id, message)
-
-        try:
-            result = await _do_update(report_update_progress)
-        except Exception as exc:
-            log.exception("Update %s failed", command)
-            result = f"❌ Ошибка: {exc}"
-        await _tg_send_text(telegram, base, chat_id, result)
+        await _tg_run_update_command(telegram, base, chat_id)
         return
 
     try:
-        await _send_disk_command(command, chat_id)
-        message = (
-            "⏳ Запрашиваю конфиги фотобудки..."
-            if command == "get_config"
-            else f"⏳ {command}: команда отправлена"
-        )
-        await _tg_send_text(telegram, base, chat_id, message)
+        await _send_disk_command(command, chat_id, data)
     except Exception as exc:
-        await _tg_send_text(telegram, base, chat_id, f"❌ Команда не отправлена: {exc}")
+        await _tg_send_text(
+            telegram,
+            base,
+            chat_id,
+            admin_commands.failed_message(command, exc),
+        )
+        return
+
+    await _tg_send_text(
+        telegram,
+        base,
+        chat_id,
+        admin_commands.sent_message(command, data),
+    )
 
 
 async def _tg_route_message_update(
@@ -1949,11 +1638,11 @@ async def _handle_control_response(response: dict) -> bool:
                 "\n⚠️ Event активирован, но папку не удалось "
                 f"опубликовать: {event_publish_error}"
             )
-        if event_name and event_name != TECHNICAL_EVENT_NAME:
+        if event_name and event_name != event_access.TECHNICAL_EVENT_NAME:
             try:
-                start_link = _event_start_link(event_name)
+                start_link = event_access.start_link(event_name)
                 event_qr_png = await asyncio.to_thread(
-                    _qr_code_png,
+                    event_access.qr_code_png,
                     start_link,
                 )
             except Exception as exc:
