@@ -92,6 +92,81 @@ class EventSwitchTests(unittest.IsolatedAsyncioTestCase):
         self.assertRegex(token, r"^ev_[A-Za-z0-9_-]{43}$")
 
 
+class CafeUnblockCommandTests(unittest.IsolatedAsyncioTestCase):
+    def test_parses_default_and_explicit_session_count(self):
+        self.assertEqual(app._unblock_sessions_from_command("/unblock"), 1)
+        self.assertEqual(app._unblock_sessions_from_command("/unblock 25"), 25)
+        self.assertEqual(
+            app._unblock_sessions_from_command("/unblock@photobooth_bot 1000"),
+            1000,
+        )
+        self.assertIsNone(app._unblock_sessions_from_command("/status"))
+
+    def test_rejects_invalid_session_count(self):
+        for command in (
+            "/unblock 0",
+            "/unblock 1001",
+            "/unblock -1",
+            "/unblock 1.5",
+            "/unblock many",
+            "/unblock 2 extra",
+        ):
+            with self.subTest(command=command), self.assertRaises(ValueError):
+                app._unblock_sessions_from_command(command)
+
+    def test_is_registered_as_fixed_command_and_keyboard_button(self):
+        self.assertEqual(app.TG_COMMANDS["/unblock"], "unblock")
+        callbacks = [
+            button["callback_data"]
+            for row in app.TG_COMMAND_KEYBOARD["inline_keyboard"]
+            for button in row
+        ]
+        self.assertIn("/unblock", callbacks)
+        self.assertIsNone(app._camera_setting_from_command("/unblock 2"))
+
+    async def test_forwards_session_count_to_booth(self):
+        with patch(
+            "app._send_disk_command",
+            AsyncMock(return_value="a" * 32),
+        ) as send, patch(
+            "app._tg_send_text",
+            AsyncMock(return_value=True),
+        ) as send_text:
+            await app._tg_handle_admin_command(
+                object(), "https://telegram.test", 123, "/unblock 7")
+
+        send.assert_awaited_once_with("unblock", 123, {"sessions": 7})
+        self.assertIn("7", send_text.await_args.args[3])
+        self.assertIn("подтверждение будки", send_text.await_args.args[3])
+
+    async def test_without_count_forwards_one_session(self):
+        with patch(
+            "app._send_disk_command",
+            AsyncMock(return_value="a" * 32),
+        ) as send, patch(
+            "app._tg_send_text",
+            AsyncMock(return_value=True),
+        ):
+            await app._tg_handle_admin_command(
+                object(), "https://telegram.test", 123, "/unblock")
+
+        send.assert_awaited_once_with("unblock", 123, {"sessions": 1})
+
+    async def test_invalid_count_is_reported_without_disk_command(self):
+        with patch(
+            "app._send_disk_command",
+            new_callable=AsyncMock,
+        ) as send, patch(
+            "app._tg_send_text",
+            AsyncMock(return_value=True),
+        ) as send_text:
+            await app._tg_handle_admin_command(
+                object(), "https://telegram.test", 123, "/unblock 1001")
+
+        send.assert_not_awaited()
+        self.assertIn("от 1 до 1000", send_text.await_args.args[3])
+
+
 class CameraSettingCommandTests(unittest.IsolatedAsyncioTestCase):
     def test_parses_dynamic_camera_setting(self):
         self.assertEqual(

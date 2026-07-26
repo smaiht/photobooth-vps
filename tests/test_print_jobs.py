@@ -47,7 +47,7 @@ class PrintPreviewTests(unittest.TestCase):
         with Image.open(io.BytesIO(preview.payload)) as collage:
             self.assertGreater(collage.width, collage.height * 0.8)
 
-    def test_tiles_share_print_area_without_borders_and_keep_bottom_whitespace(self):
+    def test_tiles_have_white_paper_and_badge_outlines_at_the_bottom(self):
         paper_size = (200, 100)
         fit_source = Image.new("RGB", (100, 100), "royalblue")
         cover_source = Image.new("RGB", (300, 100), "royalblue")
@@ -90,15 +90,31 @@ class PrintPreviewTests(unittest.TestCase):
                 + print_jobs._BADGE_INSET,
                 print_jobs._TILE_PADDING
                 + (visual_area_size[1] - paper_size[1]) // 2
-                + print_jobs._BADGE_RADIUS
-                + print_jobs._BADGE_INSET,
+                + paper_size[1]
+                - print_jobs._BADGE_RADIUS
+                - print_jobs._BADGE_INSET,
             )
             badge_top = (
                 badge_center[0],
                 badge_center[1] - print_jobs._BADGE_RADIUS,
             )
-            self.assertEqual(fit_tile.getpixel(badge_top), print_jobs._BADGE_FILL)
-            self.assertEqual(cover_tile.getpixel(badge_top), print_jobs._BADGE_FILL)
+            self.assertEqual(fit_tile.getpixel(badge_top), print_jobs._PAPER)
+            self.assertEqual(cover_tile.getpixel(badge_top), print_jobs._PAPER)
+            badge_inside = (
+                badge_center[0],
+                badge_center[1]
+                - print_jobs._BADGE_RADIUS
+                + print_jobs._BADGE_OUTLINE_WIDTH
+                + 2,
+            )
+            self.assertEqual(
+                fit_tile.getpixel(badge_inside),
+                print_jobs._BADGE_FILL,
+            )
+            self.assertEqual(
+                cover_tile.getpixel(badge_inside),
+                print_jobs._BADGE_FILL,
+            )
 
             paper_left = (
                 print_jobs._TILE_PADDING
@@ -115,6 +131,11 @@ class PrintPreviewTests(unittest.TestCase):
             )
             self.assertEqual(
                 cover_tile.getpixel((paper_left, paper_middle_y)),
+                print_jobs._PAPER,
+            )
+            frame_inside_x = paper_left + print_jobs._PAPER_OUTLINE_WIDTH + 1
+            self.assertEqual(
+                cover_tile.getpixel((frame_inside_x, paper_middle_y)),
                 (65, 105, 225),
             )
 
@@ -314,6 +335,7 @@ class TelegramPrintChoiceTests(unittest.IsolatedAsyncioTestCase):
         ]
         with TemporaryDirectory() as tmpdir, \
              patch.object(print_jobs, "PENDING_ROOT", Path(tmpdir)), \
+             patch("app.yadisk_poll.current_event_folder", return_value="event"), \
              patch("app._tg_answer_callback", new_callable=AsyncMock) as answer, \
              patch("app._tg_edit_print_caption", AsyncMock(return_value=True)), \
              patch("app._tg_send_text", AsyncMock(return_value=True)), \
@@ -344,6 +366,130 @@ class TelegramPrintChoiceTests(unittest.IsolatedAsyncioTestCase):
             self.assertTrue(await app._tg_handle_print_callback(
                 object(), "https://telegram.test", callback))
             submit.assert_awaited_once()
+
+    async def test_cafe_choice_notifies_user_before_sending_photo_to_admin(self):
+        owner_id = 111222333
+        job_id = "6" * 32
+        callback = {
+            "id": "callback-cafe-fill",
+            "data": f"print:fill:{job_id}",
+            "from": {"id": owner_id},
+            "message": {"message_id": 47, "chat": {"id": owner_id}},
+        }
+        self.claim_choice.return_value = {
+            "outcome": "awaiting_authorization",
+            "status": "awaiting_authorization",
+            "print_mode": "fill",
+        }
+        calls = []
+
+        async def answer(*_args, **_kwargs):
+            calls.append("answer_user")
+            return True
+
+        async def edit(*_args, **_kwargs):
+            calls.append("edit_user")
+            return True
+
+        async def send_admin(*_args, **_kwargs):
+            calls.append("send_admin")
+            return 501
+
+        with TemporaryDirectory() as tmpdir, \
+             patch.object(print_jobs, "PENDING_ROOT", Path(tmpdir)), \
+             patch("app.yadisk_poll.current_event_folder", return_value="Кафе"), \
+             patch("app._tg_answer_callback", side_effect=answer) as answer_mock, \
+             patch("app._tg_edit_print_caption", side_effect=edit) as edit_mock, \
+             patch("app._send_admin_print_request", side_effect=send_admin):
+            print_jobs.save_pending(
+                job_id,
+                ".jpg",
+                image_payload((1000, 1000)),
+                {"sender_id": owner_id, "event_folder": "Кафе"},
+            )
+
+            self.assertTrue(await app._tg_handle_print_callback(
+                object(), "https://telegram.test", callback))
+
+        self.assertEqual(calls, ["answer_user", "edit_user", "send_admin"])
+        self.assertEqual(answer_mock.await_args.args[3], "Вариант сохранён")
+        self.assertEqual(
+            edit_mock.await_args.args[4],
+            "✅ Выбрано: увеличить под размер, края обрежутся.\n"
+            "⏳ Оплатите печать администратору; "
+            "фото ожидает его подтверждения.",
+        )
+
+    async def test_admin_approval_notifies_user_once_before_dispatch(self):
+        admin_id = 999
+        user_chat_id = 111222333
+        owner_id = 444555666
+        job_id = "5" * 32
+        callback = {
+            "id": "callback-admin-approve",
+            "data": f"print_admin:approve:{job_id}",
+            "from": {"id": admin_id},
+            "message": {"message_id": 88, "chat": {"id": admin_id}},
+        }
+        approval = {
+            "outcome": "authorized",
+            "conversation_id": user_chat_id,
+            "choice_message_id": 47,
+            "print_mode": "fill",
+            "provider_user_id": owner_id,
+        }
+        calls = []
+
+        async def send_text(*args, **_kwargs):
+            calls.append(("send_text", args[2], args[3]))
+            return True
+
+        async def submit(*_args, **_kwargs):
+            calls.append(("submit",))
+            return "e" * 32
+
+        telegram = object()
+        with TemporaryDirectory() as tmpdir, \
+             patch.object(print_jobs, "PENDING_ROOT", Path(tmpdir)), \
+             patch.object(app, "TG_ADMIN", str(admin_id)), \
+             patch("app.yadisk_poll.current_event_folder", return_value="Кафе"), \
+             patch.object(
+                 app.database,
+                 "authorize_print_job_by_admin",
+                 AsyncMock(return_value=approval),
+             ), \
+             patch("app._tg_answer_callback", AsyncMock(return_value=True)), \
+             patch("app._tg_send_text", side_effect=send_text) as send_text_mock, \
+             patch("app._tg_edit_print_caption", AsyncMock(return_value=True)) as edit, \
+             patch("app._submit_print_job", side_effect=submit):
+            print_jobs.save_pending(
+                job_id,
+                ".jpg",
+                image_payload((1000, 1000)),
+                {
+                    "sender_id": owner_id,
+                    "event_folder": "Кафе",
+                    "print_mode": "fill",
+                },
+            )
+
+            self.assertTrue(await app._tg_handle_print_admin_callback(
+                telegram, "https://telegram.test", callback))
+
+        expected_text = (
+            "✅ Оплата подтверждена. Ваше фото добавлено в очередь "
+            "и скоро будет распечатано."
+        )
+        self.assertEqual(calls[0], ("send_text", user_chat_id, expected_text))
+        self.assertEqual(calls[1], ("submit",))
+        send_text_mock.assert_awaited_once()
+        edit.assert_awaited_once_with(
+            telegram,
+            "https://telegram.test",
+            admin_id,
+            88,
+            "✅ Печать разрешена и передана на будку.",
+        )
 
     async def test_cancel_removes_pending_without_submitting(self):
         owner_id = 6634566969

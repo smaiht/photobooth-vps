@@ -45,6 +45,8 @@ _LABEL_LINE_GAP = 10
 _LABEL_BOTTOM_MARGIN = 38
 _BADGE_RADIUS = 34
 _BADGE_INSET = 10
+_PAPER_OUTLINE_WIDTH = 5
+_BADGE_OUTLINE_WIDTH = 4
 
 
 @dataclass(frozen=True)
@@ -227,9 +229,21 @@ def _tile(
         (area_width - paper_width) // 2,
         (area_height - paper_height) // 2,
     )
+    paper_box = (
+        _TILE_PADDING + paper_position[0],
+        _TILE_PADDING + paper_position[1],
+        _TILE_PADDING + paper_position[0] + paper_width - 1,
+        _TILE_PADDING + paper_position[1] + paper_height - 1,
+    )
+    draw.rectangle(
+        paper_box,
+        outline=_PAPER,
+        width=_PAPER_OUTLINE_WIDTH,
+    )
     badge_center = (
         _TILE_PADDING + paper_position[0] + _BADGE_RADIUS + _BADGE_INSET,
-        _TILE_PADDING + paper_position[1] + _BADGE_RADIUS + _BADGE_INSET,
+        _TILE_PADDING + paper_position[1] + paper_height
+        - _BADGE_RADIUS - _BADGE_INSET,
     )
     draw.ellipse(
         (
@@ -239,6 +253,8 @@ def _tile(
             badge_center[1] + _BADGE_RADIUS,
         ),
         fill=_BADGE_FILL,
+        outline=_PAPER,
+        width=_BADGE_OUTLINE_WIDTH,
     )
     number_box = badge_font.getbbox(number)
     number_width = number_box[2] - number_box[0]

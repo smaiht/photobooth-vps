@@ -970,14 +970,6 @@ async def _tg_handle_print_message(
                     job_id,
                     pending_status="awaiting_authorization",
                 )
-                await _send_admin_print_request(
-                    telegram,
-                    base,
-                    job_id=job_id,
-                    payload=payload,
-                    metadata=metadata,
-                    mode="fit",
-                )
                 try:
                     await _tg_send_text(
                         telegram,
@@ -988,9 +980,18 @@ async def _tg_handle_print_message(
                         "фото ожидает его подтверждения.",
                     )
                 except Exception:
-                    # The admin already has a durable, actionable request.
+                    # The durable job remains ready for the cashier even if
+                    # Telegram cannot deliver this informational message.
                     log.exception(
                         "Could not notify user about exact cafe job=%s", job_id)
+                await _send_admin_print_request(
+                    telegram,
+                    base,
+                    job_id=job_id,
+                    payload=payload,
+                    metadata=metadata,
+                    mode="fit",
+                )
                 return True
             if claim["outcome"] != "authorized":
                 await database.cancel_print_job(
@@ -1268,6 +1269,26 @@ async def _tg_handle_print_callback(
             return True
         if outcome == "awaiting_authorization":
             try:
+                await _tg_answer_callback(
+                    telegram, base, callback_id, "Вариант сохранён")
+            except Exception:
+                log.exception(
+                    "Could not acknowledge cafe print choice job=%s", job_id)
+            if isinstance(message.get("message_id"), int):
+                try:
+                    await _tg_edit_print_caption(
+                        telegram,
+                        base,
+                        chat_id,
+                        message["message_id"],
+                        f"✅ Выбрано: {selected_text}.\n\n"
+                        "⏳ <b>Оплатите печать администратору;</b> "
+                        "фото ожидает его подтверждения.",
+                    )
+                except Exception:
+                    log.exception(
+                        "Could not update cafe print choice job=%s", job_id)
+            try:
                 payload, metadata = await asyncio.to_thread(
                     print_jobs.load_pending,
                     job_id,
@@ -1301,24 +1322,20 @@ async def _tg_handle_print_callback(
                     await asyncio.to_thread(print_jobs.delete_pending, job_id)
                 except Exception:
                     log.exception("Could not remove failed cafe print job=%s", job_id)
-                await _tg_answer_callback(
-                    telegram, base, callback_id,
-                    "Не удалось отправить запрос администратору.",
-                    show_alert=True,
-                )
+                try:
+                    await _tg_send_text(
+                        telegram,
+                        base,
+                        chat_id,
+                        "❌ Не удалось отправить запрос администратору. "
+                        "Пришлите фото ещё раз.",
+                    )
+                except Exception:
+                    log.exception(
+                        "Could not report failed cafe approval request job=%s",
+                        job_id,
+                    )
                 return True
-            await _tg_answer_callback(
-                telegram, base, callback_id, "Вариант сохранён")
-            if isinstance(message.get("message_id"), int):
-                await _tg_edit_print_caption(
-                    telegram,
-                    base,
-                    chat_id,
-                    message["message_id"],
-                    f"✅ Выбрано: {selected_text}.\n"
-                    "⏳ Оплатите печать администратору; "
-                    "фото ожидает его подтверждения.",
-                )
             return True
         if outcome != "authorized":
             log.error("Unexpected print choice outcome job=%s outcome=%s", job_id, outcome)
@@ -1516,20 +1533,6 @@ async def _tg_handle_print_admin_callback(
                     )
                 except Exception:
                     log.exception("Could not notify user about rejection job=%s", job_id)
-            user_choice_message_id = _telegram_message_id(
-                result.get("choice_message_id")
-            )
-            if user_chat_id and user_choice_message_id is not None:
-                try:
-                    await _tg_edit_print_caption(
-                        telegram,
-                        base,
-                        user_chat_id,
-                        user_choice_message_id,
-                        "🚫 Печать отклонена администратором.",
-                    )
-                except Exception:
-                    log.exception("Could not edit rejected user choice job=%s", job_id)
             return True
 
         try:
@@ -1563,17 +1566,17 @@ async def _tg_handle_print_admin_callback(
             )
         except Exception:
             log.exception("Could not acknowledge approved print job=%s", job_id)
-        if admin_message_id is not None:
+        if user_chat_id:
             try:
-                await _tg_edit_print_caption(
+                await _tg_send_text(
                     telegram,
                     base,
-                    admin_chat_id,
-                    admin_message_id,
-                    "⏳ Печать разрешена, передаю на будку…",
+                    user_chat_id,
+                    "✅ Оплата подтверждена. Ваше фото добавлено в очередь "
+                    "и скоро будет распечатано.",
                 )
             except Exception:
-                log.exception("Could not edit submitting admin request job=%s", job_id)
+                log.exception("Could not notify user about approval job=%s", job_id)
         try:
             payload, metadata = await asyncio.to_thread(print_jobs.load_pending, job_id)
             mode = str(result.get("print_mode") or metadata.get("print_mode") or "")
@@ -1657,29 +1660,6 @@ async def _tg_handle_print_admin_callback(
                 )
             except Exception:
                 log.exception("Could not edit approved admin request job=%s", job_id)
-        if user_chat_id:
-            try:
-                await _tg_send_text(
-                    telegram,
-                    base,
-                    user_chat_id,
-                    "✅ Оплата подтверждена. "
-                    "Фото передано на фотобудку.",
-                )
-            except Exception:
-                log.exception("Could not notify user about approval job=%s", job_id)
-        user_choice_message_id = _telegram_message_id(result.get("choice_message_id"))
-        if user_chat_id and user_choice_message_id is not None:
-            try:
-                await _tg_edit_print_caption(
-                    telegram,
-                    base,
-                    user_chat_id,
-                    user_choice_message_id,
-                    "✅ Печать оплачена и передана на будку.",
-                )
-            except Exception:
-                log.exception("Could not edit approved user choice job=%s", job_id)
         log.info(
             "Admin approved cafe print job=%s user=%s command=%s",
             job_id,
@@ -1733,7 +1713,7 @@ async def _tg_handle_admin_command(
                 telegram,
                 base,
                 chat_id,
-                f"⏳ Кафе: открываю {unblock_sessions} сессий; "
+                f"⏳ Кафе: задаю остаток разрешённых сессий — {unblock_sessions}; "
                 "ожидаю подтверждение будки",
             )
         except Exception as exc:
