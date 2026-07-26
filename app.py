@@ -24,10 +24,20 @@ from PIL import Image, ImageOps
 
 import database
 import migrate
+import print_jobs
+import telegram_api
 import yadisk_control
 import yadisk_poll
 import yadisk_updates
-import print_jobs
+from telegram_api import (
+    answer_callback as _tg_answer_callback,
+    download_file as _tg_download_file,
+    edit_print_caption as _tg_edit_print_caption,
+    send_document as _tg_send_document,
+    send_documents as _tg_send_documents,
+    send_photo as _tg_send_photo,
+    send_text as _tg_send_text,
+)
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger(__name__)
@@ -42,8 +52,6 @@ def _load_config() -> dict:
 
 
 CONFIG = _load_config()
-TG_TOKEN = os.environ.get("TG_BOT_TOKEN", "")
-TG_BOT_USERNAME = os.environ.get("TG_BOT_USERNAME", "").strip().lstrip("@")
 TG_CHAT = os.environ.get("TG_CHAT_ID", "")
 TG_ADMIN = os.environ.get("TG_ADMIN_ID", "").strip()
 GITHUB_RELEASE_URL = os.environ.get("GITHUB_RELEASE_URL", "")
@@ -59,7 +67,6 @@ PRINT_ALLOWED_USER_IDS = (
     "6634566969",
     "5683598562",
 )
-MAX_TELEGRAM_PRINT_FILE_SIZE = 20 * 1024 * 1024
 PRINT_MIME_SUFFIXES = {
     "image/jpeg": ".jpg",
     "image/png": ".png",
@@ -119,102 +126,6 @@ TG_COMMAND_KEYBOARD = {
 }
 
 
-async def _tg_send_text(
-    session: aiohttp.ClientSession,
-    base: str,
-    chat_id: str | int,
-    text: str,
-    reply_markup: dict | None = None,
-) -> bool:
-    payload = {"chat_id": chat_id, "text": text}
-    if reply_markup:
-        payload["reply_markup"] = reply_markup
-    async with session.post(f"{base}/sendMessage", json=payload) as response:
-        if response.status != 200:
-            log.warning(f"TG sendMessage failed: {await response.text()}")
-            return False
-        return True
-
-
-async def _tg_send_photo(
-    session: aiohttp.ClientSession,
-    base: str,
-    chat_id: str | int,
-    photo: bytes,
-    caption: str,
-    reply_markup: dict | None,
-    reply_to_message_id: int | None,
-    *,
-    filename: str = "print_options.jpg",
-    content_type: str = "image/jpeg",
-    parse_mode: str | None = "HTML",
-) -> int | None:
-    form = aiohttp.FormData()
-    form.add_field("chat_id", str(chat_id))
-    form.add_field("caption", caption)
-    if parse_mode:
-        form.add_field("parse_mode", parse_mode)
-    form.add_field(
-        "photo",
-        photo,
-        filename=filename,
-        content_type=content_type,
-    )
-    if reply_markup:
-        form.add_field(
-            "reply_markup",
-            json.dumps(reply_markup, ensure_ascii=False, separators=(",", ":")),
-        )
-    if isinstance(reply_to_message_id, int):
-        form.add_field(
-            "reply_parameters",
-            json.dumps(
-                {"message_id": reply_to_message_id},
-                ensure_ascii=False,
-                separators=(",", ":"),
-            ),
-        )
-    async with session.post(f"{base}/sendPhoto", data=form) as response:
-        if response.status != 200:
-            log.warning("TG photo send failed: %s", await response.text())
-            return None
-        try:
-            body = await response.json()
-        except Exception as exc:
-            log.warning("TG photo response returned invalid JSON: %s", exc)
-            return None
-        result = body.get("result") if isinstance(body, dict) else None
-        message_id = result.get("message_id") if isinstance(result, dict) else None
-        if (not isinstance(body, dict) or not body.get("ok")
-                or not isinstance(message_id, int)
-                or isinstance(message_id, bool)):
-            log.warning("TG photo response has no valid message_id")
-            return None
-        return message_id
-
-
-async def _tg_edit_print_caption(
-    session: aiohttp.ClientSession,
-    base: str,
-    chat_id: str | int,
-    message_id: int,
-    caption: str,
-) -> bool:
-    payload = {
-        "chat_id": chat_id,
-        "message_id": message_id,
-        "caption": caption,
-        "reply_markup": {"inline_keyboard": []},
-    }
-    async with session.post(
-        f"{base}/editMessageCaption", json=payload,
-    ) as response:
-        if response.status != 200:
-            log.warning("TG print preview edit failed: %s", await response.text())
-            return False
-        return True
-
-
 def is_admin(user_id) -> bool:
     return bool(TG_ADMIN and user_id is not None and str(user_id) == TG_ADMIN)
 
@@ -257,27 +168,6 @@ async def _tg_show_keyboard(
         "Не понял команду. Выбери действие кнопкой:",
         reply_markup=TG_COMMAND_KEYBOARD,
     )
-
-
-async def _tg_answer_callback(
-    telegram: aiohttp.ClientSession,
-    base: str,
-    callback_id: str | None,
-    text: str = "",
-    show_alert: bool = False,
-) -> None:
-    if not callback_id:
-        return
-    payload = {"callback_query_id": callback_id}
-    if text:
-        payload["text"] = text
-        payload["show_alert"] = bool(show_alert)
-    async with telegram.post(
-        f"{base}/answerCallbackQuery",
-        json=payload,
-    ) as response:
-        if response.status != 200:
-            log.warning(f"TG answerCallbackQuery failed: {await response.text()}")
 
 
 async def _do_update(
@@ -414,10 +304,10 @@ def _event_access_token(event_name: str) -> str:
 
 
 def _event_start_link(event_name: str) -> str:
-    if not TG_BOT_USERNAME:
+    if not telegram_api.BOT_USERNAME:
         raise RuntimeError("TG_BOT_USERNAME не настроен")
     return (
-        f"https://t.me/{TG_BOT_USERNAME}"
+        f"https://t.me/{telegram_api.BOT_USERNAME}"
         f"?start={_event_access_token(event_name)}"
     )
 
@@ -425,7 +315,7 @@ def _event_start_link(event_name: str) -> str:
 def _validate_event_access_configuration() -> None:
     if not EVENT_KEY.strip():
         raise RuntimeError("EVENT_KEY не настроен")
-    if not TG_BOT_USERNAME:
+    if not telegram_api.BOT_USERNAME:
         raise RuntimeError("TG_BOT_USERNAME не настроен")
 
 
@@ -625,40 +515,6 @@ def _telegram_print_file(message: dict) -> tuple[str, str, int | None] | None:
     if not suffix or not document.get("file_id"):
         raise ValueError("пришли изображение как обычное фото или image-документ")
     return str(document["file_id"]), suffix, document.get("file_size")
-
-
-async def _tg_download_file(
-    telegram: aiohttp.ClientSession,
-    base: str,
-    file_id: str,
-) -> bytes:
-    async with telegram.post(
-        f"{base}/getFile",
-        json={"file_id": file_id},
-        timeout=aiohttp.ClientTimeout(total=30),
-    ) as response:
-        body = await response.json()
-        if response.status != 200 or not body.get("ok"):
-            raise RuntimeError("Telegram не отдал файл")
-    file_path = (body.get("result") or {}).get("file_path")
-    if not file_path:
-        raise RuntimeError("Telegram не вернул путь к файлу")
-
-    download_url = f"https://api.telegram.org/file/bot{TG_TOKEN}/{file_path}"
-    payload = bytearray()
-    async with telegram.get(
-        download_url,
-        timeout=aiohttp.ClientTimeout(total=90),
-    ) as response:
-        if response.status != 200:
-            raise RuntimeError(f"Telegram download HTTP {response.status}")
-        async for chunk in response.content.iter_chunked(1024 * 1024):
-            payload.extend(chunk)
-            if len(payload) > MAX_TELEGRAM_PRINT_FILE_SIZE:
-                raise ValueError("файл больше 20 МБ")
-    if not payload:
-        raise ValueError("Telegram прислал пустой файл")
-    return bytes(payload)
 
 
 def _telegram_sender_data(message: dict) -> dict:
@@ -934,7 +790,10 @@ async def _tg_handle_print_message(
         if file_info is None:
             return False
         file_id, suffix, declared_size = file_info
-        if declared_size is not None and int(declared_size) > MAX_TELEGRAM_PRINT_FILE_SIZE:
+        if (
+            declared_size is not None
+            and int(declared_size) > telegram_api.MAX_DOWNLOAD_FILE_SIZE
+        ):
             raise ValueError("файл больше 20 МБ")
 
         event_name, event_token, cafe_mode = _current_print_event()
@@ -1912,25 +1771,21 @@ async def _tg_route_callback_update(
 
 async def tg_poll_commands() -> None:
     """Long-poll Telegram and sequentially route bot messages and callbacks."""
-    if not TG_TOKEN or not TG_ADMIN:
+    if not telegram_api.BOT_TOKEN or not TG_ADMIN:
         log.warning("Telegram bot/admin is not configured")
         return
-    base = f"https://api.telegram.org/bot{TG_TOKEN}"
+    base = telegram_api.BOT_API_BASE
     offset = 0
-    allowed_updates = json.dumps(["message", "callback_query"])
+    allowed_updates = ("message", "callback_query")
     async with aiohttp.ClientSession() as telegram:
         while True:
             try:
-                async with telegram.get(
-                    f"{base}/getUpdates",
-                    params={
-                        "offset": offset,
-                        "timeout": 10,
-                        "allowed_updates": allowed_updates,
-                    },
-                    timeout=aiohttp.ClientTimeout(total=15),
-                ) as response:
-                    data = await response.json()
+                data = await telegram_api.get_updates(
+                    telegram,
+                    base,
+                    offset=offset,
+                    allowed_updates=allowed_updates,
+                )
                 for update in data.get("result", []):
                     next_offset = update["update_id"] + 1
                     message = update.get("message")
@@ -1958,74 +1813,6 @@ def _save_vps_event(name: str) -> None:
         json.dumps(data, ensure_ascii=False, indent=4) + "\n", encoding="utf-8")
     temporary.replace(CONFIG_PATH)
     CONFIG["yadisk_folder"] = name
-
-
-async def _tg_send_document(
-    chat_id: str | int,
-    payload: bytes,
-    filename: str,
-    content_type: str,
-) -> bool:
-    if not TG_TOKEN:
-        return False
-    form = aiohttp.FormData()
-    # aiohttp multipart fields accept text/bytes, unlike Telegram JSON where an
-    # integer chat_id is valid. Passing the raw int raises during serialization.
-    form.add_field("chat_id", str(chat_id))
-    form.add_field(
-        "document", payload, filename=filename, content_type=content_type)
-    async with aiohttp.ClientSession() as telegram:
-        async with telegram.post(
-            f"https://api.telegram.org/bot{TG_TOKEN}/sendDocument",
-            data=form,
-            timeout=aiohttp.ClientTimeout(total=60),
-        ) as response:
-            if response.status != 200:
-                log.warning(
-                    "TG document send failed filename=%s: %s",
-                    filename, await response.text(),
-                )
-                return False
-            return True
-
-
-async def _tg_send_documents(
-    chat_id: str | int,
-    documents: list[tuple[bytes, str, str]],
-) -> bool:
-    """Send two or more separate documents in one Telegram media group."""
-    if not TG_TOKEN or len(documents) < 2:
-        return False
-    form = aiohttp.FormData()
-    form.add_field("chat_id", str(chat_id))
-    media = []
-    for index, (payload, filename, content_type) in enumerate(documents):
-        field_name = f"document_{index}"
-        form.add_field(
-            field_name,
-            payload,
-            filename=filename,
-            content_type=content_type,
-        )
-        media.append({
-            "type": "document",
-            "media": f"attach://{field_name}",
-        })
-    form.add_field("media", json.dumps(media, ensure_ascii=False))
-    async with aiohttp.ClientSession() as telegram:
-        async with telegram.post(
-            f"https://api.telegram.org/bot{TG_TOKEN}/sendMediaGroup",
-            data=form,
-            timeout=aiohttp.ClientTimeout(total=60),
-        ) as response:
-            if response.status != 200:
-                log.warning(
-                    "TG document group send failed files=%s: %s",
-                    [filename for _, filename, _ in documents],
-                    await response.text(),
-                )
-                return False
-            return True
 
 
 async def _tg_send_log(chat_id: str | int, payload: bytes) -> bool:
@@ -2077,7 +1864,7 @@ async def _handle_control_response(response: dict) -> bool:
             return True
 
     chat_id = response.get("reply_chat_id") or TG_ADMIN
-    if not chat_id or not TG_TOKEN:
+    if not chat_id or not telegram_api.BOT_TOKEN:
         return False
 
     event_public_url: str | None = None
@@ -2175,7 +1962,7 @@ async def _handle_control_response(response: dict) -> bool:
             else:
                 response_message += f"\n\nСсылка для гостей:\n{start_link}"
     async with aiohttp.ClientSession() as telegram:
-        telegram_base = f"https://api.telegram.org/bot{TG_TOKEN}"
+        telegram_base = telegram_api.BOT_API_BASE
         if event_qr_png is not None:
             message_id = await _tg_send_photo(
                 telegram,
@@ -2216,7 +2003,7 @@ async def main() -> None:
     yadisk_folder = CONFIG.get("yadisk_folder", "")
     control_folder = CONFIG.get("yadisk_control_folder", "photobooth_system/control")
     inbox_ready = await yadisk_poll.yadisk_init(
-        yadisk_folder, control_folder, TG_TOKEN, TG_CHAT)
+        yadisk_folder, control_folder, telegram_api.BOT_TOKEN, TG_CHAT)
     await yadisk_control.control_init(control_folder)
     if not inbox_ready:
         log.error("Yandex.Disk inbox poller is not configured")
