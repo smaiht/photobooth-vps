@@ -71,7 +71,7 @@ PRINT_FILE_SUFFIXES = {
 SAFE_PRINT_SUFFIX_RE = re.compile(r"^\.[a-z0-9]{1,10}$")
 _rejected_media_groups: set[str] = set()
 _print_callbacks_in_progress: set[str] = set()
-PRINT_CALLBACK_RE = re.compile(r"^print:(fit|fill):([a-f0-9]{32})$")
+PRINT_CALLBACK_RE = re.compile(r"^print:(fit|fill|cancel):([a-f0-9]{32})$")
 
 TG_COMMANDS = {
     "/run": "run",
@@ -126,6 +126,7 @@ async def _tg_send_photo(
     form = aiohttp.FormData()
     form.add_field("chat_id", str(chat_id))
     form.add_field("caption", caption)
+    form.add_field("parse_mode", "HTML")
     form.add_field(
         "photo",
         photo,
@@ -542,6 +543,12 @@ async def _tg_handle_print_message(
         if declared_size is not None and int(declared_size) > MAX_TELEGRAM_PRINT_FILE_SIZE:
             raise ValueError("файл больше 20 МБ")
 
+        await _tg_send_text(
+            telegram,
+            base,
+            chat_id,
+            "⏳ Ваше фото обрабатывается, подождите немного…",
+        )
         payload = await _tg_download_file(telegram, base, file_id)
         preview = await asyncio.to_thread(print_jobs.build_choice_preview, payload)
         metadata = _telegram_sender_data(message)
@@ -582,21 +589,27 @@ async def _tg_handle_print_message(
             metadata,
         )
         keyboard = {
-            "inline_keyboard": [[
-                {
-                    "text": "1️⃣ Как есть",
-                    "callback_data": f"print:fit:{job_id}",
-                },
-                {
-                    "text": "2️⃣ Увеличить под размер",
-                    "callback_data": f"print:fill:{job_id}",
-                },
-            ]],
+            "inline_keyboard": [
+                [
+                    {
+                        "text": "1️⃣ Как есть",
+                        "callback_data": f"print:fit:{job_id}",
+                    },
+                    {
+                        "text": "2️⃣ Увеличить",
+                        "callback_data": f"print:fill:{job_id}",
+                    },
+                ],
+                [{
+                    "text": "❌ Отмена",
+                    "callback_data": f"print:cancel:{job_id}",
+                }],
+            ],
         }
         caption = (
-            "Фото не совпадает с форматом 10×15.\n\n"
-            "1 — как есть (будут белые поля).\n"
-            "2 — увеличить под размер (обрежутся затемнённые края)."
+            "<b>Фото не совпадает с форматом 10×15.</b>\n\n"
+            "1 — <b>как есть</b> — будут белые поля.\n"
+            "2 — <b>увеличить под размер</b> — обрежутся затемнённые края."
         )
         sent = await _tg_send_photo(
             telegram,
@@ -644,94 +657,125 @@ async def _tg_handle_print_callback(
         return True
     if job_id in _print_callbacks_in_progress:
         await _tg_answer_callback(
-            telegram, base, callback_id, "Уже отправляем на печать")
+            telegram, base, callback_id, "Задание уже обрабатывается")
         return True
-
-    try:
-        payload, metadata = await asyncio.to_thread(print_jobs.load_pending, job_id)
-    except Exception:
-        await _tg_answer_callback(
-            telegram, base, callback_id,
-            "Кнопка уже неактивна. Для новой печати пришли фото ещё раз.",
-            show_alert=True,
-        )
-        return True
-
-    if int(metadata.get("sender_id") or 0) != user_id:
-        await _tg_answer_callback(
-            telegram, base, callback_id,
-            "Выбрать может только отправитель фото", show_alert=True)
-        return True
-    status = str(metadata.get("pending_status") or "")
-    if status in ("submitting", "submitted"):
-        await _tg_answer_callback(
-            telegram, base, callback_id,
-            "Фото уже передаётся или передано на печать")
-        return True
-
     _print_callbacks_in_progress.add(job_id)
-    selected_text = (
-        "как есть, с белыми полями"
-        if mode == "fit"
-        else "увеличить под размер, края обрежутся"
-    )
-    await _tg_answer_callback(
-        telegram, base, callback_id, "Принято, отправляю на печать")
     try:
-        metadata = await asyncio.to_thread(
-            print_jobs.update_pending,
-            job_id,
-            pending_status="submitting",
-            print_mode=mode,
-            print_choice="telegram_button",
-            print_selected_at=time.time(),
-        )
-        suffix = str(metadata["source_suffix"])
-        command_id = await _submit_print_job(
-            job_id, user_id, suffix, payload, metadata, chat_id)
-        await asyncio.to_thread(
-            print_jobs.update_pending,
-            job_id,
-            pending_status="submitted",
-            command_id=command_id,
-        )
-    except Exception as exc:
-        log.exception("TG print choice submission failed job=%s mode=%s", job_id, mode)
         try:
+            payload, metadata = await asyncio.to_thread(
+                print_jobs.load_pending, job_id)
+        except Exception:
+            await _tg_answer_callback(
+                telegram,
+                base,
+                callback_id,
+                "Кнопка уже неактивна. Для новой печати пришли фото ещё раз.",
+                show_alert=True,
+            )
+            return True
+
+        if int(metadata.get("sender_id") or 0) != user_id:
+            await _tg_answer_callback(
+                telegram, base, callback_id,
+                "Выбрать может только отправитель фото", show_alert=True)
+            return True
+        status = str(metadata.get("pending_status") or "")
+        if status in ("submitting", "submitted"):
+            await _tg_answer_callback(
+                telegram, base, callback_id,
+                "Фото уже передаётся или передано на печать")
+            return True
+
+        if mode == "cancel":
+            try:
+                await asyncio.to_thread(print_jobs.delete_pending, job_id)
+            except Exception:
+                log.exception("Could not cancel pending print job=%s", job_id)
+                await _tg_answer_callback(
+                    telegram,
+                    base,
+                    callback_id,
+                    "Не удалось отменить печать. Попробуй ещё раз.",
+                    show_alert=True,
+                )
+                return True
+
+            await _tg_answer_callback(
+                telegram, base, callback_id, "Печать отменена")
+            if isinstance(message.get("message_id"), int):
+                await _tg_edit_print_caption(
+                    telegram,
+                    base,
+                    chat_id,
+                    message["message_id"],
+                    "🚫 Печать отменена.",
+                )
+            log.info("TG print choice cancelled job=%s user=%s", job_id, user_id)
+            return True
+
+        selected_text = (
+            "как есть, с белыми полями"
+            if mode == "fit"
+            else "увеличить под размер, края обрежутся"
+        )
+        try:
+            await _tg_answer_callback(
+                telegram, base, callback_id, "Принято, отправляю на печать")
+            metadata = await asyncio.to_thread(
+                print_jobs.update_pending,
+                job_id,
+                pending_status="submitting",
+                print_mode=mode,
+                print_choice="telegram_button",
+                print_selected_at=time.time(),
+            )
+            suffix = str(metadata["source_suffix"])
+            command_id = await _submit_print_job(
+                job_id, user_id, suffix, payload, metadata, chat_id)
             await asyncio.to_thread(
                 print_jobs.update_pending,
                 job_id,
-                pending_status="awaiting_choice",
+                pending_status="submitted",
+                command_id=command_id,
             )
+        except Exception as exc:
+            log.exception(
+                "TG print choice submission failed job=%s mode=%s", job_id, mode)
+            try:
+                await asyncio.to_thread(
+                    print_jobs.update_pending,
+                    job_id,
+                    pending_status="awaiting_choice",
+                )
+            except Exception:
+                log.exception("Could not restore pending print choice job=%s", job_id)
+            await _tg_send_text(
+                telegram,
+                base,
+                chat_id,
+                f"❌ Не удалось передать фото на печать: {exc}. Нажми вариант ещё раз.",
+            )
+            return True
+
+        if isinstance(message.get("message_id"), int):
+            await _tg_edit_print_caption(
+                telegram,
+                base,
+                chat_id,
+                message["message_id"],
+                f"✅ Выбрано: {selected_text}. Фото передано на печать.",
+            )
+        try:
+            await asyncio.to_thread(print_jobs.delete_pending, job_id)
         except Exception:
-            log.exception("Could not restore pending print choice job=%s", job_id)
-        await _tg_send_text(
-            telegram,
-            base,
-            chat_id,
-            f"❌ Не удалось передать фото на печать: {exc}. Нажми вариант ещё раз.",
+            log.exception("Could not remove submitted pending print job=%s", job_id)
+        log.info(
+            "TG print choice submitted job=%s user=%s mode=%s command=%s",
+            job_id, user_id, mode, command_id,
         )
         return True
     finally:
         _print_callbacks_in_progress.discard(job_id)
-
-    if isinstance(message.get("message_id"), int):
-        await _tg_edit_print_caption(
-            telegram,
-            base,
-            chat_id,
-            message["message_id"],
-            f"✅ Выбрано: {selected_text}. Фото передано на печать.",
-        )
-    try:
-        await asyncio.to_thread(print_jobs.delete_pending, job_id)
-    except Exception:
-        log.exception("Could not remove submitted pending print job=%s", job_id)
-    log.info(
-        "TG print choice submitted job=%s user=%s mode=%s command=%s",
-        job_id, user_id, mode, command_id,
-    )
-    return True
 
 
 async def _tg_handle_admin_command(
