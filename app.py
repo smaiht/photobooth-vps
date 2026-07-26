@@ -2,7 +2,6 @@
 
 import asyncio
 import html
-import io
 import json
 import logging
 import os
@@ -12,7 +11,6 @@ import uuid
 from pathlib import Path
 
 import aiohttp
-from PIL import Image, ImageOps
 
 import admin_commands
 import database
@@ -20,6 +18,7 @@ import event_access
 import migrate
 import print_jobs
 import telegram_api
+import telegram_helpers
 import vps_update
 import yadisk_control
 import yadisk_poll
@@ -152,7 +151,6 @@ async def _record_telegram_start(update: dict, message: dict) -> bool:
         username=sender.get("username"),
         first_name=sender.get("first_name"),
         last_name=sender.get("last_name"),
-        profile={},
     )
     log.info("TG /start stored for user=%s parameter=%r", user_id, parameter)
     return True
@@ -247,71 +245,6 @@ def _telegram_print_file(message: dict) -> tuple[str, str, int | None] | None:
     return str(document["file_id"]), suffix, document.get("file_size")
 
 
-def _telegram_sender_data(message: dict) -> dict:
-    sender = message.get("from") or {}
-    chat = message.get("chat") or {}
-    first_name = str(sender.get("first_name") or "").strip()
-    last_name = str(sender.get("last_name") or "").strip()
-    display_name = " ".join(part for part in (first_name, last_name) if part)
-    username = str(sender.get("username") or "").strip()
-    document = message.get("document") or {}
-    source_filename = str(document.get("file_name") or "telegram_photo.jpg")
-    source_filename = re.sub(r"[\x00-\x1f\x7f]", "", source_filename)[:200]
-    return {
-        "sender_id": sender.get("id"),
-        "sender_name": display_name[:100],
-        "username": username[:64],
-        "source_filename": source_filename,
-        "telegram_mime_type": str(document.get("mime_type") or ""),
-        "telegram_document": dict(document),
-        "telegram_user": dict(sender),
-        "telegram_chat": dict(chat),
-        "telegram_message_id": message.get("message_id"),
-        "telegram_message_date": message.get("date"),
-        "telegram_caption": str(message.get("caption") or "")[:1024],
-        "telegram_source_kind": "photo" if message.get("photo") else "document",
-    }
-
-
-async def _ensure_telegram_bot_user(sender: dict) -> int:
-    user_id = sender.get("id")
-    if user_id is None:
-        raise ValueError("Telegram не передал ID пользователя")
-    return await database.ensure_bot_user(
-        provider="telegram",
-        provider_user_id=user_id,
-        username=sender.get("username"),
-        first_name=sender.get("first_name"),
-        last_name=sender.get("last_name"),
-        profile={},
-    )
-
-
-def _telegram_photo_jpeg_preview(payload: bytes) -> bytes:
-    """Convert any supported input image into a Telegram-friendly JPEG."""
-    with Image.open(io.BytesIO(payload)) as source:
-        source.seek(0)
-        oriented = ImageOps.exif_transpose(source)
-        try:
-            if oriented.mode in ("RGBA", "LA") or "transparency" in oriented.info:
-                rgba = oriented.convert("RGBA")
-                image = Image.new("RGB", rgba.size, (255, 255, 255))
-                image.paste(rgba, mask=rgba.getchannel("A"))
-                rgba.close()
-            else:
-                image = oriented.convert("RGB")
-        finally:
-            if oriented is not source:
-                oriented.close()
-    try:
-        image.thumbnail((1600, 1600), Image.Resampling.LANCZOS)
-        output = io.BytesIO()
-        image.save(output, "JPEG", quality=88, optimize=True)
-        return output.getvalue()
-    finally:
-        image.close()
-
-
 def _print_mode_text(mode: str) -> str:
     if mode == "fit":
         return "как есть, с белыми полями"
@@ -349,7 +282,7 @@ async def _send_admin_print_request(
 ) -> int:
     if not TG_ADMIN:
         raise RuntimeError("TG_ADMIN_ID не настроен")
-    photo = await asyncio.to_thread(_telegram_photo_jpeg_preview, payload)
+    photo = await asyncio.to_thread(telegram_helpers.photo_jpeg_preview, payload)
     keyboard = {
         "inline_keyboard": [[
             {
@@ -520,7 +453,7 @@ async def _tg_handle_print_message(
             raise ValueError("файл больше 20 МБ")
 
         event_name, event_token, cafe_mode = event_access.current_event()
-        database_user_id = await _ensure_telegram_bot_user(sender)
+        database_user_id = await telegram_helpers.ensure_bot_user(sender)
         has_event_access = await _telegram_user_has_print_access(
             user_id,
             event_token=event_token,
@@ -561,7 +494,7 @@ async def _tg_handle_print_message(
         )
         payload = await _tg_download_file(telegram, base, file_id)
         preview = await asyncio.to_thread(print_jobs.build_choice_preview, payload)
-        metadata = _telegram_sender_data(message)
+        metadata = telegram_helpers.sender_data(message)
         metadata.update({
             "job_id": job_id,
             "source_size": len(payload),
@@ -760,7 +693,7 @@ async def _tg_handle_print_callback(
     _print_callbacks_in_progress.add(job_id)
     try:
         try:
-            database_user_id = await _ensure_telegram_bot_user(sender)
+            database_user_id = await telegram_helpers.ensure_bot_user(sender)
         except Exception as exc:
             log.exception("Could not prepare print callback job=%s", job_id)
             await _tg_answer_callback(

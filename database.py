@@ -1,6 +1,5 @@
 """Small PostgreSQL access layer shared by messenger integrations."""
 
-import json
 import os
 import uuid
 
@@ -23,16 +22,13 @@ def _bot_user_values(
     *,
     provider: str,
     provider_user_id: str | int,
-    profile: dict | None,
-) -> tuple[str, str, dict]:
+) -> tuple[str, str]:
     if provider not in PROVIDERS:
         raise ValueError(f"unsupported bot provider: {provider}")
     external_id = str(provider_user_id).strip()
     if not external_id:
         raise ValueError("provider_user_id is required")
-    if profile is not None and not isinstance(profile, dict):
-        raise TypeError("profile must be an object or None")
-    return provider, external_id, profile or {}
+    return provider, external_id
 
 
 def _required_text(value: str | int | None, field: str) -> str:
@@ -94,13 +90,11 @@ async def record_bot_start(
     username: str | None = None,
     first_name: str | None = None,
     last_name: str | None = None,
-    profile: dict | None = None,
 ) -> int:
     """Upsert a messenger user and append one idempotent /start event."""
-    provider, external_id, profile = _bot_user_values(
+    provider, external_id = _bot_user_values(
         provider=provider,
         provider_user_id=provider_user_id,
-        profile=profile,
     )
     if start_parameter is not None and not isinstance(start_parameter, str):
         raise TypeError("start_parameter must be a string or None")
@@ -113,14 +107,13 @@ async def record_bot_start(
                 """
                 INSERT INTO bot_users (
                     provider, provider_user_id, username, first_name, last_name,
-                    profile, first_start_parameter, current_start_parameter
+                    first_start_parameter, current_start_parameter
                 )
-                VALUES (%s, %s, %s, %s, %s, %s::jsonb, %s, %s)
+                VALUES (%s, %s, %s, %s, %s, %s, %s)
                 ON CONFLICT (provider, provider_user_id) DO UPDATE SET
                     username = COALESCE(EXCLUDED.username, bot_users.username),
                     first_name = COALESCE(EXCLUDED.first_name, bot_users.first_name),
                     last_name = COALESCE(EXCLUDED.last_name, bot_users.last_name),
-                    profile = bot_users.profile || EXCLUDED.profile,
                     first_start_parameter = COALESCE(
                         NULLIF(bot_users.first_start_parameter, ''),
                         NULLIF(EXCLUDED.first_start_parameter, '')
@@ -138,7 +131,6 @@ async def record_bot_start(
                     username,
                     first_name,
                     last_name,
-                    json.dumps(profile, ensure_ascii=False),
                     start_parameter,
                     start_parameter,
                 ),
@@ -173,28 +165,24 @@ async def ensure_bot_user(
     username: str | None = None,
     first_name: str | None = None,
     last_name: str | None = None,
-    profile: dict | None = None,
 ) -> int:
     """Upsert a bot user without changing /start fields or start history."""
-    provider, external_id, profile = _bot_user_values(
+    provider, external_id = _bot_user_values(
         provider=provider,
         provider_user_id=provider_user_id,
-        profile=profile,
     )
     connection = await _connect()
     async with connection:
         cursor = await connection.execute(
             """
             INSERT INTO bot_users (
-                provider, provider_user_id, username, first_name, last_name,
-                profile
+                provider, provider_user_id, username, first_name, last_name
             )
-            VALUES (%s, %s, %s, %s, %s, %s::jsonb)
+            VALUES (%s, %s, %s, %s, %s)
             ON CONFLICT (provider, provider_user_id) DO UPDATE SET
                 username = COALESCE(EXCLUDED.username, bot_users.username),
                 first_name = COALESCE(EXCLUDED.first_name, bot_users.first_name),
                 last_name = COALESCE(EXCLUDED.last_name, bot_users.last_name),
-                profile = bot_users.profile || EXCLUDED.profile,
                 last_seen_at = now()
             RETURNING id
             """,
@@ -204,7 +192,6 @@ async def ensure_bot_user(
                 username,
                 first_name,
                 last_name,
-                json.dumps(profile, ensure_ascii=False),
             ),
         )
         row = await cursor.fetchone()
@@ -220,10 +207,9 @@ async def user_has_current_start_parameter(
     start_parameter: str,
 ) -> bool:
     """Return whether a messenger user currently has the expected event token."""
-    provider, external_id, _profile = _bot_user_values(
+    provider, external_id = _bot_user_values(
         provider=provider,
         provider_user_id=provider_user_id,
-        profile=None,
     )
     start_parameter = _required_text(start_parameter, "start_parameter")
 
@@ -561,7 +547,6 @@ def _admin_print_job_from_row(row) -> dict:
         "username": row[11],
         "first_name": row[12],
         "last_name": row[13],
-        "profile": row[14],
     }
 
 
@@ -603,8 +588,7 @@ async def authorize_print_job_by_admin(
                     bot_users.provider_user_id,
                     bot_users.username,
                     bot_users.first_name,
-                    bot_users.last_name,
-                    bot_users.profile
+                    bot_users.last_name
                 FROM changed
                 JOIN bot_users ON bot_users.id = changed.user_id
                 """,
@@ -630,8 +614,7 @@ async def authorize_print_job_by_admin(
                     bot_users.provider_user_id,
                     bot_users.username,
                     bot_users.first_name,
-                    bot_users.last_name,
-                    bot_users.profile
+                    bot_users.last_name
                 FROM print_jobs
                 JOIN bot_users ON bot_users.id = print_jobs.user_id
                 WHERE print_jobs.id = %s
@@ -693,8 +676,7 @@ async def reject_print_job_by_admin(
                     bot_users.provider_user_id,
                     bot_users.username,
                     bot_users.first_name,
-                    bot_users.last_name,
-                    bot_users.profile
+                    bot_users.last_name
                 FROM changed
                 JOIN bot_users ON bot_users.id = changed.user_id
                 """,
@@ -720,8 +702,7 @@ async def reject_print_job_by_admin(
                     bot_users.provider_user_id,
                     bot_users.username,
                     bot_users.first_name,
-                    bot_users.last_name,
-                    bot_users.profile
+                    bot_users.last_name
                 FROM print_jobs
                 JOIN bot_users ON bot_users.id = print_jobs.user_id
                 WHERE print_jobs.id = %s
