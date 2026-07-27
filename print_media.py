@@ -53,31 +53,23 @@ def sender_caption(
     metadata: dict,
     *,
     telegram_html: bool = False,
-    include_filename: bool = True,
 ) -> str:
     """Format normalized sender fields consistently in print notifications."""
     sender_name = str(metadata.get("sender_name") or "—")
     username = str(metadata.get("username") or "").strip().lstrip("@")
     provider = str(metadata.get("provider") or "messenger").upper()
     sender_id = str(metadata.get("sender_id") or "—")
-    filename = str(metadata.get("source_filename") or "photo.jpg")
     if telegram_html:
         username_line = f" (@{html.escape(username)})" if username else ""
-        caption = (
+        return (
             f"Пользователь: {html.escape(sender_name)}{username_line}\n"
             f"{html.escape(provider)} ID: <code>{html.escape(sender_id)}</code>"
         )
-        return (
-            f"{caption}\nФайл: {html.escape(filename)}"
-            if include_filename
-            else caption
-        )
     username_line = f" (@{username})" if username else ""
-    caption = (
+    return (
         f"Пользователь: {sender_name}{username_line}\n"
         f"{provider} ID: {sender_id}"
     )
-    return f"{caption}\nФайл: {filename}" if include_filename else caption
 
 
 def jpeg_preview(payload: bytes) -> bytes:

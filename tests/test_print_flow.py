@@ -919,6 +919,8 @@ class TelegramPrintArchiveTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("<b>Фото отправлено на печать</b>", caption)
         self.assertIn("Кафе &amp; тест", caption)
         self.assertIn("Иван &lt;Иванов&gt;", caption)
+        self.assertNotIn("Файл:", caption)
+        self.assertNotIn("photo &amp; copy.jpg", caption)
         self.assertEqual(send.await_args.kwargs["parse_mode"], "HTML")
 
     async def test_archive_skips_an_identical_telegram_source(self):

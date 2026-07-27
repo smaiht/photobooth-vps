@@ -129,10 +129,14 @@ async def send_text(
     chat_id: str | int,
     text: str,
     reply_markup: dict | None = None,
+    *,
+    parse_mode: str | None = None,
 ) -> bool:
     payload = {"chat_id": chat_id, "text": text}
     if reply_markup:
         payload["reply_markup"] = reply_markup
+    if parse_mode:
+        payload["parse_mode"] = parse_mode
     body = await _post_with_retry(
         session,
         f"{base}/sendMessage",

@@ -76,9 +76,19 @@ async def _send_card(
         return False
 
 
-async def _send_text(target: ReplyTarget, text: str) -> bool:
+async def _send_text(
+    target: ReplyTarget,
+    text: str,
+    *,
+    parse_mode: str | None = None,
+) -> bool:
     try:
-        return await messenger_delivery.send_text(target, text)
+        options = {"parse_mode": parse_mode} if parse_mode is not None else {}
+        return await messenger_delivery.send_text(
+            target,
+            text,
+            **options,
+        )
     except Exception as exc:
         log.warning(
             "Admin text delivery failed provider=%s conversation=%s: %s",
@@ -104,19 +114,33 @@ async def send_event_update(
     primary_target: ReplyTarget,
     image: bytes | None,
     caption: str,
+    *,
+    telegram_caption: str | None = None,
 ) -> EventAccessDelivery:
     """Send an event result to its origin and every configured administrator."""
     primary_target = ReplyTarget.from_value(primary_target)
     targets = _targets_with_primary(primary_target)
 
     async def deliver(target: ReplyTarget) -> bool:
+        is_telegram = target.provider == "telegram"
+        target_caption = (
+            telegram_caption
+            if is_telegram and telegram_caption is not None
+            else caption
+        )
+        parse_mode = "HTML" if is_telegram and telegram_caption is not None else None
         if image is None:
-            return await _send_text(target, caption)
+            return await _send_text(
+                target,
+                target_caption,
+                parse_mode=parse_mode,
+            )
         return await _send_card(
             target,
             image,
-            caption,
+            target_caption,
             filename="event_access_telegram_vk_qr.png",
+            parse_mode=parse_mode,
         )
 
     results = await asyncio.gather(*(deliver(target) for target in targets))

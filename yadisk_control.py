@@ -59,6 +59,18 @@ def validate_response(data: dict, filename: str = "") -> dict:
     event_folder = data.get("event_folder")
     if event_folder is not None and not isinstance(event_folder, str):
         raise ValueError("invalid event folder")
+    start_locked = data.get("start_locked")
+    if start_locked is not None and type(start_locked) is not bool:
+        raise ValueError("invalid start_locked")
+    unlock_sessions_remaining = data.get("unlock_sessions_remaining")
+    if (
+        unlock_sessions_remaining is not None
+        and (
+            type(unlock_sessions_remaining) is not int
+            or not 0 <= unlock_sessions_remaining <= 1000
+        )
+    ):
+        raise ValueError("invalid unlock_sessions_remaining")
     try:
         reply_target = ReplyTarget.from_value(data.get("reply_target"))
     except ValueError as exc:
@@ -72,6 +84,8 @@ def validate_response(data: dict, filename: str = "") -> dict:
         "message": str(data.get("message", ""))[:4000],
         "artifact_path": artifact_path,
         "event_folder": event_folder,
+        "start_locked": start_locked,
+        "unlock_sessions_remaining": unlock_sessions_remaining,
         "reply_target": reply_target,
         "created_at": str(data.get("created_at", "")),
     }

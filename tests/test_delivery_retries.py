@@ -107,6 +107,22 @@ class RetryPolicyTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(session.calls), 1)
         wait.assert_not_awaited()
 
+    async def test_telegram_text_includes_explicit_html_parse_mode(self):
+        session = FakeSession([
+            FakeResponse(200, {"ok": True, "result": {"message_id": 1}}),
+        ])
+
+        delivered = await telegram_api.send_text(
+            session,
+            "https://telegram.test",
+            123,
+            "<b>Кафе</b>",
+            parse_mode="HTML",
+        )
+
+        self.assertTrue(delivered)
+        self.assertEqual(session.calls[0][1]["json"]["parse_mode"], "HTML")
+
     async def test_telegram_edit_not_modified_counts_as_success(self):
         session = FakeSession([
             FakeResponse(400, {

@@ -21,17 +21,26 @@ def _vk_peer_id(target: ReplyTarget) -> int:
     return peer_id
 
 
-async def send_text(target: ReplyTarget, text: str) -> bool:
+async def send_text(
+    target: ReplyTarget,
+    text: str,
+    *,
+    parse_mode: str | None = None,
+) -> bool:
     target = ReplyTarget.from_value(target)
     async with aiohttp.ClientSession() as session:
         if target.provider == "telegram":
+            options = {"parse_mode": parse_mode} if parse_mode is not None else {}
             return await telegram_api.send_text(
                 session,
                 telegram_api.BOT_API_BASE,
                 target.conversation_id,
                 text,
+                **options,
             )
         if target.provider == "vk":
+            if parse_mode is not None:
+                raise ValueError("parse_mode is supported only for Telegram")
             message_id = await vk_api.send_text(
                 session,
                 _vk_peer_id(target),

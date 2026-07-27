@@ -81,6 +81,43 @@ class MessengerDeliveryTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(delivered)
         send.assert_awaited_once_with(session, 556972284, "hello")
 
+    async def test_routes_html_text_only_to_telegram(self):
+        session, context = session_context()
+        with patch(
+            "messenger_delivery.aiohttp.ClientSession",
+            return_value=context,
+        ), patch(
+            "messenger_delivery.telegram_api.send_text",
+            AsyncMock(return_value=True),
+        ) as send:
+            delivered = await messenger_delivery.send_text(
+                ReplyTarget("telegram", 123),
+                "<b>Кафе</b>",
+                parse_mode="HTML",
+            )
+
+        self.assertTrue(delivered)
+        send.assert_awaited_once_with(
+            session,
+            messenger_delivery.telegram_api.BOT_API_BASE,
+            "123",
+            "<b>Кафе</b>",
+            parse_mode="HTML",
+        )
+
+    async def test_rejects_telegram_parse_mode_for_vk(self):
+        _session, context = session_context()
+        with patch(
+            "messenger_delivery.aiohttp.ClientSession",
+            return_value=context,
+        ):
+            with self.assertRaisesRegex(ValueError, "only for Telegram"):
+                await messenger_delivery.send_text(
+                    ReplyTarget("vk", 556972284),
+                    "<b>Кафе</b>",
+                    parse_mode="HTML",
+                )
+
     async def test_routes_photo_to_selected_provider(self):
         session, context = session_context()
         keyboard = {"inline": True, "buttons": []}

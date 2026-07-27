@@ -118,7 +118,7 @@ class EventSwitchTests(unittest.IsolatedAsyncioTestCase):
         response = {
             "status": "ok",
             "command": "set_event",
-            "message": "Event переключён",
+            "message": "Event активирован: <b>legacy markup</b>",
             "event_folder": "2026-08-17 Свадьба Ивановых",
             "reply_target": {
                 "provider": "telegram",
@@ -142,7 +142,7 @@ class EventSwitchTests(unittest.IsolatedAsyncioTestCase):
         ), patch(
             "control_response_service.yadisk_poll.publish_current_folder",
             AsyncMock(return_value="https://disk.example/event"),
-        ), patch(
+        ) as publish, patch(
             "control_response_service.event_access.guest_links",
             return_value=links,
         ), patch(
@@ -161,15 +161,26 @@ class EventSwitchTests(unittest.IsolatedAsyncioTestCase):
             ReplyTarget("telegram", 123),
         )
         self.assertEqual(send.await_args.args[1], b"qr-card")
-        self.assertIn(links["telegram"], send.await_args.args[2])
-        self.assertIn(links["vk"], send.await_args.args[2])
+        publish.assert_awaited_once_with()
+        plain_caption = send.await_args.args[2]
+        telegram_caption = send.await_args.kwargs["telegram_caption"]
+        self.assertNotIn("<b>", plain_caption)
+        self.assertIn("Event активирован на будке", plain_caption)
+        self.assertIn(links["telegram"], plain_caption)
+        self.assertIn(links["vk"], plain_caption)
+        self.assertIn(
+            "<b>2026-08-17 Свадьба Ивановых</b>",
+            telegram_caption,
+        )
 
     async def test_cafe_event_text_is_delivered_to_both_admin_channels(self):
         response = {
             "status": "ok",
             "command": "set_event",
-            "message": "Кафе включено",
+            "message": "Event активирован на будке: <b>Кафе</b>",
             "event_folder": "Кафе",
+            "start_locked": True,
+            "unlock_sessions_remaining": 0,
             "reply_target": {
                 "provider": "vk",
                 "conversation_id": "556972284",
@@ -188,17 +199,30 @@ class EventSwitchTests(unittest.IsolatedAsyncioTestCase):
         ), patch(
             "control_response_service.yadisk_poll.publish_current_folder",
             AsyncMock(return_value="https://disk.example/cafe"),
-        ), patch(
+        ) as publish, patch(
+            "control_response_service.event_access.guest_links",
+        ) as guest_links, patch(
             "control_response_service.admin_notifications.send_event_update",
             AsyncMock(return_value=delivery),
         ) as send:
             handled = await control_response_service.handle(response)
 
         self.assertTrue(handled)
+        publish.assert_not_awaited()
+        guest_links.assert_not_called()
         send.assert_awaited_once()
         self.assertEqual(send.await_args.args[0], ReplyTarget("vk", 556972284))
         self.assertIsNone(send.await_args.args[1])
-        self.assertIn("Кафе включено", send.await_args.args[2])
+        plain_caption = send.await_args.args[2]
+        telegram_caption = send.await_args.kwargs["telegram_caption"]
+        self.assertEqual(
+            plain_caption,
+            "✅ Event активирован на будке: Кафе\n\n"
+            "🔒 Запуск заблокирован. Разрешённых фотосессий: 0.",
+        )
+        self.assertIn("<b>Кафе</b>", telegram_caption)
+        self.assertNotIn("<b>", plain_caption)
+        self.assertNotIn("Публичная папка", plain_caption)
 
     def test_event_command_requires_iso_date_except_cafe(self):
         with patch.object(

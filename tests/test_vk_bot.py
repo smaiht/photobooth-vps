@@ -941,6 +941,7 @@ class AdminNotificationTests(unittest.IsolatedAsyncioTestCase):
                 telegram_admin,
                 b"png",
                 "event ready",
+                telegram_caption="<b>event ready</b>",
             )
 
         self.assertTrue(result.primary_delivered)
@@ -955,10 +956,11 @@ class AdminNotificationTests(unittest.IsolatedAsyncioTestCase):
                 call(
                     telegram_admin,
                     b"png",
-                    "event ready",
+                    "<b>event ready</b>",
                     filename="event_access_telegram_vk_qr.png",
                     content_type="image/png",
                     keyboard=None,
+                    parse_mode="HTML",
                 ),
                 call(
                     vk_admin,
@@ -1005,6 +1007,7 @@ class AdminNotificationTests(unittest.IsolatedAsyncioTestCase):
                 telegram_admin,
                 None,
                 "Кафе включено",
+                telegram_caption="<b>Кафе</b> включено",
             )
 
         self.assertTrue(result.primary_delivered)
@@ -1012,7 +1015,11 @@ class AdminNotificationTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(
             send.await_args_list,
             [
-                call(telegram_admin, "Кафе включено"),
+                call(
+                    telegram_admin,
+                    "<b>Кафе</b> включено",
+                    parse_mode="HTML",
+                ),
                 call(vk_admin, "Кафе включено"),
             ],
         )

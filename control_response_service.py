@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import asyncio
+import html
 import logging
+from dataclasses import dataclass
 
 import admin_notifications
 import database
@@ -16,6 +18,13 @@ from messaging import ReplyTarget
 
 
 log = logging.getLogger(__name__)
+
+
+@dataclass(frozen=True)
+class EventUpdate:
+    image: bytes | None
+    caption: str
+    telegram_caption: str
 
 
 async def _persist_print_result(response: dict) -> bool:
@@ -56,7 +65,7 @@ async def _persist_print_result(response: dict) -> bool:
 
 
 async def _activate_event(response: dict) -> tuple[str | None, str | None] | None:
-    event_name = response.get("event_folder")
+    event_name = str(response.get("event_folder") or "")
     if not event_name:
         return None
     try:
@@ -65,6 +74,8 @@ async def _activate_event(response: dict) -> tuple[str | None, str | None] | Non
     except Exception as exc:
         log.warning("Control: cannot activate event on VPS: %s", exc)
         return None
+    if event_name == event_access.TECHNICAL_EVENT_NAME:
+        return None, None
     try:
         return await yadisk_poll.publish_current_folder(), None
     except Exception as exc:
@@ -137,37 +148,79 @@ async def _deliver_artifact(
     return True
 
 
-async def _event_card(
+def _event_caption(
     response: dict,
     event_public_url: str | None,
     event_publish_error: str | None,
-) -> tuple[bytes | None, str]:
-    response_message = response["message"]
+    guest_links: dict[str, str] | None,
+    qr_error: str | None,
+    *,
+    telegram_html: bool,
+) -> str:
     event_name = str(response.get("event_folder") or "")
-    if event_public_url:
-        response_message += f"\n\nПубличная папка: {event_public_url}"
-    elif event_publish_error:
-        response_message += (
-            "\n⚠️ Мероприятие активировано, но папку не удалось "
-            f"опубликовать: {event_publish_error}"
-        )
-    if not event_name or event_name == event_access.TECHNICAL_EVENT_NAME:
-        return None, response_message
+    render = html.escape if telegram_html else str
+    event_label = render(event_name)
+    if telegram_html:
+        event_label = f"<b>{event_label}</b>"
+    lines = [f"✅ Event активирован на будке: {event_label}"]
 
-    try:
-        guest_links = event_access.guest_links(event_name)
-        image = await asyncio.to_thread(
-            event_access.guest_qr_sheet_png,
-            guest_links,
+    if (
+        event_name == event_access.TECHNICAL_EVENT_NAME
+        and response.get("start_locked") is True
+        and response.get("unlock_sessions_remaining") == 0
+    ):
+        lines.append("🔒 Запуск заблокирован. Разрешённых фотосессий: 0.")
+    if event_public_url:
+        lines.append(f"Публичная папка: {render(event_public_url)}")
+    elif event_publish_error:
+        lines.append(
+            "⚠️ Мероприятие активировано, но папку не удалось "
+            f"опубликовать: {render(event_publish_error)}"
         )
-    except Exception as exc:
-        log.warning("Control: event QR unavailable: %s", exc)
-        return None, response_message + f"\n⚠️ QR-код не создан: {exc}"
-    return image, (
-        response_message
-        + "\n\nСсылки для гостей:"
-        + f"\nTelegram: {guest_links['telegram']}"
-        + f"\nVK: {guest_links['vk']}"
+    if qr_error:
+        lines.append(f"⚠️ QR-код не создан: {render(qr_error)}")
+    elif guest_links:
+        lines.extend((
+            "Ссылки для гостей:",
+            f"Telegram: {render(guest_links['telegram'])}",
+            f"VK: {render(guest_links['vk'])}",
+        ))
+    return "\n\n".join(lines)
+
+
+async def _event_update(
+    response: dict,
+    event_public_url: str | None,
+    event_publish_error: str | None,
+) -> EventUpdate:
+    event_name = str(response.get("event_folder") or "")
+    image: bytes | None = None
+    guest_links: dict[str, str] | None = None
+    qr_error: str | None = None
+
+    if event_name != event_access.TECHNICAL_EVENT_NAME:
+        try:
+            guest_links = event_access.guest_links(event_name)
+            image = await asyncio.to_thread(
+                event_access.guest_qr_sheet_png,
+                guest_links,
+            )
+        except Exception as exc:
+            log.warning("Control: event QR unavailable: %s", exc)
+            guest_links = None
+            qr_error = str(exc)
+
+    caption_arguments = (
+        response,
+        event_public_url,
+        event_publish_error,
+        guest_links,
+        qr_error,
+    )
+    return EventUpdate(
+        image=image,
+        caption=_event_caption(*caption_arguments, telegram_html=False),
+        telegram_caption=_event_caption(*caption_arguments, telegram_html=True),
     )
 
 
@@ -194,21 +247,19 @@ async def handle(response: dict) -> bool:
         return await _deliver_artifact(response, target)
 
     prefix = "✅" if response["status"] == "ok" else "❌"
-    response_message = response["message"]
-    event_qr_png: bytes | None = None
     if response["status"] == "ok" and response["command"] == "set_event":
-        event_qr_png, response_message = await _event_card(
+        event_update = await _event_update(
             response,
             event_public_url,
             event_publish_error,
         )
-
-    caption = f"{prefix} {response_message}"
-    if response["status"] == "ok" and response["command"] == "set_event":
         delivery = await admin_notifications.send_event_update(
             target,
-            event_qr_png,
-            caption,
+            event_update.image,
+            event_update.caption,
+            telegram_caption=event_update.telegram_caption,
         )
         return delivery.primary_delivered
+    response_message = response["message"]
+    caption = f"{prefix} {response_message}"
     return await messenger_delivery.send_text(target, caption)

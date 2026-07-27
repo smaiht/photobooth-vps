@@ -184,13 +184,13 @@ def admin_request_text(
             f"<b>Новая печать в «{html.escape(event_label)}»</b>\n"
             f"Job: <code>{html.escape(job_id)}</code>\n"
             f"Выбор: <b>{html.escape(mode_text(mode))}</b>\n"
-            f"{print_media.sender_caption(metadata, telegram_html=True, include_filename=False)}"
+            f"{print_media.sender_caption(metadata, telegram_html=True)}"
         )
     return (
         f"Новая печать в «{event_label}»\n"
         f"Job: {job_id}\n"
         f"Выбор: {mode_text(mode)}\n"
-        f"{print_media.sender_caption(metadata, include_filename=False)}"
+        f"{print_media.sender_caption(metadata)}"
     )
 
 
@@ -233,7 +233,7 @@ def admin_job_result_text(
         f"{status}\n"
         f"Мероприятие: «{event_name}»\n"
         f"Job: {job_id}\n"
-        f"{print_media.sender_caption(sender, include_filename=False)}"
+        f"{print_media.sender_caption(sender)}"
     )
 
 
