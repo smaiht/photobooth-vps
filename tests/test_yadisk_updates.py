@@ -4,7 +4,7 @@ import unittest
 import zipfile
 from unittest.mock import AsyncMock, call, patch
 
-import app
+import runtime_config
 import vps_update
 import yadisk_updates
 
@@ -206,8 +206,7 @@ class PublishUpdateTests(unittest.IsolatedAsyncioTestCase):
         }
 
         progress = AsyncMock()
-        updates_folder = app.CONFIG.get(
-            "yadisk_updates_folder", "photobooth_system/updates")
+        updates_folder = runtime_config.updates_folder()
         with patch.object(
             vps_update,
             "GITHUB_RELEASE_URL",

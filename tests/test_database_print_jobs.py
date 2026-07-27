@@ -277,6 +277,7 @@ class PrintJobDatabaseTests(unittest.IsolatedAsyncioTestCase):
             result = await database.authorize_print_job_by_admin(
                 job_id=JOB_ID,
                 current_event_name="Кафе",
+                cafe_mode=True,
             )
 
         self.assertEqual(result["outcome"], "authorized")
@@ -285,7 +286,7 @@ class PrintJobDatabaseTests(unittest.IsolatedAsyncioTestCase):
         sql, parameters = connection.executed[0]
         self.assertIn("status = 'awaiting_authorization'", sql)
         self.assertIn("authorization_kind = 'cashier'", sql)
-        self.assertEqual(parameters, (JOB_ID, "Кафе", "Кафе"))
+        self.assertEqual(parameters, (JOB_ID, "Кафе", True))
 
     async def test_admin_rejection_closes_only_pending_cafe_job(self):
         row = (
@@ -298,6 +299,7 @@ class PrintJobDatabaseTests(unittest.IsolatedAsyncioTestCase):
             result = await database.reject_print_job_by_admin(
                 job_id=JOB_ID,
                 current_event_name="Кафе",
+                cafe_mode=True,
             )
 
         self.assertEqual(result["outcome"], "cancelled")

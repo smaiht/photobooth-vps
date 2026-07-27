@@ -1,4 +1,4 @@
-"""Parsing and user-facing descriptions for Telegram admin commands."""
+"""Parsing and user-facing descriptions for provider-neutral admin commands."""
 
 import re
 from datetime import date
@@ -102,8 +102,8 @@ def parse(text: str) -> ParsedCommand | None:
     if known_command:
         return known_command, None
 
-    # /start is consumed by the main Telegram router and must never be treated
-    # as a camera field if this parser is called directly.
+    # /start is consumed by a provider adapter and must never be treated as a
+    # camera field if this parser is called directly.
     if command_name == "/start":
         return None
 
@@ -117,7 +117,7 @@ def parse(text: str) -> ParsedCommand | None:
 
 def sent_message(command: str, data: dict | None) -> str:
     if command == "set_event":
-        return f"⏳ Переключаю event на будке и VPS: {data['name']}"
+        return f"⏳ Переключаю мероприятие на будке и VPS: {data['name']}"
     if command == "unblock":
         if data["sessions"] == 0:
             return (
@@ -140,7 +140,7 @@ def sent_message(command: str, data: dict | None) -> str:
 
 def failed_message(command: str, error: Exception) -> str:
     label = {
-        "set_event": "Event не отправлен",
+        "set_event": "Команда смены мероприятия не отправлена",
         "unblock": "Изменение блокировки не отправлено",
         "set_camera_config": "Настройка камеры не отправлена",
     }.get(command, "Команда не отправлена")

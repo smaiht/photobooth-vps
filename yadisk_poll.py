@@ -16,7 +16,6 @@ import os
 import re
 import tempfile
 import time
-from contextlib import ExitStack
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Awaitable, Callable
@@ -24,6 +23,8 @@ from typing import Awaitable, Callable
 import aiohttp
 from aiohttp.payload import Payload
 
+import print_media
+import telegram_session_delivery
 import yadisk_control
 
 log = logging.getLogger(__name__)
@@ -31,12 +32,11 @@ log = logging.getLogger(__name__)
 API = "https://cloud-api.yandex.net/v1/disk"
 POLL_INTERVAL = 10
 PAGE_SIZE = 1000
-STATE_FILE = Path("vps_yadisk_state.json")
+STATE_FILE = Path(__file__).resolve().parent / "vps_yadisk_state.json"
 SCHEMA_VERSION = 2
 MD5_RE = re.compile(r"^[a-f0-9]{32}$")
 PRINT_JOB_ID_RE = re.compile(r"^[a-f0-9]{32}$")
 PRINT_SUFFIX_RE = re.compile(r"^\.[a-z0-9]{1,10}$")
-MAX_PRINT_FILE_SIZE = 20 * 1024 * 1024
 PRINT_UPLOAD_CHUNK_SIZE = 1024 * 1024
 PRINT_UPLOAD_PROGRESS_BYTES = 5 * 1024 * 1024
 PRINT_UPLOAD_PROGRESS_SECONDS = 3
@@ -47,8 +47,6 @@ _transfer_session: aiohttp.ClientSession | None = None
 _folder = ""
 _bus_root = ""
 _token = ""
-_tg_token = ""
-_tg_chat = ""
 _configured = False
 _inflight: set[str] = set()
 
@@ -56,7 +54,7 @@ ResponseHandler = Callable[[dict], Awaitable[bool]]
 
 
 class _PrintUploadPayload(Payload):
-    """Stream one Telegram print file and log actual upload progress."""
+    """Stream one messenger print file and log actual upload progress."""
 
     _autoclose = True
 
@@ -311,13 +309,13 @@ async def store_print_job(
     metadata: dict,
     event_folder: str | None = None,
 ) -> dict:
-    """Store one Telegram image and its TXT metadata on Yandex.Disk."""
+    """Store one messenger image and its TXT metadata on Yandex.Disk."""
     normalized_suffix = str(suffix or "").lower()
     if (not PRINT_JOB_ID_RE.fullmatch(str(job_id or ""))
             or not isinstance(user_id, int) or user_id <= 0
             or not PRINT_SUFFIX_RE.fullmatch(normalized_suffix)
             or not isinstance(image_payload, bytes) or not image_payload
-            or len(image_payload) > MAX_PRINT_FILE_SIZE
+            or len(image_payload) > print_media.MAX_PRINT_FILE_SIZE
             or not isinstance(metadata, dict)):
         raise ValueError("invalid print job")
     if not await _connect():
@@ -393,54 +391,6 @@ async def _download_file(remote_path: str, local_path: Path, expected: dict) -> 
             raise ValueError(f"md5 mismatch for {expected['name']}")
 
 
-async def _tg_post(endpoint: str, form: aiohttp.FormData) -> bool:
-    base = f"https://api.telegram.org/bot{_tg_token}"
-    try:
-        async with aiohttp.ClientSession(
-            timeout=aiohttp.ClientTimeout(total=180, connect=30)
-        ) as telegram:
-            async with telegram.post(f"{base}/{endpoint}", data=form) as response:
-                if response.status != 200:
-                    log.warning(f"Telegram {endpoint} {response.status}: {await response.text()}")
-                    return False
-                return True
-    except Exception as exc:
-        log.warning(f"Telegram {endpoint} failed: {exc}")
-        return False
-
-
-async def _tg_send_chunk(files: list[tuple[Path, str]]) -> bool:
-    with ExitStack() as stack:
-        form = aiohttp.FormData()
-        form.add_field("chat_id", _tg_chat)
-        if len(files) == 1:
-            path, kind = files[0]
-            field = "video" if kind == "video" else "photo"
-            form.add_field(field, stack.enter_context(path.open("rb")), filename=path.name)
-            return await _tg_post("sendVideo" if kind == "video" else "sendPhoto", form)
-
-        media = []
-        for index, (path, kind) in enumerate(files):
-            key = f"file{index}"
-            media.append({
-                "type": "video" if kind == "video" else "photo",
-                "media": f"attach://{key}",
-            })
-            form.add_field(key, stack.enter_context(path.open("rb")), filename=path.name)
-        form.add_field("media", json.dumps(media))
-        return await _tg_post("sendMediaGroup", form)
-
-
-async def _tg_send_session(files: list[tuple[Path, str]]) -> bool:
-    if not _tg_token or not _tg_chat:
-        log.warning("Telegram token/chat is missing")
-        return False
-    for start in range(0, len(files), 10):
-        if not await _tg_send_chunk(files[start:start + 10]):
-            return False
-    return True
-
-
 async def _wait_operation(href: str) -> bool:
     for _ in range(30):
         async with _session.get(href) as response:
@@ -492,7 +442,7 @@ async def _deliver_session(manifest: dict) -> bool:
             log.warning(f"YaDisk: session download failed, keeping inbox: {exc}")
             return False
 
-        if not await _tg_send_session(local_files):
+        if not await telegram_session_delivery.send_session(local_files):
             log.warning(f"YaDisk: Telegram failed for {manifest['session_id']}, keeping inbox")
             return False
     return True
@@ -624,11 +574,9 @@ async def yadisk_poll_loop(response_handler: ResponseHandler) -> None:
 async def yadisk_init(
     folder: str,
     control_folder: str,
-    tg_token: str,
-    tg_chat: str,
 ) -> bool:
     """Configure the unified inbox poller and make its initial connection."""
-    global _folder, _bus_root, _token, _tg_token, _tg_chat, _configured
+    global _folder, _bus_root, _token, _configured
     _state_load()
     _inflight.clear()
     _token = os.environ.get("YADISK_TOKEN", "").strip()
@@ -646,8 +594,6 @@ async def yadisk_init(
 
     _folder = "/" + folder_name
     _bus_root = "/" + bus_name
-    _tg_token = tg_token
-    _tg_chat = tg_chat
     _configured = True
     connected = await _connect()
     if not connected:

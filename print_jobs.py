@@ -1,4 +1,4 @@
-"""Telegram print-choice previews and durable local pending jobs."""
+"""Provider-neutral print-choice previews and durable local pending jobs."""
 
 from __future__ import annotations
 
@@ -320,7 +320,7 @@ def build_choice_preview(payload: bytes) -> PrintPreview:
                 overflow_axis=None,
             )
 
-        # The comparison sent to Telegram never needs the full source raster.
+        # The messenger comparison never needs the full source raster.
         preview_source = image.copy()
         preview_source.thumbnail((2200, 2200), Image.Resampling.LANCZOS)
         paper_size = _paper_preview_size(target_size)

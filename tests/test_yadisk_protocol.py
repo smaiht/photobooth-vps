@@ -6,7 +6,8 @@ from tempfile import TemporaryDirectory
 from unittest.mock import AsyncMock, patch
 
 import yadisk_poll
-from yadisk_poll import _process_manifest, _tg_send_chunk, validate_manifest
+import telegram_session_delivery
+from yadisk_poll import _process_manifest, validate_manifest
 
 
 class ManifestTests(unittest.TestCase):
@@ -67,8 +68,13 @@ class DeliveryTests(unittest.IsolatedAsyncioTestCase):
         with TemporaryDirectory() as tmpdir:
             photo = Path(tmpdir) / "photo.jpg"
             photo.write_bytes(b"jpeg")
-            with patch("yadisk_poll._tg_post", AsyncMock(return_value=True)) as post:
-                self.assertTrue(await _tg_send_chunk([(photo, "photo")]))
+            with patch(
+                "telegram_session_delivery._post",
+                AsyncMock(return_value=True),
+            ) as post:
+                self.assertTrue(await telegram_session_delivery._send_chunk(
+                    [(photo, "photo")],
+                ))
             self.assertEqual(post.await_args.args[0], "sendPhoto")
 
     async def test_download_failure_keeps_manifest_in_inbox(self):
@@ -91,7 +97,10 @@ class DeliveryTests(unittest.IsolatedAsyncioTestCase):
         with patch("yadisk_poll._download_bytes", AsyncMock(
                 return_value=json.dumps(manifest).encode("utf-8"))), \
              patch("yadisk_poll._download_file", download_file), \
-             patch("yadisk_poll._tg_send_session", AsyncMock()) as send, \
+             patch(
+                 "yadisk_poll.telegram_session_delivery.send_session",
+                 AsyncMock(),
+             ) as send, \
              patch("yadisk_poll._delete_inbox_message", AsyncMock()) as delete:
             ok = await _process_manifest({
                 "name": "abc123.json",
@@ -115,9 +124,13 @@ class DeliveryTests(unittest.IsolatedAsyncioTestCase):
             }],
         }
         response = {
-            "schema_version": 2,
+            "schema_version": 3,
             "message_type": "command_response",
             "command_id": "a" * 32,
+            "reply_target": {
+                "provider": "telegram",
+                "conversation_id": "123",
+            },
         }
         items = [
             {"name": "session_abc123.json", "path": "disk:/bus/to_vps/session_abc123.json"},

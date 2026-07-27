@@ -2,32 +2,71 @@ import json
 import unittest
 from unittest.mock import AsyncMock, MagicMock, patch
 
+import admin_command_service
 import admin_commands
+import admin_notifications
 import app
+import control_response_service
 import event_access
+import telegram_api
 import yadisk_control
 import yadisk_poll
+from messaging import ReplyTarget
 
 
 class ResponseValidationTests(unittest.TestCase):
     def test_validates_response_and_artifact_path(self):
         command_id = "a" * 32
         response = yadisk_control.validate_response({
-            "schema_version": 2,
+            "schema_version": 3,
             "message_type": "command_response",
             "command_id": command_id,
             "command": "send_logs",
             "status": "ok",
             "message": "done",
             "artifact_path": "/photobooth_system/control/logs/test.log",
+            "reply_target": {
+                "provider": "telegram",
+                "conversation_id": 123,
+            },
         }, f"response_{command_id}.json")
         self.assertEqual(response["status"], "ok")
+        self.assertEqual(
+            response["reply_target"],
+            ReplyTarget("telegram", 123),
+        )
 
         with self.assertRaisesRegex(ValueError, "artifact"):
             yadisk_control.validate_response({
                 **response,
                 "artifact_path": "/control/../secret",
             })
+
+    def test_rejects_response_without_reply_target(self):
+        command_id = "b" * 32
+        with self.assertRaisesRegex(ValueError, "reply_target"):
+            yadisk_control.validate_response({
+                "schema_version": 3,
+                "message_type": "command_response",
+                "command_id": command_id,
+                "command": "status",
+                "status": "ok",
+            }, f"response_{command_id}.json")
+
+    def test_rejects_previous_control_schema(self):
+        command_id = "c" * 32
+        with self.assertRaisesRegex(ValueError, "schema"):
+            yadisk_control.validate_response({
+                "schema_version": 2,
+                "message_type": "command_response",
+                "command_id": command_id,
+                "command": "status",
+                "status": "ok",
+                "reply_target": {
+                    "provider": "telegram",
+                    "conversation_id": "123",
+                },
+            }, f"response_{command_id}.json")
 
 
 class SendCommandTests(unittest.IsolatedAsyncioTestCase):
@@ -43,11 +82,22 @@ class SendCommandTests(unittest.IsolatedAsyncioTestCase):
              patch("yadisk_control.uuid.uuid4") as uuid4:
             uuid4.return_value.hex = "a" * 32
             command = await yadisk_control.send_command(
-                "set_event", {"name": "Свадьба"}, reply_chat_id=123)
+                "set_event",
+                ReplyTarget("telegram", 123),
+                {"name": "Свадьба"},
+            )
 
         self.assertEqual(command["command_id"], "a" * 32)
+        self.assertEqual(uploads[0][0]["schema_version"], 3)
         self.assertEqual(uploads[0][0]["message_type"], "command")
         self.assertEqual(uploads[0][0]["data"], {"name": "Свадьба"})
+        self.assertEqual(
+            uploads[0][0]["reply_target"],
+            {
+                "provider": "telegram",
+                "conversation_id": "123",
+            },
+        )
         self.assertEqual(
             uploads[0][1],
             f"/photobooth_system/control/to_booth/{'a' * 32}.json",
@@ -64,6 +114,92 @@ class EventSwitchTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(yadisk_poll._folder, "/Свадьба Ивановых 2026")
 
+    async def test_event_qr_card_is_delivered_to_both_admin_channels(self):
+        response = {
+            "status": "ok",
+            "command": "set_event",
+            "message": "Event переключён",
+            "event_folder": "2026-08-17 Свадьба Ивановых",
+            "reply_target": {
+                "provider": "telegram",
+                "conversation_id": "123",
+            },
+        }
+        links = {
+            "telegram": "https://t.me/bot?start=token",
+            "vk": "https://vk.me/community?ref=token",
+        }
+        delivery = admin_notifications.EventAccessDelivery(
+            primary_delivered=True,
+            delivered_targets=(ReplyTarget("telegram", 123),),
+            failed_targets=(),
+        )
+        with patch(
+            "control_response_service.yadisk_poll.set_event_folder",
+            AsyncMock(),
+        ), patch(
+            "control_response_service.runtime_config.save_event",
+        ), patch(
+            "control_response_service.yadisk_poll.publish_current_folder",
+            AsyncMock(return_value="https://disk.example/event"),
+        ), patch(
+            "control_response_service.event_access.guest_links",
+            return_value=links,
+        ), patch(
+            "control_response_service.event_access.guest_qr_sheet_png",
+            return_value=b"qr-card",
+        ), patch(
+            "control_response_service.admin_notifications.send_event_update",
+            AsyncMock(return_value=delivery),
+        ) as send:
+            handled = await control_response_service.handle(response)
+
+        self.assertTrue(handled)
+        send.assert_awaited_once()
+        self.assertEqual(
+            send.await_args.args[0],
+            ReplyTarget("telegram", 123),
+        )
+        self.assertEqual(send.await_args.args[1], b"qr-card")
+        self.assertIn(links["telegram"], send.await_args.args[2])
+        self.assertIn(links["vk"], send.await_args.args[2])
+
+    async def test_cafe_event_text_is_delivered_to_both_admin_channels(self):
+        response = {
+            "status": "ok",
+            "command": "set_event",
+            "message": "Кафе включено",
+            "event_folder": "Кафе",
+            "reply_target": {
+                "provider": "vk",
+                "conversation_id": "556972284",
+            },
+        }
+        delivery = admin_notifications.EventAccessDelivery(
+            primary_delivered=True,
+            delivered_targets=(ReplyTarget("vk", 556972284),),
+            failed_targets=(),
+        )
+        with patch(
+            "control_response_service.yadisk_poll.set_event_folder",
+            AsyncMock(),
+        ), patch(
+            "control_response_service.runtime_config.save_event",
+        ), patch(
+            "control_response_service.yadisk_poll.publish_current_folder",
+            AsyncMock(return_value="https://disk.example/cafe"),
+        ), patch(
+            "control_response_service.admin_notifications.send_event_update",
+            AsyncMock(return_value=delivery),
+        ) as send:
+            handled = await control_response_service.handle(response)
+
+        self.assertTrue(handled)
+        send.assert_awaited_once()
+        self.assertEqual(send.await_args.args[0], ReplyTarget("vk", 556972284))
+        self.assertIsNone(send.await_args.args[1])
+        self.assertIn("Кафе включено", send.await_args.args[2])
+
     def test_event_command_requires_iso_date_except_cafe(self):
         with patch.object(
             event_access,
@@ -73,6 +209,10 @@ class EventSwitchTests(unittest.IsolatedAsyncioTestCase):
             event_access.telegram_api,
             "BOT_USERNAME",
             "photobooth_bot",
+        ), patch.object(
+            event_access.vk_api,
+            "GROUP_USERNAME",
+            "photobooth_vk",
         ):
             self.assertEqual(
                 admin_commands.parse(
@@ -146,73 +286,99 @@ class CafeUnblockCommandTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_forwards_session_count_to_booth(self):
         with patch(
-            "app._send_disk_command",
+            "admin_command_service.yadisk_control.send_command",
             AsyncMock(return_value="a" * 32),
         ) as send, patch(
-            "app._tg_send_text",
+            "admin_command_service.messenger_delivery.send_text",
             AsyncMock(return_value=True),
         ) as send_text:
-            await app._tg_handle_admin_command(
-                object(), "https://telegram.test", 123, "/unblock 7")
+            await admin_command_service.handle_message(
+                ReplyTarget("telegram", 123),
+                "/unblock 7",
+            )
 
-        send.assert_awaited_once_with("unblock", 123, {"sessions": 7})
-        self.assertIn("7", send_text.await_args.args[3])
-        self.assertIn("подтверждение будки", send_text.await_args.args[3])
+        send.assert_awaited_once_with(
+            "unblock",
+            ReplyTarget("telegram", 123),
+            {"sessions": 7},
+        )
+        self.assertIn("7", send_text.await_args.args[1])
+        self.assertIn("подтверждение будки", send_text.await_args.args[1])
 
     async def test_without_count_forwards_one_session(self):
         with patch(
-            "app._send_disk_command",
+            "admin_command_service.yadisk_control.send_command",
             AsyncMock(return_value="a" * 32),
         ) as send, patch(
-            "app._tg_send_text",
+            "admin_command_service.messenger_delivery.send_text",
             AsyncMock(return_value=True),
         ):
-            await app._tg_handle_admin_command(
-                object(), "https://telegram.test", 123, "/unblock")
+            await admin_command_service.handle_message(
+                ReplyTarget("telegram", 123),
+                "/unblock",
+            )
 
-        send.assert_awaited_once_with("unblock", 123, {"sessions": 1})
+        send.assert_awaited_once_with(
+            "unblock",
+            ReplyTarget("telegram", 123),
+            {"sessions": 1},
+        )
 
     async def test_block_forwards_zero_with_lock_message(self):
         with patch(
-            "app._send_disk_command",
+            "admin_command_service.yadisk_control.send_command",
             AsyncMock(return_value="a" * 32),
         ) as send, patch(
-            "app._tg_send_text",
+            "admin_command_service.messenger_delivery.send_text",
             AsyncMock(return_value=True),
         ) as send_text:
-            await app._tg_handle_admin_command(
-                object(), "https://telegram.test", 123, "/block")
+            await admin_command_service.handle_message(
+                ReplyTarget("telegram", 123),
+                "/block",
+            )
 
-        send.assert_awaited_once_with("unblock", 123, {"sessions": 0})
-        self.assertIn("блокирую", send_text.await_args.args[3])
-        self.assertIn("подтверждение будки", send_text.await_args.args[3])
+        send.assert_awaited_once_with(
+            "unblock",
+            ReplyTarget("telegram", 123),
+            {"sessions": 0},
+        )
+        self.assertIn("блокирую", send_text.await_args.args[1])
+        self.assertIn("подтверждение будки", send_text.await_args.args[1])
 
     async def test_unblock_zero_forwards_zero(self):
         with patch(
-            "app._send_disk_command",
+            "admin_command_service.yadisk_control.send_command",
             AsyncMock(return_value="a" * 32),
         ) as send, patch(
-            "app._tg_send_text",
+            "admin_command_service.messenger_delivery.send_text",
             AsyncMock(return_value=True),
         ):
-            await app._tg_handle_admin_command(
-                object(), "https://telegram.test", 123, "/unblock 0")
+            await admin_command_service.handle_message(
+                ReplyTarget("telegram", 123),
+                "/unblock 0",
+            )
 
-        send.assert_awaited_once_with("unblock", 123, {"sessions": 0})
+        send.assert_awaited_once_with(
+            "unblock",
+            ReplyTarget("telegram", 123),
+            {"sessions": 0},
+        )
 
     async def test_invalid_count_is_reported_without_disk_command(self):
         with patch(
-            "app._send_disk_command",
+            "admin_command_service.yadisk_control.send_command",
             new_callable=AsyncMock,
         ) as send, patch(
-            "app._tg_send_text",
+            "admin_command_service.messenger_delivery.send_text",
             AsyncMock(return_value=True),
         ) as send_text:
-            await app._tg_handle_admin_command(
-                object(), "https://telegram.test", 123, "/unblock 1001")
+            await admin_command_service.handle_message(
+                ReplyTarget("telegram", 123),
+                "/unblock 1001",
+            )
 
         send.assert_not_awaited()
-        self.assertIn("от 0 до 1000", send_text.await_args.args[3])
+        self.assertIn("от 0 до 1000", send_text.await_args.args[1])
 
 
 class CameraSettingCommandTests(unittest.IsolatedAsyncioTestCase):
@@ -244,75 +410,143 @@ class CameraSettingCommandTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_forwards_raw_value_to_booth(self):
         with patch(
-            "app._send_disk_command",
+            "admin_command_service.yadisk_control.send_command",
             AsyncMock(return_value="a" * 32),
         ) as send, patch(
-            "app._tg_send_text",
+            "admin_command_service.messenger_delivery.send_text",
             AsyncMock(return_value=True),
         ) as send_text:
-            await app._tg_handle_admin_command(
-                object(), "https://telegram.test", 123, "/iso auto")
+            await admin_command_service.handle_message(
+                ReplyTarget("telegram", 123),
+                "/iso auto",
+            )
 
         send.assert_awaited_once_with(
             "set_camera_config",
-            123,
+            ReplyTarget("telegram", 123),
             {"field": "iso", "value": "auto"},
         )
-        self.assertIn("ожидаю подтверждение", send_text.await_args.args[3])
+        self.assertIn("ожидаю подтверждение", send_text.await_args.args[1])
 
     async def test_missing_value_returns_usage_without_disk_command(self):
         with patch(
-            "app._send_disk_command",
+            "admin_command_service.yadisk_control.send_command",
             new_callable=AsyncMock,
         ) as send, patch(
-            "app._tg_send_text",
+            "admin_command_service.messenger_delivery.send_text",
             AsyncMock(return_value=True),
         ) as send_text:
-            await app._tg_handle_admin_command(
-                object(), "https://telegram.test", 123, "/continuous_af")
+            await admin_command_service.handle_message(
+                ReplyTarget("telegram", 123),
+                "/continuous_af",
+            )
 
         send.assert_not_awaited()
-        self.assertIn("Использование", send_text.await_args.args[3])
+        self.assertIn("Использование", send_text.await_args.args[1])
 
     async def test_get_config_is_forwarded_as_fixed_command(self):
         with patch(
-            "app._send_disk_command",
+            "admin_command_service.yadisk_control.send_command",
             AsyncMock(return_value="a" * 32),
         ) as send, patch(
-            "app._tg_send_text",
+            "admin_command_service.messenger_delivery.send_text",
             AsyncMock(return_value=True),
         ) as send_text:
-            await app._tg_handle_admin_command(
-                object(), "https://telegram.test", 123, "/get_config")
+            await admin_command_service.handle_message(
+                ReplyTarget("telegram", 123),
+                "/get_config",
+            )
 
-        send.assert_awaited_once_with("get_config", 123, None)
+        send.assert_awaited_once_with(
+            "get_config",
+            ReplyTarget("telegram", 123),
+            None,
+        )
         self.assertEqual(
-            send_text.await_args.args[3],
+            send_text.await_args.args[1],
             "⏳ Запрашиваю конфиги фотобудки...",
         )
 
 
 class UpdateCommandTests(unittest.IsolatedAsyncioTestCase):
+    async def test_update_uses_runtime_folder_by_default(self):
+        with patch(
+            "admin_command_service.runtime_config.updates_folder",
+            return_value="configured-updates",
+        ), patch(
+            "admin_command_service.vps_update.publish_latest_release",
+            AsyncMock(return_value="published"),
+        ) as do_update, patch(
+            "admin_command_service.messenger_delivery.send_text",
+            AsyncMock(return_value=True),
+        ):
+            await admin_command_service.handle_message(
+                ReplyTarget("vk", 556972284),
+                "/update",
+            )
+
+        self.assertEqual(do_update.await_args.args[0], "configured-updates")
+
     async def test_update_does_not_restart_automatically(self):
         async def update(_updates_folder, progress_callback):
             await progress_callback("retry notice")
             return "published"
 
         with patch(
-            "app.vps_update.publish_latest_release",
+            "admin_command_service.vps_update.publish_latest_release",
             AsyncMock(side_effect=update),
         ) as do_update, \
-             patch("app._send_disk_command", AsyncMock(return_value="a" * 32)) as send, \
-             patch("app._tg_send_text", AsyncMock(return_value=True)) as send_text:
-            await app._tg_handle_admin_command(
-                object(), "https://telegram.test", 123, "/update")
+             patch("admin_command_service.yadisk_control.send_command",
+                   AsyncMock(return_value="a" * 32)) as send, \
+             patch("admin_command_service.messenger_delivery.send_text",
+                   AsyncMock(return_value=True)) as send_text:
+            await admin_command_service.handle_message(
+                ReplyTarget("telegram", 123),
+                "/update",
+                updates_folder="test-updates",
+            )
 
         do_update.assert_awaited_once()
+        self.assertEqual(do_update.await_args.args[0], "test-updates")
         send.assert_not_awaited()
         self.assertEqual(
-            [item.args[3] for item in send_text.await_args_list],
+            [item.args[1] for item in send_text.await_args_list],
             ["⏳ Скачиваю полный релиз...", "retry notice", "published"],
         )
+
+
+class ProviderNeutralAdminCommandTests(unittest.IsolatedAsyncioTestCase):
+    async def test_vk_target_is_preserved_for_booth_response(self):
+        target = ReplyTarget("vk", 556972284)
+        with patch(
+            "admin_command_service.yadisk_control.send_command",
+            AsyncMock(return_value={"command_id": "a" * 32}),
+        ) as send, patch(
+            "admin_command_service.messenger_delivery.send_text",
+            AsyncMock(return_value=True),
+        ) as reply:
+            await admin_command_service.handle_message(target, "/status")
+
+        send.assert_awaited_once_with("status", target, None)
+        self.assertEqual(reply.await_args.args[0], target)
+
+    async def test_failed_acknowledgement_cannot_repeat_a_durable_command(self):
+        target = ReplyTarget("vk", 556972284)
+        with patch(
+            "admin_command_service.yadisk_control.send_command",
+            AsyncMock(return_value={"command_id": "a" * 32}),
+        ) as send, patch(
+            "admin_command_service.messenger_delivery.send_text",
+            AsyncMock(side_effect=RuntimeError("VK unavailable")),
+        ) as reply, patch.object(
+            admin_command_service.log,
+            "warning",
+        ) as warning:
+            await admin_command_service.handle_message(target, "/status")
+
+        send.assert_awaited_once_with("status", target, None)
+        reply.assert_awaited_once()
+        warning.assert_called_once()
 
 
 class LogDeliveryTests(unittest.IsolatedAsyncioTestCase):
@@ -338,10 +572,16 @@ class LogDeliveryTests(unittest.IsolatedAsyncioTestCase):
                 return False
 
         form = MagicMock()
-        with patch.object(app.telegram_api, "BOT_TOKEN", "token"), \
-             patch("app.aiohttp.FormData", return_value=form), \
-             patch("app.aiohttp.ClientSession", return_value=ClientSession()):
-            self.assertTrue(await app._tg_send_log(5683598562, b"log"))
+        with patch.object(telegram_api, "BOT_TOKEN", "token"), \
+             patch("telegram_api.aiohttp.FormData", return_value=form), \
+             patch("telegram_api.aiohttp.ClientSession",
+                   return_value=ClientSession()):
+            self.assertTrue(await telegram_api.send_document(
+                5683598562,
+                b"log",
+                "photobooth.log",
+                "text/plain",
+            ))
 
         form.add_field.assert_any_call("chat_id", "5683598562")
 
@@ -351,19 +591,59 @@ class LogDeliveryTests(unittest.IsolatedAsyncioTestCase):
             "command": "send_logs",
             "message": "Лог загружен",
             "artifact_path": "/control/logs/test.log",
-            "reply_chat_id": 5683598562,
+            "reply_target": {
+                "provider": "telegram",
+                "conversation_id": "5683598562",
+            },
         }
-        with patch.object(app.telegram_api, "BOT_TOKEN", "token"), \
-             patch.object(app, "TG_ADMIN", "admin"), \
-             patch("app.yadisk_control.download_bytes", AsyncMock(return_value=b"log")), \
-             patch("app._tg_send_log", AsyncMock(return_value=True)) as send_log, \
-             patch("app._tg_send_text", new_callable=AsyncMock) as send_text, \
-             patch("app.yadisk_control.delete_resource", AsyncMock(
+        with patch("control_response_service.yadisk_control.download_bytes",
+                   AsyncMock(return_value=b"log")), \
+             patch("control_response_service.messenger_delivery.send_document",
+                   AsyncMock(return_value=True)) as send_document, \
+             patch("control_response_service.messenger_delivery.send_text",
+                   new_callable=AsyncMock) as send_text, \
+             patch("control_response_service.yadisk_control.delete_resource", AsyncMock(
                  side_effect=RuntimeError("cleanup unavailable"))) as delete:
-            self.assertTrue(await app._handle_control_response(response))
+            self.assertTrue(await control_response_service.handle(response))
 
-        send_log.assert_awaited_once_with(5683598562, b"log")
+        send_document.assert_awaited_once_with(
+            ReplyTarget("telegram", 5683598562),
+            b"log",
+            "photobooth.log",
+            "text/plain",
+        )
         send_text.assert_not_awaited()
+        delete.assert_awaited_once_with("/control/logs/test.log")
+
+    async def test_log_response_can_be_delivered_to_vk(self):
+        response = {
+            "status": "ok",
+            "command": "send_logs",
+            "message": "Лог загружен",
+            "artifact_path": "/control/logs/test.log",
+            "reply_target": {
+                "provider": "vk",
+                "conversation_id": "556972284",
+            },
+        }
+        with patch(
+            "control_response_service.yadisk_control.download_bytes",
+            AsyncMock(return_value=b"log"),
+        ), patch(
+            "control_response_service.messenger_delivery.send_document",
+            AsyncMock(return_value=True),
+        ) as send, patch(
+            "control_response_service.yadisk_control.delete_resource",
+            AsyncMock(return_value=True),
+        ) as delete:
+            self.assertTrue(await control_response_service.handle(response))
+
+        send.assert_awaited_once_with(
+            ReplyTarget("vk", 556972284),
+            b"log",
+            "photobooth.log",
+            "text/plain",
+        )
         delete.assert_awaited_once_with("/control/logs/test.log")
 
 
@@ -375,7 +655,10 @@ class PrintCommandResponseTests(unittest.IsolatedAsyncioTestCase):
             "command": "print_image",
             "command_id": command_id,
             "message": "Ваше фото добавлено в очередь",
-            "reply_chat_id": 123,
+            "reply_target": {
+                "provider": "telegram",
+                "conversation_id": "123",
+            },
         }
         queued = {
             "outcome": "queued",
@@ -383,17 +666,14 @@ class PrintCommandResponseTests(unittest.IsolatedAsyncioTestCase):
             "command_id": command_id,
         }
         with patch.object(
-            app.database,
+            control_response_service.database,
             "mark_print_job_queued",
             AsyncMock(return_value=queued),
         ) as mark_queued, patch(
-            "app._tg_send_text",
+            "control_response_service.messenger_delivery.send_text",
             new_callable=AsyncMock,
-        ) as send_text, patch(
-            "app.aiohttp.ClientSession",
-            side_effect=AssertionError("Telegram session must not be opened"),
-        ):
-            self.assertTrue(await app._handle_control_response(response))
+        ) as send_text:
+            self.assertTrue(await control_response_service.handle(response))
 
         mark_queued.assert_awaited_once_with(command_id=command_id)
         send_text.assert_not_awaited()
@@ -405,51 +685,32 @@ class PrintCommandResponseTests(unittest.IsolatedAsyncioTestCase):
             "command": "print_image",
             "command_id": command_id,
             "message": "Принтер не готов",
-            "reply_chat_id": 123,
+            "reply_target": {
+                "provider": "telegram",
+                "conversation_id": "123",
+            },
         }
         failed = {
             "outcome": "failed",
             "status": "failed",
             "command_id": command_id,
         }
-        telegram = object()
-
-        class ClientSession:
-            async def __aenter__(self):
-                return telegram
-
-            async def __aexit__(self, *_args):
-                return False
-
         with patch.object(
-            app.telegram_api,
-            "BOT_TOKEN",
-            "token",
-        ), patch.object(
-            app.telegram_api,
-            "BOT_API_BASE",
-            "https://api.telegram.org/bottoken",
-        ), patch.object(
-            app.database,
+            control_response_service.database,
             "mark_print_job_failed",
             AsyncMock(return_value=failed),
         ) as mark_failed, patch(
-            "app.aiohttp.ClientSession",
-            return_value=ClientSession(),
-        ), patch(
-            "app._tg_send_text",
+            "control_response_service.messenger_delivery.send_text",
             AsyncMock(return_value=True),
         ) as send_text:
-            self.assertTrue(await app._handle_control_response(response))
+            self.assertTrue(await control_response_service.handle(response))
 
         mark_failed.assert_awaited_once_with(
             command_id=command_id,
             last_error="Принтер не готов",
         )
         send_text.assert_awaited_once_with(
-            telegram,
-            "https://api.telegram.org/bottoken",
-            123,
+            ReplyTarget("telegram", 123),
             "❌ Принтер не готов",
         )
 
@@ -477,10 +738,11 @@ class ConfigDeliveryTests(unittest.IsolatedAsyncioTestCase):
                 return False
 
         form = MagicMock()
-        with patch.object(app.telegram_api, "BOT_TOKEN", "token"), \
-             patch("app.aiohttp.FormData", return_value=form), \
-             patch("app.aiohttp.ClientSession", return_value=ClientSession()):
-            self.assertTrue(await app._tg_send_document(
+        with patch.object(telegram_api, "BOT_TOKEN", "token"), \
+             patch("telegram_api.aiohttp.FormData", return_value=form), \
+             patch("telegram_api.aiohttp.ClientSession",
+                   return_value=ClientSession()):
+            self.assertTrue(await telegram_api.send_document(
                 123,
                 b"combined configs",
                 "photobooth_configs.txt",
@@ -501,24 +763,27 @@ class ConfigDeliveryTests(unittest.IsolatedAsyncioTestCase):
             "command": "get_config",
             "message": "Конфиги готовы",
             "artifact_path": "/control/configs/test.txt",
-            "reply_chat_id": 123,
+            "reply_target": {
+                "provider": "telegram",
+                "conversation_id": "123",
+            },
         }
         export = b"===== config_app.json =====\n{}\n"
         vps_config = b'{"yadisk_folder":"event"}\n'
-        with patch.object(app.telegram_api, "BOT_TOKEN", "token"), \
-             patch.object(app, "CONFIG_PATH") as config_path, \
-             patch("app.yadisk_control.download_bytes",
+        with patch("control_response_service.runtime_config.read_bytes",
+                   return_value=vps_config), \
+             patch("control_response_service.yadisk_control.download_bytes",
                    AsyncMock(return_value=export)), \
-             patch("app._tg_send_documents",
+             patch("control_response_service.messenger_delivery.send_documents",
                    AsyncMock(return_value=True)) as send, \
-             patch("app._tg_send_log", new_callable=AsyncMock) as send_log, \
-             patch("app.yadisk_control.delete_resource",
+             patch("control_response_service.messenger_delivery.send_document",
+                   new_callable=AsyncMock) as send_document, \
+             patch("control_response_service.yadisk_control.delete_resource",
                    AsyncMock(return_value=True)) as delete:
-            config_path.read_bytes.return_value = vps_config
-            self.assertTrue(await app._handle_control_response(response))
+            self.assertTrue(await control_response_service.handle(response))
 
         send.assert_awaited_once_with(
-            123,
+            ReplyTarget("telegram", 123),
             [
                 (
                     export,
@@ -532,7 +797,7 @@ class ConfigDeliveryTests(unittest.IsolatedAsyncioTestCase):
                 ),
             ],
         )
-        send_log.assert_not_awaited()
+        send_document.assert_not_awaited()
         delete.assert_awaited_once_with("/control/configs/test.txt")
 
 

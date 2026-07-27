@@ -13,10 +13,12 @@ from datetime import datetime, timezone
 
 import aiohttp
 
+from messaging import ReplyTarget
+
 log = logging.getLogger(__name__)
 
 API = "https://cloud-api.yandex.net/v1/disk"
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 COMMAND_ID_RE = re.compile(r"^[a-f0-9]{32}$")
 
 _session: aiohttp.ClientSession | None = None
@@ -57,9 +59,10 @@ def validate_response(data: dict, filename: str = "") -> dict:
     event_folder = data.get("event_folder")
     if event_folder is not None and not isinstance(event_folder, str):
         raise ValueError("invalid event folder")
-    reply_chat_id = data.get("reply_chat_id")
-    if reply_chat_id is not None and not isinstance(reply_chat_id, (int, str)):
-        raise ValueError("invalid reply_chat_id")
+    try:
+        reply_target = ReplyTarget.from_value(data.get("reply_target"))
+    except ValueError as exc:
+        raise ValueError("invalid reply_target") from exc
     return {
         "schema_version": SCHEMA_VERSION,
         "message_type": "command_response",
@@ -69,7 +72,7 @@ def validate_response(data: dict, filename: str = "") -> dict:
         "message": str(data.get("message", ""))[:4000],
         "artifact_path": artifact_path,
         "event_folder": event_folder,
-        "reply_chat_id": reply_chat_id,
+        "reply_target": reply_target,
         "created_at": str(data.get("created_at", "")),
     }
 
@@ -151,8 +154,8 @@ async def _upload_bytes(payload: bytes, remote_path: str) -> None:
 
 async def send_command(
     command: str,
+    reply_target: ReplyTarget,
     data: dict | str | None = None,
-    reply_chat_id: int | str | None = None,
     *,
     command_id: str | None = None,
 ) -> dict:
@@ -160,6 +163,7 @@ async def send_command(
         raise ValueError("invalid command")
     if data is not None and not isinstance(data, (dict, str)):
         raise ValueError("invalid command data")
+    reply_target = ReplyTarget.from_value(reply_target)
     if command_id is None:
         command_id = uuid.uuid4().hex
     elif not isinstance(command_id, str) or not COMMAND_ID_RE.fullmatch(command_id):
@@ -173,7 +177,7 @@ async def send_command(
         "command": command,
         "data": data,
         "created_at": datetime.now(timezone.utc).isoformat(),
-        "reply_chat_id": reply_chat_id,
+        "reply_target": reply_target.to_dict(),
     }
     payload = json.dumps(body, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
     await _upload_bytes(payload, f"{_root}/to_booth/{command_id}.json")

@@ -8,10 +8,19 @@ import aiohttp
 
 log = logging.getLogger(__name__)
 
-BOT_TOKEN = os.environ.get("TG_BOT_TOKEN", "")
+BOT_TOKEN = os.environ.get("TG_BOT_TOKEN", "").strip()
 BOT_USERNAME = os.environ.get("TG_BOT_USERNAME", "").strip().lstrip("@")
+ADMIN_ID = os.environ.get("TG_ADMIN_ID", "").strip()
+ARCHIVE_CHAT_ID = os.environ.get("TG_CHAT_ID", "").strip()
 BOT_API_BASE = f"https://api.telegram.org/bot{BOT_TOKEN}"
-MAX_DOWNLOAD_FILE_SIZE = 20 * 1024 * 1024
+
+
+def is_admin(user_id: object) -> bool:
+    return bool(
+        ADMIN_ID
+        and user_id is not None
+        and str(user_id) == ADMIN_ID
+    )
 
 
 async def send_text(
@@ -163,6 +172,8 @@ async def download_file(
     session: aiohttp.ClientSession,
     base: str,
     file_id: str,
+    *,
+    max_size: int,
 ) -> bytes:
     async with session.post(
         f"{base}/getFile",
@@ -186,9 +197,9 @@ async def download_file(
             raise RuntimeError(f"Telegram download HTTP {response.status}")
         async for chunk in response.content.iter_chunked(1024 * 1024):
             payload.extend(chunk)
-            if len(payload) > MAX_DOWNLOAD_FILE_SIZE:
+            if len(payload) > max_size:
                 raise ValueError(
-                    f"файл больше {MAX_DOWNLOAD_FILE_SIZE // 1048576} МБ"
+                    f"файл больше {max_size // 1048576} МБ"
                 )
     if not payload:
         raise ValueError("Telegram прислал пустой файл")

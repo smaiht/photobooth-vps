@@ -4,10 +4,9 @@ import os
 import uuid
 
 
-PROVIDERS = frozenset({"telegram", "max"})
+PROVIDERS = frozenset({"telegram", "vk", "max"})
 PRINT_MODES = frozenset({"fit", "fill"})
 PRINT_COOLDOWN_SECONDS = 5 * 60
-TECHNICAL_EVENT_NAME = "Кафе"
 
 
 async def _connect():
@@ -91,7 +90,7 @@ async def record_bot_start(
     first_name: str | None = None,
     last_name: str | None = None,
 ) -> int:
-    """Upsert a messenger user and append one idempotent /start event."""
+    """Upsert a messenger user and append one idempotent deep-link event."""
     provider, external_id = _bot_user_values(
         provider=provider,
         provider_user_id=provider_user_id,
@@ -554,6 +553,7 @@ async def authorize_print_job_by_admin(
     *,
     job_id: str | uuid.UUID,
     current_event_name: str,
+    cafe_mode: bool,
 ) -> dict:
     """Authorize one pending Cafe job with a compare-and-set transition."""
     job_id = _uuid_text(job_id, "job_id")
@@ -570,7 +570,7 @@ async def authorize_print_job_by_admin(
                         authorized_at = now()
                     WHERE id = %s
                       AND event_name = %s
-                      AND %s = 'Кафе'
+                      AND %s = TRUE
                       AND status = 'awaiting_authorization'
                     RETURNING *
                 )
@@ -592,7 +592,7 @@ async def authorize_print_job_by_admin(
                 FROM changed
                 JOIN bot_users ON bot_users.id = changed.user_id
                 """,
-                (job_id, current_event_name, current_event_name),
+                (job_id, current_event_name, cafe_mode),
             )
             row = await cursor.fetchone()
             if row is not None:
@@ -626,7 +626,7 @@ async def authorize_print_job_by_admin(
                 return {"outcome": "not_found", "job_id": job_id}
             job = _admin_print_job_from_row(row)
             if (
-                current_event_name != TECHNICAL_EVENT_NAME
+                not cafe_mode
                 or job["event_name"] != current_event_name
             ):
                 return {
@@ -642,6 +642,7 @@ async def reject_print_job_by_admin(
     *,
     job_id: str | uuid.UUID,
     current_event_name: str,
+    cafe_mode: bool,
 ) -> dict:
     """Reject one pending Cafe job with a compare-and-set transition."""
     job_id = _uuid_text(job_id, "job_id")
@@ -658,7 +659,7 @@ async def reject_print_job_by_admin(
                         close_reason = 'cashier_rejected'
                     WHERE id = %s
                       AND event_name = %s
-                      AND %s = 'Кафе'
+                      AND %s = TRUE
                       AND status = 'awaiting_authorization'
                     RETURNING *
                 )
@@ -680,7 +681,7 @@ async def reject_print_job_by_admin(
                 FROM changed
                 JOIN bot_users ON bot_users.id = changed.user_id
                 """,
-                (job_id, current_event_name, current_event_name),
+                (job_id, current_event_name, cafe_mode),
             )
             row = await cursor.fetchone()
             if row is not None:
@@ -714,7 +715,7 @@ async def reject_print_job_by_admin(
                 return {"outcome": "not_found", "job_id": job_id}
             job = _admin_print_job_from_row(row)
             if (
-                current_event_name != TECHNICAL_EVENT_NAME
+                not cafe_mode
                 or job["event_name"] != current_event_name
             ):
                 return {
