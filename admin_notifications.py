@@ -157,7 +157,7 @@ def print_approval_keyboard(provider: str, job_id: str) -> dict:
             "buttons": [[
                 {
                     "action": {
-                        "type": "text",
+                        "type": "callback",
                         "label": label,
                         "payload": json.dumps(
                             {
@@ -213,22 +213,9 @@ async def send_print_approval(
     )
 
 
-async def send_admin_text(
-    text: str,
-    *,
-    exclude_target: ReplyTarget | None = None,
-) -> AdminBroadcastDelivery:
-    """Send a status to all configured admins except an already updated one."""
-    excluded = (
-        ReplyTarget.from_value(exclude_target)
-        if exclude_target is not None
-        else None
-    )
-    targets = tuple(
-        target
-        for target in configured_admin_targets()
-        if target != excluded
-    )
+async def send_admin_text(text: str) -> AdminBroadcastDelivery:
+    """Send one final status to every configured administrator."""
+    targets = configured_admin_targets()
     results = await asyncio.gather(*(_send_text(target, text) for target in targets))
     return AdminBroadcastDelivery(
         delivered_targets=tuple(

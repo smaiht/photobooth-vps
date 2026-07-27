@@ -32,6 +32,19 @@ _user_profile_cache: OrderedDict[
 ] = OrderedDict()
 
 
+def peek_cached_user_profile(user_id: int) -> dict[str, str | None] | None:
+    """Return a fresh cached profile without delaying a button callback."""
+    cached = _user_profile_cache.get(user_id)
+    if cached is None:
+        return None
+    expires_at, profile = cached
+    if expires_at <= time.monotonic():
+        del _user_profile_cache[user_id]
+        return None
+    _user_profile_cache.move_to_end(user_id)
+    return dict(profile)
+
+
 def incoming_private_message(update: dict) -> dict | None:
     """Return an incoming direct VK message, ignoring chats and bot output."""
     if not isinstance(update, dict) or update.get("type") != "message_new":
@@ -57,6 +70,34 @@ def incoming_private_message(update: dict) -> dict | None:
     return message
 
 
+def incoming_private_event(update: dict) -> dict | None:
+    """Return one callback-button event from a private VK conversation."""
+    if not isinstance(update, dict) or update.get("type") != "message_event":
+        return None
+    event = update.get("object")
+    if not isinstance(event, dict):
+        return None
+    user_id = event.get("user_id")
+    peer_id = event.get("peer_id")
+    cmid = event.get("conversation_message_id")
+    event_id = event.get("event_id")
+    if (
+        not isinstance(user_id, int)
+        or isinstance(user_id, bool)
+        or user_id <= 0
+        or not isinstance(peer_id, int)
+        or isinstance(peer_id, bool)
+        or peer_id != user_id
+        or not isinstance(cmid, int)
+        or isinstance(cmid, bool)
+        or cmid <= 0
+        or not isinstance(event_id, str)
+        or not event_id
+    ):
+        return None
+    return event
+
+
 def provider_update_id(update: dict, message: dict) -> str | None:
     event_id = update.get("event_id")
     if event_id is not None and str(event_id).strip():
@@ -69,19 +110,21 @@ def provider_update_id(update: dict, message: dict) -> str | None:
     return f"message:{peer_id}:{message_id}"
 
 
+def event_update_id(update: dict, event: dict) -> str:
+    update_id = update.get("event_id")
+    if update_id is not None and str(update_id).strip():
+        return str(update_id)
+    return f"message_event:{event['event_id']}"
+
+
 async def cached_user_profile(
     session: aiohttp.ClientSession,
     user_id: int,
 ) -> dict[str, str | None]:
     """Resolve a VK profile best-effort and avoid one API call per button."""
-    now = time.monotonic()
-    cached = _user_profile_cache.get(user_id)
+    cached = peek_cached_user_profile(user_id)
     if cached is not None:
-        expires_at, profile = cached
-        if expires_at > now:
-            _user_profile_cache.move_to_end(user_id)
-            return dict(profile)
-        del _user_profile_cache[user_id]
+        return cached
 
     try:
         profile = await vk_api.get_user_profile(session, user_id)
@@ -94,7 +137,7 @@ async def cached_user_profile(
         return {}
 
     _user_profile_cache[user_id] = (
-        now + USER_PROFILE_CACHE_TTL_SECONDS,
+        time.monotonic() + USER_PROFILE_CACHE_TTL_SECONDS,
         dict(profile),
     )
     _user_profile_cache.move_to_end(user_id)
@@ -193,8 +236,7 @@ async def route_message_update(
     if started:
         await reply_for_current_event(session, message)
 
-    # VK keyboard text buttons are regular message_new updates. Route their
-    # signed job payload before treating visible button labels as commands.
+    # Keep routing old text-button cards until all pre-deployment cards expire.
     if await vk_print.handle_action(session, message, profile=profile):
         return
     if await vk_print.handle_message(session, message, profile=profile):
@@ -219,6 +261,34 @@ async def route_message_update(
     await reply_for_current_event(session, message)
 
 
+async def route_message_event(
+    session: aiohttp.ClientSession,
+    event: dict,
+) -> None:
+    # Names were stored when the photo/message arrived. A callback must not
+    # wait for an extra users.get request; a cached profile is only a bonus.
+    profile = peek_cached_user_profile(event["user_id"]) or {}
+    if not await vk_print.handle_event(session, event, profile=profile):
+        log.warning(
+            "VK ignored unknown message_event user=%s cmid=%s",
+            event["user_id"],
+            event["conversation_message_id"],
+        )
+        try:
+            await vk_api.answer_message_event(
+                session,
+                event_id=event["event_id"],
+                user_id=event["user_id"],
+                peer_id=event["peer_id"],
+                text="Кнопка устарела или больше неактивна",
+            )
+        except Exception:
+            log.exception(
+                "Could not acknowledge unknown VK message_event user=%s",
+                event["user_id"],
+            )
+
+
 async def process_update_batch(
     session: aiohttp.ClientSession,
     updates: list,
@@ -227,14 +297,23 @@ async def process_update_batch(
     """Process a redeliverable VK batch without repeating completed updates."""
     for update in updates:
         message = incoming_private_message(update)
-        if message is None:
+        if message is not None:
+            update_id = provider_update_id(update, message)
+            if update_id is not None and update_id in completed_update_ids:
+                continue
+            await route_message_update(session, update, message)
+            if update_id is not None:
+                completed_update_ids.add(update_id)
             continue
-        update_id = provider_update_id(update, message)
-        if update_id is not None and update_id in completed_update_ids:
+
+        event = incoming_private_event(update)
+        if event is None:
             continue
-        await route_message_update(session, update, message)
-        if update_id is not None:
-            completed_update_ids.add(update_id)
+        update_id = event_update_id(update, event)
+        if update_id in completed_update_ids:
+            continue
+        await route_message_event(session, event)
+        completed_update_ids.add(update_id)
 
 
 async def poll_messages() -> None:

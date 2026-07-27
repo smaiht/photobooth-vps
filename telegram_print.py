@@ -193,12 +193,21 @@ class TelegramPrintUI:
         message = callback.get("message") or {}
         message_id = message.get("message_id")
         if isinstance(message_id, int):
+            caption = str(message.get("caption") or "").strip()
+            raw_entities = message.get("caption_entities")
+            entities = (
+                raw_entities
+                if isinstance(raw_entities, list)
+                and all(isinstance(item, dict) for item in raw_entities)
+                else None
+            )
             await telegram_api.edit_print_caption(
                 self.session,
                 self.base,
                 action.user.conversation_id,
                 message_id,
-                text,
+                _caption_with_status(caption, text),
+                caption_entities=entities,
             )
 
     async def update_admin(

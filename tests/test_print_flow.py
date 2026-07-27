@@ -148,6 +148,15 @@ class SharedPrintFlowTests(unittest.IsolatedAsyncioTestCase):
         owner = user("telegram")
         incoming, download = upload(owner)
         ui = FakeUI()
+
+        async def download_after_status():
+            ui.send_text.assert_awaited_once_with(
+                owner,
+                "⏳ Ваше фото обрабатывается, подождите немного…",
+            )
+            return image_payload((1000, 1000))
+
+        download.side_effect = download_after_status
         job_id = "a" * 32
         with TemporaryDirectory() as tmpdir, patch.object(
             print_jobs,
@@ -169,6 +178,10 @@ class SharedPrintFlowTests(unittest.IsolatedAsyncioTestCase):
         download.assert_awaited_once()
         submit.assert_not_awaited()
         ui.send_choice.assert_awaited_once()
+        ui.send_text.assert_awaited_once_with(
+            owner,
+            "⏳ Ваше фото обрабатывается, подождите немного…",
+        )
         self.awaiting_choice.assert_awaited_once_with(
             job_id=job_id,
             choice_message_id=501,
@@ -220,7 +233,19 @@ class SharedPrintFlowTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(kwargs["reply_target"], ReplyTarget("vk", 321))
         self.assertEqual(kwargs["metadata"]["provider"], "vk")
         self.assertEqual(kwargs["metadata"]["print_mode"], "fit")
-        self.assertIn("передано на печать", ui.send_text.await_args.args[1])
+        self.assertEqual(
+            ui.send_text.await_args_list,
+            [
+                call(
+                    owner,
+                    "⏳ Ваше фото обрабатывается, подождите немного…",
+                ),
+                call(
+                    owner,
+                    "✅ Ваше фото добавлено в очередь и скоро будет распечатано.",
+                ),
+            ],
+        )
 
     async def test_vk_guest_access_uses_vk_identity_and_event_token(self):
         owner = user("vk", 456, allowlisted=False)
@@ -279,6 +304,14 @@ class SharedPrintFlowTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(
             submit.await_args.kwargs["metadata"]["print_choice"],
             "vk_button",
+        )
+        ui.update_choice.assert_awaited_once_with(
+            action,
+            "✅ Выбрано: увеличить под размер, края обрежутся.",
+        )
+        ui.send_text.assert_awaited_once_with(
+            owner,
+            "✅ Ваше фото добавлено в очередь и скоро будет распечатано.",
         )
 
     async def test_choice_is_rejected_for_another_user(self):
@@ -352,7 +385,16 @@ class SharedPrintFlowTests(unittest.IsolatedAsyncioTestCase):
             "VK ID: <code>777</code>",
             self.send_approval.await_args.kwargs["telegram_caption"],
         )
+        self.assertNotIn(
+            "Файл:",
+            self.send_approval.await_args.kwargs["telegram_caption"],
+        )
         self.assertEqual(metadata["pending_status"], "awaiting_authorization")
+        ui.update_choice.assert_awaited_once_with(
+            action,
+            "✅ Выбрано: увеличить под размер, края обрежутся.",
+        )
+        ui.send_text.assert_awaited_once()
         self.assertIn("Оплатите", ui.send_text.await_args.args[1])
         self.fail_job.assert_not_awaited()
 
@@ -544,21 +586,42 @@ class SharedPrintFlowTests(unittest.IsolatedAsyncioTestCase):
             print_flow.messenger_delivery,
             "send_text",
             AsyncMock(return_value=True),
-        ) as notify:
-            print_jobs.save_pending(job_id, ".jpg", b"image", {"sender_id": 321})
+        ) as notify, patch.object(
+            print_flow,
+            "submit_print_job",
+            new_callable=AsyncMock,
+        ) as submit:
+            print_jobs.save_pending(
+                job_id,
+                ".jpg",
+                b"image",
+                {
+                    "provider": "vk",
+                    "sender_id": 321,
+                    "sender_name": "Алёна Ёлкина",
+                    "username": "foto_guest",
+                    "event_folder": "Кафе",
+                },
+            )
             self.assertTrue(await print_flow.handle_admin_action(action, ui))
             self.assertFalse((Path(tmpdir) / job_id).exists())
 
+        submit.assert_not_awaited()
         notify.assert_awaited_once_with(
             ReplyTarget("vk", 321),
             "❌ Печать фотографии отклонена администратором.",
         )
-        status = ui.update_admin.await_args.args[1]
-        self.assertIn("отклонена", status)
-        self.send_admin_status.assert_awaited_once_with(
-            status,
-            exclude_target=ReplyTarget("vk", 556972284),
+        ui.update_admin.assert_awaited_once_with(
+            action,
+            "🚫 Решение администратора: печать отклонена.",
         )
+        self.send_admin_status.assert_awaited_once()
+        final_status = self.send_admin_status.await_args.args[0]
+        self.assertIn("Мероприятие: «Кафе»", final_status)
+        self.assertIn(f"Job: {job_id}", final_status)
+        self.assertIn("Пользователь: Алёна Ёлкина (@foto_guest)", final_status)
+        self.assertIn("VK ID: 321", final_status)
+        self.assertNotIn("Файл:", final_status)
 
     async def test_admin_approval_dispatches_in_background_to_original_provider(self):
         print_flow.event_access.current_event.return_value = ("Кафе", None, True)
@@ -570,6 +633,10 @@ class SharedPrintFlowTests(unittest.IsolatedAsyncioTestCase):
             "conversation_id": "4321",
             "provider_user_id": "4321",
             "print_mode": "fit",
+            "event_name": "Кафе",
+            "username": "vk_guest",
+            "first_name": "Иван",
+            "last_name": "Иванов",
         }
         authorize = AsyncMock(return_value=result)
         started_patch = patch.object(
@@ -618,6 +685,12 @@ class SharedPrintFlowTests(unittest.IsolatedAsyncioTestCase):
             )
             self.assertTrue(await print_flow.handle_admin_action(action, ui))
             await asyncio.wait_for(submit_started.wait(), timeout=1)
+            ui.update_admin.assert_awaited_once_with(
+                action,
+                "✅ Решение администратора: печать разрешена.",
+            )
+            notify.assert_not_awaited()
+            self.send_admin_status.assert_not_awaited()
             tasks = tuple(print_flow._background_tasks)
             self.assertEqual(len(tasks), 1)
             release_submit.set()
@@ -628,22 +701,103 @@ class SharedPrintFlowTests(unittest.IsolatedAsyncioTestCase):
             dispatch.await_args.kwargs["reply_target"],
             ReplyTarget("vk", 4321),
         )
-        self.assertEqual(
-            notify.await_args_list[0],
-            call(
-                ReplyTarget("vk", 4321),
-                "✅ Оплата подтверждена. Ваше фото добавлено в очередь "
-                "и скоро будет распечатано.",
-            ),
+        notify.assert_awaited_once_with(
+            ReplyTarget("vk", 4321),
+            "✅ Оплата подтверждена. Ваше фото добавлено в очередь "
+            "и скоро будет распечатано.",
         )
-        self.assertIn("передана", ui.update_admin.await_args.args[1])
+        self.send_admin_status.assert_awaited_once()
+        final_status = self.send_admin_status.await_args.args[0]
+        self.assertIn("✅ Фото отправлено на печать.", final_status)
+        self.assertIn("Мероприятие: «Кафе»", final_status)
+        self.assertIn(f"Job: {job_id}", final_status)
+        self.assertIn("Пользователь: Иван Иванов (@vk_guest)", final_status)
+        self.assertIn("VK ID: 4321", final_status)
+        self.assertNotIn("Файл:", final_status)
+
+    async def test_admin_dispatch_error_sends_one_final_status_to_both(self):
+        print_flow.event_access.current_event.return_value = ("Кафе", None, True)
+        job_id = "5" * 32
+        result = {
+            "outcome": "authorized",
+            "job_id": job_id,
+            "provider": "telegram",
+            "conversation_id": "123",
+            "provider_user_id": "123",
+            "print_mode": "fill",
+            "event_name": "Кафе",
+            "first_name": "Анна",
+            "last_name": "Петрова",
+        }
+        action = print_flow.PrintAction(
+            user=user("vk", 556972284, is_admin=True),
+            action="approve",
+            job_id=job_id,
+        )
+        ui = FakeUI()
+        with TemporaryDirectory() as tmpdir, patch.object(
+            print_jobs,
+            "PENDING_ROOT",
+            Path(tmpdir),
+        ), patch.object(
+            print_flow.database,
+            "authorize_print_job_by_admin",
+            AsyncMock(return_value=result),
+        ), patch.object(
+            print_flow,
+            "submit_print_job",
+            AsyncMock(side_effect=RuntimeError("Диск временно недоступен")),
+        ), patch.object(
+            print_flow.messenger_delivery,
+            "send_text",
+            AsyncMock(return_value=True),
+        ) as notify, patch.object(print_flow.log, "exception"):
+            print_jobs.save_pending(
+                job_id,
+                ".jpg",
+                image_payload((1000, 1000)),
+                {
+                    "provider": "telegram",
+                    "sender_id": 123,
+                    "event_folder": "Кафе",
+                    "print_mode": "fill",
+                },
+            )
+            self.assertTrue(await print_flow.handle_admin_action(action, ui))
+            tasks = tuple(print_flow._background_tasks)
+            await asyncio.wait_for(asyncio.gather(*tasks), timeout=1)
+
+        ui.update_admin.assert_awaited_once_with(
+            action,
+            "✅ Решение администратора: печать разрешена.",
+        )
+        notify.assert_awaited_once_with(
+            ReplyTarget("telegram", 123),
+            "❌ Не удалось передать фото на печать. "
+            "Обратитесь к администратору.",
+        )
+        self.send_admin_status.assert_awaited_once()
+        final_status = self.send_admin_status.await_args.args[0]
+        self.assertIn("❌ Ошибка передачи на печать", final_status)
+        self.assertIn(f"Job: {job_id}", final_status)
+        self.assertIn("Пользователь: Анна Петрова", final_status)
 
 
 class PrintSubmissionTests(unittest.IsolatedAsyncioTestCase):
-    async def test_publishes_provider_target_and_archives_after_command(self):
+    def setUp(self):
+        print_flow._background_tasks.clear()
+
+    async def test_publishes_then_archives_without_blocking_statuses(self):
         command_id = "6" * 32
         target = ReplyTarget("vk", 123)
         metadata = {"event_folder": "event", "print_mode": "fit"}
+        archive_started = asyncio.Event()
+        release_archive = asyncio.Event()
+
+        async def archive_copy(**_kwargs):
+            archive_started.set()
+            await release_archive.wait()
+
         with patch.object(
             print_flow.yadisk_poll,
             "store_print_job",
@@ -662,7 +816,7 @@ class PrintSubmissionTests(unittest.IsolatedAsyncioTestCase):
         ) as send, patch.object(
             print_flow.telegram_print_archive,
             "send",
-            new_callable=AsyncMock,
+            AsyncMock(side_effect=archive_copy),
         ) as archive, patch.object(print_flow.uuid, "uuid4") as uuid4:
             uuid4.return_value.hex = command_id
             result = await print_flow.submit_print_job(
@@ -673,6 +827,12 @@ class PrintSubmissionTests(unittest.IsolatedAsyncioTestCase):
                 metadata=metadata,
                 reply_target=target,
             )
+            await asyncio.wait_for(archive_started.wait(), timeout=1)
+            tasks = tuple(print_flow._background_tasks)
+            self.assertEqual(len(tasks), 1)
+            self.assertFalse(tasks[0].done())
+            release_archive.set()
+            await asyncio.wait_for(asyncio.gather(*tasks), timeout=1)
 
         self.assertEqual(result, command_id)
         store.assert_awaited_once()

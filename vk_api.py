@@ -228,6 +228,8 @@ async def validate_long_poll(
     events = settings.get("events")
     if not isinstance(events, dict) or events.get("message_new") not in (1, True):
         raise VkApiError("событие message_new выключено в Bots Long Poll")
+    if events.get("message_event") not in (1, True):
+        raise VkApiError("событие message_event выключено в Bots Long Poll")
 
 
 async def get_long_poll_server(
@@ -339,6 +341,135 @@ async def _send_message(
         return message_id
 
     return await _retry("messages.send", send_once)
+
+
+def extract_message(response: Any, conversation_message_id: int) -> dict:
+    items = response.get("items") if isinstance(response, dict) else None
+    if not isinstance(items, list):
+        raise VkApiError(
+            "VK API messages.getByConversationMessageId вернул неожиданный ответ"
+        )
+    for message in items:
+        if (
+            isinstance(message, dict)
+            and message.get("conversation_message_id") == conversation_message_id
+        ):
+            return message
+    raise VkApiError("VK API не вернул редактируемое сообщение")
+
+
+async def get_message_by_cmid(
+    session: aiohttp.ClientSession,
+    peer_id: int,
+    conversation_message_id: int,
+) -> dict:
+    async def fetch_once() -> dict:
+        response = await api_call(
+            session,
+            "messages.getByConversationMessageId",
+            peer_id=peer_id,
+            conversation_message_ids=str(conversation_message_id),
+        )
+        return extract_message(response, conversation_message_id)
+
+    return await _retry("messages.getByConversationMessageId", fetch_once)
+
+
+def message_attachment_refs(message: dict) -> str | None:
+    """Return reusable attachment references from a VK message object."""
+    references: list[str] = []
+    attachments = message.get("attachments")
+    if not isinstance(attachments, list):
+        return None
+    for attachment in attachments:
+        if not isinstance(attachment, dict):
+            continue
+        kind = attachment.get("type")
+        media = attachment.get(kind) if isinstance(kind, str) else None
+        if kind not in {"photo", "doc", "video", "audio"} or not isinstance(
+            media,
+            dict,
+        ):
+            continue
+        owner_id = media.get("owner_id")
+        media_id = media.get("id")
+        if (
+            not isinstance(owner_id, int)
+            or isinstance(owner_id, bool)
+            or not isinstance(media_id, int)
+            or isinstance(media_id, bool)
+        ):
+            continue
+        reference = f"{kind}{owner_id}_{media_id}"
+        access_key = media.get("access_key")
+        if isinstance(access_key, str) and access_key:
+            reference += f"_{access_key}"
+        references.append(reference)
+    return ",".join(references) or None
+
+
+async def edit_message(
+    session: aiohttp.ClientSession,
+    peer_id: int,
+    conversation_message_id: int,
+    text: str,
+    *,
+    attachment: str | None = None,
+) -> None:
+    params: dict[str, Any] = {
+        "peer_id": peer_id,
+        "cmid": conversation_message_id,
+        "message": text,
+        "keyboard": json.dumps(
+            {"buttons": []},
+            ensure_ascii=False,
+            separators=(",", ":"),
+        ),
+    }
+    if attachment:
+        params["attachment"] = attachment
+
+    async def edit_once() -> None:
+        response = await api_call(session, "messages.edit", **params)
+        if response not in (1, True):
+            raise VkApiError(
+                "VK API messages.edit не подтвердил редактирование",
+                retryable=True,
+            )
+
+    await _retry("messages.edit", edit_once)
+
+
+async def answer_message_event(
+    session: aiohttp.ClientSession,
+    *,
+    event_id: str,
+    user_id: int,
+    peer_id: int,
+    text: str,
+) -> None:
+    event_data = json.dumps(
+        {"type": "show_snackbar", "text": str(text or "")[:90]},
+        ensure_ascii=False,
+        separators=(",", ":"),
+    )
+
+    async def answer_once() -> None:
+        response = await api_call(
+            session,
+            "messages.sendMessageEventAnswer",
+            event_id=event_id,
+            user_id=user_id,
+            peer_id=peer_id,
+            event_data=event_data,
+        )
+        if response not in (1, True):
+            raise VkApiError(
+                "VK API не подтвердил callback-ответ",
+                retryable=True,
+            )
+
+    await _retry("messages.sendMessageEventAnswer", answer_once)
 
 
 def photo_attachment(saved_photo: Any) -> str:

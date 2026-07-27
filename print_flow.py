@@ -176,19 +176,64 @@ def admin_request_text(
     *,
     telegram_html: bool = False,
 ) -> str:
-    event_label = event_access.TECHNICAL_EVENT_NAME
+    event_label = str(
+        metadata.get("event_folder") or event_access.TECHNICAL_EVENT_NAME
+    )
     if telegram_html:
         return (
             f"<b>Новая печать в «{html.escape(event_label)}»</b>\n"
             f"Job: <code>{html.escape(job_id)}</code>\n"
             f"Выбор: <b>{html.escape(mode_text(mode))}</b>\n"
-            f"{print_media.sender_caption(metadata, telegram_html=True)}"
+            f"{print_media.sender_caption(metadata, telegram_html=True, include_filename=False)}"
         )
     return (
         f"Новая печать в «{event_label}»\n"
         f"Job: {job_id}\n"
         f"Выбор: {mode_text(mode)}\n"
-        f"{print_media.sender_caption(metadata)}"
+        f"{print_media.sender_caption(metadata, include_filename=False)}"
+    )
+
+
+def _admin_result_metadata(result: dict, metadata: dict | None = None) -> dict:
+    source = dict(metadata or {})
+    first_name = str(result.get("first_name") or "").strip()
+    last_name = str(result.get("last_name") or "").strip()
+    result_name = " ".join(part for part in (first_name, last_name) if part)
+    if result_name:
+        source["sender_name"] = result_name
+    source["provider"] = str(
+        result.get("provider") or source.get("provider") or "messenger"
+    )
+    source["sender_id"] = (
+        result.get("provider_user_id")
+        or result.get("user_provider_user_id")
+        or source.get("sender_id")
+        or "—"
+    )
+    if result.get("username"):
+        source["username"] = result["username"]
+    return source
+
+
+def admin_job_result_text(
+    result: dict,
+    status: str,
+    *,
+    metadata: dict | None = None,
+) -> str:
+    """Build one compact final job notification for every administrator."""
+    event_name = str(
+        result.get("event_name")
+        or (metadata or {}).get("event_folder")
+        or "—"
+    )
+    job_id = str(result.get("job_id") or (metadata or {}).get("job_id") or "—")
+    sender = _admin_result_metadata(result, metadata)
+    return (
+        f"{status}\n"
+        f"Мероприятие: «{event_name}»\n"
+        f"Job: {job_id}\n"
+        f"{print_media.sender_caption(sender, include_filename=False)}"
     )
 
 
@@ -396,17 +441,24 @@ async def submit_print_job(
         raise RuntimeError("Диск вернул неверный ID команды")
 
     try:
-        await telegram_print_archive.send(
-            job_id=job_id,
-            payload=payload,
-            metadata=metadata,
-            source_target=reply_target,
-            mode_label=mode_text(str(metadata.get("print_mode") or "")),
-        )
+        mode_label = mode_text(str(metadata.get("print_mode") or ""))
     except Exception:
-        # The command is already durable on Disk; archiving must not change
-        # the successful dispatch result, even with malformed old metadata.
+        # The command is already durable on Disk; malformed legacy metadata
+        # must not change the successful dispatch result.
         log.exception("Could not prepare print archive copy job=%s", job_id)
+    else:
+        # The Telegram archive is best effort. Do not make the user or the
+        # administrators wait for another messenger after the booth command
+        # has already been published successfully.
+        _start_background(
+            telegram_print_archive.send(
+                job_id=job_id,
+                payload=payload,
+                metadata=metadata,
+                source_target=reply_target,
+                mode_label=mode_label,
+            )
+        )
     return command_id
 
 
@@ -542,8 +594,7 @@ async def handle_upload(upload: PrintUpload, ui: PrintUI) -> bool:
             await _safe_send_text(
                 ui,
                 user,
-                "⏳ Фото подходит под формат "
-                f"{print_media.PRINT_FORMAT_LABEL} и передано на печать",
+                "✅ Ваше фото добавлено в очередь и скоро будет распечатано.",
             )
             log.info(
                 "%s print job sent without choice job=%s user=%s command=%s",
@@ -763,6 +814,7 @@ async def handle_choice(action: PrintAction, ui: PrintUI) -> bool:
                 else "Задание уже обрабатывается или передано на печать."
             )
             await _safe_ack(ui, action, text)
+            await _safe_choice_update(ui, action, f"ℹ️ {text}")
             return True
 
         selected_text = mode_text(action.action)
@@ -813,11 +865,11 @@ async def handle_choice(action: PrintAction, ui: PrintUI) -> bool:
             )
             return True
 
-        await _safe_ack(ui, action, "Принято, отправляю на печать")
+        await _safe_ack(ui, action, "Вариант сохранён")
         await _safe_choice_update(
             ui,
             action,
-            f"✅ Выбрано: {selected_text}.\n⏳ Передаём на печать…",
+            f"✅ Выбрано: {selected_text}.",
         )
         try:
             payload, _metadata_value = await asyncio.to_thread(
@@ -850,10 +902,10 @@ async def handle_choice(action: PrintAction, ui: PrintUI) -> bool:
             )
             return True
 
-        await _safe_choice_update(
+        await _safe_send_text(
             ui,
-            action,
-            f"✅ Выбрано: {selected_text}. Фото передано на печать.",
+            user,
+            "✅ Ваше фото добавлено в очередь и скоро будет распечатано.",
         )
         await _delete_pending(job_id)
         log.info(
@@ -890,7 +942,7 @@ async def _notify_target(result: dict, text: str) -> None:
         log.exception("Could not notify print user job=%s", result.get("job_id"))
 
 
-async def _update_admins(
+async def _update_admin_card(
     ui: PrintUI,
     action: PrintAction,
     status: str,
@@ -899,26 +951,41 @@ async def _update_admins(
         await ui.update_admin(action, status)
     except Exception:
         log.exception("Could not update origin admin request job=%s", action.job_id)
+
+
+async def _notify_admins(text: str, *, job_id: str) -> None:
     try:
-        await admin_notifications.send_admin_text(
-            status,
-            exclude_target=action.user.target,
-        )
+        delivery = await admin_notifications.send_admin_text(text)
+        if delivery.failed_targets:
+            log.warning(
+                "Admin final status delivered only partially job=%s failed=%s",
+                job_id,
+                ",".join(target.provider for target in delivery.failed_targets),
+            )
     except Exception:
-        log.exception("Could not mirror admin status job=%s", action.job_id)
+        log.exception("Could not broadcast final admin status job=%s", job_id)
 
 
-async def _dispatch_admin_approved(
-    action: PrintAction,
-    result: dict,
-    ui: PrintUI,
-) -> None:
-    job_id = action.job_id
-    await _notify_target(
-        result,
-        "✅ Оплата подтверждена. Ваше фото добавлено в очередь "
-        "и скоро будет распечатано.",
-    )
+async def _load_pending_metadata(job_id: str) -> dict | None:
+    """Best-effort metadata fallback for complete final admin messages."""
+    try:
+        _payload, metadata = await asyncio.to_thread(print_jobs.load_pending, job_id)
+    except FileNotFoundError:
+        return None
+    except Exception:
+        log.exception("Could not load pending print metadata job=%s", job_id)
+        return None
+    return metadata
+
+
+def _error_summary(error: Exception | str, *, limit: int = 300) -> str:
+    value = " ".join(str(error).split()) or type(error).__name__
+    return value if len(value) <= limit else f"{value[:limit - 1]}…"
+
+
+async def _dispatch_admin_approved(result: dict) -> None:
+    job_id = str(result["job_id"])
+    metadata: dict | None = None
     try:
         payload, metadata = await asyncio.to_thread(print_jobs.load_pending, job_id)
         mode = str(result.get("print_mode") or metadata.get("print_mode") or "")
@@ -949,24 +1016,38 @@ async def _dispatch_admin_approved(
     except Exception as exc:
         log.exception("Could not submit admin-approved print job=%s", job_id)
         await _fail_before_dispatch(job_id, exc)
-        await _update_admins(
-            ui,
-            action,
-            f"❌ Job {job_id}: печать разрешена, но команда на будку "
-            f"не отправлена: {exc}",
-        )
-        await _notify_target(
-            result,
-            "❌ Не удалось передать фото на печать. "
-            "Обратитесь к администратору.",
+        await asyncio.gather(
+            _notify_target(
+                result,
+                "❌ Не удалось передать фото на печать. "
+                "Обратитесь к администратору.",
+            ),
+            _notify_admins(
+                admin_job_result_text(
+                    result,
+                    f"❌ Ошибка передачи на печать: {_error_summary(exc)}",
+                    metadata=metadata,
+                ),
+                job_id=job_id,
+            ),
         )
         return
 
-    await _delete_pending(job_id)
-    await _update_admins(
-        ui,
-        action,
-        "✅ Печать разрешена и передана на будку.",
+    await asyncio.gather(
+        _delete_pending(job_id),
+        _notify_target(
+            result,
+            "✅ Оплата подтверждена. Ваше фото добавлено в очередь "
+            "и скоро будет распечатано.",
+        ),
+        _notify_admins(
+            admin_job_result_text(
+                result,
+                "✅ Фото отправлено на печать.",
+                metadata=metadata,
+            ),
+            job_id=job_id,
+        ),
     )
     log.info(
         "Admin approved print job=%s provider=%s user=%s command=%s",
@@ -1044,29 +1125,47 @@ async def handle_admin_action(action: PrintAction, ui: PrintUI) -> bool:
                 "Задание уже обработано или мероприятие изменилось.",
                 alert=True,
             )
+            await _update_admin_card(
+                ui,
+                action,
+                "ℹ️ Задание уже обработано другим администратором.",
+            )
             return True
 
         if action.action == "reject":
             await _safe_ack(ui, action, "Печать отклонена")
-            await _update_admins(
+            metadata = await _load_pending_metadata(job_id)
+            await _update_admin_card(
                 ui,
                 action,
-                "🚫 Печать отклонена администратором.",
+                "🚫 Решение администратора: печать отклонена.",
             )
-            await _delete_pending(job_id)
-            await _notify_target(
-                result,
-                "❌ Печать фотографии отклонена администратором.",
+            await asyncio.gather(
+                _delete_pending(job_id),
+                _notify_target(
+                    result,
+                    "❌ Печать фотографии отклонена администратором.",
+                ),
+                _notify_admins(
+                    admin_job_result_text(
+                        result,
+                        "🚫 Печать отклонена администратором.",
+                        metadata=metadata,
+                    ),
+                    job_id=job_id,
+                ),
             )
             return True
 
-        await _safe_ack(ui, action, "Печать разрешена, передаю на будку")
-        await _update_admins(
+        await _safe_ack(ui, action, "Печать разрешена")
+        # Start the durable booth dispatch immediately after the database CAS;
+        # editing the administrator's messenger card can happen in parallel.
+        _start_background(_dispatch_admin_approved(result))
+        await _update_admin_card(
             ui,
             action,
-            "⏳ Печать разрешена. Добавляю фото в очередь…",
+            "✅ Решение администратора: печать разрешена.",
         )
-        _start_background(_dispatch_admin_approved(action, result, ui))
         return True
     finally:
         _actions_in_progress.discard(job_id)

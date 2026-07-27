@@ -232,7 +232,7 @@ def _choice_keyboard(job_id: str) -> dict:
             [
                 {
                     "action": {
-                        "type": "text",
+                        "type": "callback",
                         "label": print_flow.PRINT_CHOICE_LABELS["fit"],
                         "payload": _payload("print_choice", "fit", job_id),
                     },
@@ -240,7 +240,7 @@ def _choice_keyboard(job_id: str) -> dict:
                 },
                 {
                     "action": {
-                        "type": "text",
+                        "type": "callback",
                         "label": print_flow.PRINT_CHOICE_LABELS["fill"],
                         "payload": _payload("print_choice", "fill", job_id),
                     },
@@ -249,7 +249,7 @@ def _choice_keyboard(job_id: str) -> dict:
             ],
             [{
                 "action": {
-                    "type": "text",
+                    "type": "callback",
                     "label": print_flow.PRINT_CHOICE_LABELS["cancel"],
                     "payload": _payload("print_choice", "cancel", job_id),
                 },
@@ -295,8 +295,17 @@ class VkPrintUI:
         *,
         alert: bool = False,
     ) -> None:
-        # VK text buttons arrive as ordinary message_new events, so the reply
-        # itself is their acknowledgement. Durable DB transitions handle repeats.
+        event = action.context.get("vk_message_event")
+        if isinstance(event, dict):
+            await vk_api.answer_message_event(
+                self.session,
+                event_id=str(event["event_id"]),
+                user_id=int(event["user_id"]),
+                peer_id=int(event["peer_id"]),
+                text=text,
+            )
+            return
+        # Compatibility for cards sent before callback buttons were deployed.
         await vk_api.send_text(
             self.session,
             int(action.user.conversation_id),
@@ -308,28 +317,82 @@ class VkPrintUI:
         action: print_flow.PrintAction,
         text: str,
     ) -> None:
-        # The acknowledgement above is visible in VK. Keeping this a no-op
-        # avoids duplicate messages; stale buttons remain safe and idempotent.
-        return None
+        await self._edit_callback_card(action, text)
 
     async def update_admin(
         self,
         action: print_flow.PrintAction,
         status: str,
     ) -> None:
+        if await self._edit_callback_card(action, status):
+            return
+        # Compatibility for an old text-button action without the source cmid.
         await vk_api.send_text(
             self.session,
             int(action.user.conversation_id),
             status,
         )
 
+    async def _edit_callback_card(
+        self,
+        action: print_flow.PrintAction,
+        status: str,
+    ) -> bool:
+        event = action.context.get("vk_message_event")
+        if not isinstance(event, dict):
+            return False
+        peer_id = int(event["peer_id"])
+        cmid = int(event["conversation_message_id"])
+        message = await vk_api.get_message_by_cmid(self.session, peer_id, cmid)
+        caption = str(message.get("text") or "").strip()
+        edited_caption = f"{caption}\n\n{status}" if caption else status
+        await vk_api.edit_message(
+            self.session,
+            peer_id,
+            cmid,
+            edited_caption,
+            attachment=vk_api.message_attachment_refs(message),
+        )
+        return True
 
-def parse_action(
-    message: dict,
+
+def user_from_event(
+    event: dict,
     *,
     profile: dict[str, str | None] | None = None,
-) -> tuple[str, print_flow.PrintAction] | None:
-    raw_payload = message.get("payload")
+) -> print_flow.PrintUser:
+    user_id = event.get("user_id")
+    peer_id = event.get("peer_id")
+    cmid = event.get("conversation_message_id")
+    if (
+        not isinstance(user_id, int)
+        or isinstance(user_id, bool)
+        or user_id <= 0
+        or not isinstance(peer_id, int)
+        or isinstance(peer_id, bool)
+        or peer_id != user_id
+        or not isinstance(cmid, int)
+        or isinstance(cmid, bool)
+        or cmid <= 0
+    ):
+        raise ValueError("VK не передал корректный callback")
+    profile = profile if isinstance(profile, dict) else {}
+    admin = vk_api.is_admin(user_id)
+    return print_flow.PrintUser(
+        provider="vk",
+        provider_user_id=user_id,
+        conversation_id=peer_id,
+        source_message_id=cmid,
+        username=profile.get("username"),
+        first_name=profile.get("first_name"),
+        last_name=profile.get("last_name"),
+        allowlisted=admin,
+        is_admin=admin,
+        metadata={"vk_message_event_id": event.get("event_id")},
+    )
+
+
+def _action_payload(raw_payload) -> dict | None:
     if isinstance(raw_payload, str):
         try:
             payload = json.loads(raw_payload)
@@ -339,8 +402,10 @@ def parse_action(
         payload = raw_payload
     else:
         return None
-    if not isinstance(payload, dict):
-        return None
+    return payload if isinstance(payload, dict) else None
+
+
+def _action_parts(payload: dict) -> tuple[str, str, str] | None:
     kind = payload.get("type")
     action_name = payload.get("action")
     job_id = payload.get("job_id")
@@ -351,6 +416,21 @@ def parse_action(
     )
     if action_name not in allowed or not isinstance(job_id, str):
         return None
+    return str(kind), str(action_name), job_id
+
+
+def parse_action(
+    message: dict,
+    *,
+    profile: dict[str, str | None] | None = None,
+) -> tuple[str, print_flow.PrintAction] | None:
+    payload = _action_payload(message.get("payload"))
+    if payload is None:
+        return None
+    parts = _action_parts(payload)
+    if parts is None:
+        return None
+    kind, action_name, job_id = parts
     try:
         action = print_flow.PrintAction(
             user=user_from_message(message, profile=profile),
@@ -368,6 +448,31 @@ def parse_action(
     return str(kind), action
 
 
+def parse_event_action(
+    event: dict,
+    *,
+    profile: dict[str, str | None] | None = None,
+) -> tuple[str, print_flow.PrintAction] | None:
+    payload = _action_payload(event.get("payload"))
+    if payload is None:
+        return None
+    parts = _action_parts(payload)
+    if parts is None:
+        return None
+    kind, action_name, job_id = parts
+    try:
+        action = print_flow.PrintAction(
+            user=user_from_event(event, profile=profile),
+            action=action_name,
+            job_id=job_id,
+            action_id=str(event.get("event_id") or "") or None,
+            context={"vk_message_event": event},
+        )
+    except ValueError:
+        return None
+    return kind, action
+
+
 async def handle_action(
     session: aiohttp.ClientSession,
     message: dict,
@@ -375,6 +480,22 @@ async def handle_action(
     profile: dict[str, str | None] | None = None,
 ) -> bool:
     parsed = parse_action(message, profile=profile)
+    if parsed is None:
+        return False
+    kind, action = parsed
+    ui = VkPrintUI(session)
+    if kind == "print_choice":
+        return await print_flow.handle_choice(action, ui)
+    return await print_flow.handle_admin_action(action, ui)
+
+
+async def handle_event(
+    session: aiohttp.ClientSession,
+    event: dict,
+    *,
+    profile: dict[str, str | None] | None = None,
+) -> bool:
+    parsed = parse_event_action(event, profile=profile)
     if parsed is None:
         return False
     kind, action = parsed

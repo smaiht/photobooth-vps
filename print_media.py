@@ -49,7 +49,12 @@ def suffix_from_extension(extension: str | None) -> str | None:
     return IMAGE_FILE_SUFFIXES.get(value)
 
 
-def sender_caption(metadata: dict, *, telegram_html: bool = False) -> str:
+def sender_caption(
+    metadata: dict,
+    *,
+    telegram_html: bool = False,
+    include_filename: bool = True,
+) -> str:
     """Format normalized sender fields consistently in print notifications."""
     sender_name = str(metadata.get("sender_name") or "—")
     username = str(metadata.get("username") or "").strip().lstrip("@")
@@ -58,17 +63,21 @@ def sender_caption(metadata: dict, *, telegram_html: bool = False) -> str:
     filename = str(metadata.get("source_filename") or "photo.jpg")
     if telegram_html:
         username_line = f" (@{html.escape(username)})" if username else ""
-        return (
+        caption = (
             f"Пользователь: {html.escape(sender_name)}{username_line}\n"
-            f"{html.escape(provider)} ID: <code>{html.escape(sender_id)}</code>\n"
-            f"Файл: {html.escape(filename)}"
+            f"{html.escape(provider)} ID: <code>{html.escape(sender_id)}</code>"
+        )
+        return (
+            f"{caption}\nФайл: {html.escape(filename)}"
+            if include_filename
+            else caption
         )
     username_line = f" (@{username})" if username else ""
-    return (
+    caption = (
         f"Пользователь: {sender_name}{username_line}\n"
-        f"{provider} ID: {sender_id}\n"
-        f"Файл: {filename}"
+        f"{provider} ID: {sender_id}"
     )
+    return f"{caption}\nФайл: {filename}" if include_filename else caption
 
 
 def jpeg_preview(payload: bytes) -> bytes:

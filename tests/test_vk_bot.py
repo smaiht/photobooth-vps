@@ -93,6 +93,34 @@ class VkMessageShapeTests(unittest.TestCase):
         self.assertIsNone(vk_bot.incoming_private_message(outgoing))
         self.assertIsNone(vk_bot.incoming_private_message(chat))
 
+    def test_accepts_only_callback_events_from_private_conversations(self):
+        update = {
+            "type": "message_event",
+            "object": {
+                "event_id": "callback-event",
+                "user_id": 123,
+                "peer_id": 123,
+                "conversation_message_id": 77,
+                "payload": {"type": "print_choice"},
+            },
+        }
+
+        self.assertEqual(
+            vk_bot.incoming_private_event(update)["event_id"],
+            "callback-event",
+        )
+
+        group_chat = {
+            **update,
+            "object": {**update["object"], "peer_id": 2_000_000_001},
+        }
+        missing_event_id = {
+            **update,
+            "object": {**update["object"], "event_id": ""},
+        }
+        self.assertIsNone(vk_bot.incoming_private_event(group_chat))
+        self.assertIsNone(vk_bot.incoming_private_event(missing_event_id))
+
 
 class VkUserProfileTests(unittest.IsolatedAsyncioTestCase):
     def setUp(self):
@@ -214,6 +242,59 @@ class VkBatchReliabilityTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(calls, ["event-1", "event-2", "event-2"])
         self.assertEqual(completed, {"event-1", "event-2"})
 
+    async def test_callback_event_is_routed_once_without_profile_api_delay(self):
+        event = {
+            "event_id": "button-event",
+            "user_id": 123,
+            "peer_id": 123,
+            "conversation_message_id": 77,
+            "payload": {
+                "type": "print_choice",
+                "action": "fit",
+                "job_id": "a" * 32,
+            },
+        }
+        update = {"type": "message_event", "object": event}
+        completed = set()
+        vk_bot._user_profile_cache.clear()
+        with patch(
+            "vk_bot.vk_print.handle_event",
+            AsyncMock(return_value=True),
+        ) as handle, patch(
+            "vk_bot.cached_user_profile",
+            new_callable=AsyncMock,
+        ) as lookup:
+            await vk_bot.process_update_batch(object(), [update, update], completed)
+
+        handle.assert_awaited_once_with(ANY, event, profile={})
+        lookup.assert_not_awaited()
+        self.assertEqual(completed, {"message_event:button-event"})
+
+    async def test_unknown_callback_is_answered_without_chat_message(self):
+        event = {
+            "event_id": "unknown-event",
+            "user_id": 123,
+            "peer_id": 123,
+            "conversation_message_id": 77,
+            "payload": {"type": "unknown"},
+        }
+        with patch(
+            "vk_bot.vk_print.handle_event",
+            AsyncMock(return_value=False),
+        ), patch(
+            "vk_bot.vk_api.answer_message_event",
+            AsyncMock(),
+        ) as answer, self.assertLogs(vk_bot.log, level="WARNING"):
+            await vk_bot.route_message_event(object(), event)
+
+        answer.assert_awaited_once_with(
+            ANY,
+            event_id="unknown-event",
+            user_id=123,
+            peer_id=123,
+            text="Кнопка устарела или больше неактивна",
+        )
+
 
 class VkPrintAdapterTests(unittest.IsolatedAsyncioTestCase):
     def test_extracts_largest_photo_without_persisting_signed_url(self):
@@ -322,7 +403,29 @@ class VkPrintAdapterTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(action.job_id, job_id)
         self.assertEqual(action.user.target, ReplyTarget("vk", 123))
 
-    async def test_choice_card_contains_idempotent_text_button_payloads(self):
+    def test_parses_vk_callback_event_into_shared_action(self):
+        job_id = "b" * 32
+        event = {
+            "event_id": "callback-event",
+            "user_id": 123,
+            "peer_id": 123,
+            "conversation_message_id": 77,
+            "payload": {
+                "type": "print_choice",
+                "action": "fill",
+                "job_id": job_id,
+            },
+        }
+
+        kind, action = vk_print.parse_event_action(event)
+
+        self.assertEqual(kind, "print_choice")
+        self.assertEqual(action.action, "fill")
+        self.assertEqual(action.job_id, job_id)
+        self.assertEqual(action.action_id, "callback-event")
+        self.assertEqual(action.context["vk_message_event"], event)
+
+    async def test_choice_card_contains_callback_button_payloads(self):
         owner = print_flow.PrintUser(
             provider="vk",
             provider_user_id=123,
@@ -359,9 +462,15 @@ class VkPrintAdapterTests(unittest.IsolatedAsyncioTestCase):
             {json.loads(action["payload"])["action"] for action in actions},
             {"fit", "fill", "cancel"},
         )
-        self.assertTrue(all(action["type"] == "text" for action in actions))
+        self.assertTrue(all(action["type"] == "callback" for action in actions))
 
-    async def test_admin_status_uses_the_actual_action_conversation(self):
+    async def test_callback_ack_uses_snackbar_without_new_chat_message(self):
+        event = {
+            "event_id": "callback-event",
+            "user_id": 556972284,
+            "peer_id": 556972284,
+            "conversation_message_id": 77,
+        }
         action = print_flow.PrintAction(
             user=print_flow.PrintUser(
                 provider="vk",
@@ -371,20 +480,79 @@ class VkPrintAdapterTests(unittest.IsolatedAsyncioTestCase):
             ),
             action="approve",
             job_id="c" * 32,
+            context={"vk_message_event": event},
         )
         with patch(
+            "vk_print.vk_api.answer_message_event",
+            AsyncMock(),
+        ) as answer, patch(
             "vk_print.vk_api.send_text",
-            AsyncMock(return_value=42),
+            new_callable=AsyncMock,
         ) as send:
-            await vk_print.VkPrintUI(object()).update_admin(
+            await vk_print.VkPrintUI(object()).acknowledge(
                 action,
                 "Печать разрешена",
             )
 
-        send.assert_awaited_once_with(
+        answer.assert_awaited_once_with(
+            ANY,
+            event_id="callback-event",
+            user_id=556972284,
+            peer_id=556972284,
+            text="Печать разрешена",
+        )
+        send.assert_not_awaited()
+
+    async def test_admin_card_edit_preserves_caption_and_photo(self):
+        event = {
+            "event_id": "callback-event",
+            "user_id": 556972284,
+            "peer_id": 556972284,
+            "conversation_message_id": 77,
+        }
+        action = print_flow.PrintAction(
+            user=print_flow.PrintUser(
+                provider="vk",
+                provider_user_id=556972284,
+                conversation_id=556972284,
+                is_admin=True,
+            ),
+            action="approve",
+            job_id="c" * 32,
+            context={"vk_message_event": event},
+        )
+        message = {
+            "conversation_message_id": 77,
+            "text": "Мероприятие: «Кафе»\nJob: ccc",
+            "attachments": [{
+                "type": "photo",
+                "photo": {
+                    "owner_id": -123,
+                    "id": 456,
+                    "access_key": "photo-key",
+                },
+            }],
+        }
+        with patch(
+            "vk_print.vk_api.get_message_by_cmid",
+            AsyncMock(return_value=message),
+        ) as get_message, patch(
+            "vk_print.vk_api.edit_message",
+            AsyncMock(),
+        ) as edit:
+            await vk_print.VkPrintUI(object()).update_admin(
+                action,
+                "✅ Решение администратора: печать разрешена.",
+            )
+
+        get_message.assert_awaited_once_with(ANY, 556972284, 77)
+        edit.assert_awaited_once_with(
             ANY,
             556972284,
-            "Печать разрешена",
+            77,
+            "Мероприятие: «Кафе»\nJob: ccc\n\n"
+            "✅ Решение администратора: печать разрешена.",
+            attachment="photo-123_456_photo-key",
         )
 
     async def test_photo_is_routed_before_admin_command(self):
@@ -433,6 +601,87 @@ class VkPrintAdapterTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(message_id, 88)
         self.assertEqual(json.loads(api.await_args.kwargs["keyboard"]), keyboard)
+
+
+class VkCallbackApiTests(unittest.IsolatedAsyncioTestCase):
+    async def test_edits_card_by_cmid_and_removes_keyboard(self):
+        with patch(
+            "vk_api.api_call",
+            AsyncMock(return_value=1),
+        ) as api:
+            await vk_api.edit_message(
+                object(),
+                123,
+                77,
+                "Исходная подпись\n\n✅ Выбрано",
+                attachment="photo-1_2_key",
+            )
+
+        api.assert_awaited_once()
+        self.assertEqual(api.await_args.args[1], "messages.edit")
+        self.assertEqual(api.await_args.kwargs["peer_id"], 123)
+        self.assertEqual(api.await_args.kwargs["cmid"], 77)
+        self.assertEqual(api.await_args.kwargs["attachment"], "photo-1_2_key")
+        self.assertEqual(
+            json.loads(api.await_args.kwargs["keyboard"]),
+            {"buttons": []},
+        )
+
+    async def test_answers_callback_with_cyrillic_snackbar(self):
+        with patch(
+            "vk_api.api_call",
+            AsyncMock(return_value=1),
+        ) as api:
+            await vk_api.answer_message_event(
+                object(),
+                event_id="callback-event",
+                user_id=123,
+                peer_id=123,
+                text="Вариант сохранён",
+            )
+
+        api.assert_awaited_once()
+        self.assertEqual(
+            api.await_args.args[1],
+            "messages.sendMessageEventAnswer",
+        )
+        self.assertEqual(
+            json.loads(api.await_args.kwargs["event_data"]),
+            {"type": "show_snackbar", "text": "Вариант сохранён"},
+        )
+
+    async def test_fetches_original_card_by_conversation_message_id(self):
+        response = {
+            "items": [{
+                "conversation_message_id": 77,
+                "text": "caption",
+            }],
+        }
+        with patch(
+            "vk_api.api_call",
+            AsyncMock(return_value=response),
+        ) as api:
+            message = await vk_api.get_message_by_cmid(object(), 123, 77)
+
+        self.assertEqual(message["text"], "caption")
+        api.assert_awaited_once_with(
+            ANY,
+            "messages.getByConversationMessageId",
+            peer_id=123,
+            conversation_message_ids="77",
+        )
+
+    async def test_long_poll_requires_message_event_subscription(self):
+        settings = {
+            "is_enabled": 1,
+            "events": {"message_new": 1, "message_event": 0},
+        }
+        with patch(
+            "vk_api.api_call",
+            AsyncMock(return_value=settings),
+        ):
+            with self.assertRaisesRegex(vk_api.VkApiError, "message_event"):
+                await vk_api.validate_long_poll(object(), 123)
 
 
 class VkStartTests(unittest.IsolatedAsyncioTestCase):
@@ -807,6 +1056,10 @@ class AdminNotificationTests(unittest.IsolatedAsyncioTestCase):
             },
             {job_id},
         )
+        self.assertTrue(all(
+            button["action"]["type"] == "callback"
+            for button in vk_keyboard["buttons"][0]
+        ))
 
     async def test_vk_send_photo_passes_uploaded_attachment(self):
         with patch(
