@@ -560,6 +560,9 @@ class LogDeliveryTests(unittest.IsolatedAsyncioTestCase):
             async def __aexit__(self, *_args):
                 return False
 
+            async def read(self):
+                return b'{"ok":true,"result":{"message_id":1}}'
+
         class Telegram:
             def post(self, *_args, **_kwargs):
                 return Response()
@@ -725,6 +728,9 @@ class ConfigDeliveryTests(unittest.IsolatedAsyncioTestCase):
 
             async def __aexit__(self, *_args):
                 return False
+
+            async def read(self):
+                return b'{"ok":true,"result":{"message_id":1}}'
 
         class Telegram:
             def post(self, *_args, **_kwargs):

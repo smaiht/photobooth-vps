@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
+from collections import OrderedDict
 
 import aiohttp
 
@@ -22,6 +24,12 @@ EVENT_ACCESS_REQUIRED_MESSAGE = (
     "Для подключения отсканируйте VK QR-код текущего мероприятия и "
     "отправьте сообщение из открывшегося диалога."
 )
+USER_PROFILE_CACHE_TTL_SECONDS = 60 * 60
+USER_PROFILE_CACHE_MAX_SIZE = 4096
+_user_profile_cache: OrderedDict[
+    int,
+    tuple[float, dict[str, str | None]],
+] = OrderedDict()
 
 
 def incoming_private_message(update: dict) -> dict | None:
@@ -61,18 +69,61 @@ def provider_update_id(update: dict, message: dict) -> str | None:
     return f"message:{peer_id}:{message_id}"
 
 
-async def record_start(update: dict, message: dict) -> bool:
+async def cached_user_profile(
+    session: aiohttp.ClientSession,
+    user_id: int,
+) -> dict[str, str | None]:
+    """Resolve a VK profile best-effort and avoid one API call per button."""
+    now = time.monotonic()
+    cached = _user_profile_cache.get(user_id)
+    if cached is not None:
+        expires_at, profile = cached
+        if expires_at > now:
+            _user_profile_cache.move_to_end(user_id)
+            return dict(profile)
+        del _user_profile_cache[user_id]
+
+    try:
+        profile = await vk_api.get_user_profile(session, user_id)
+    except asyncio.CancelledError:
+        raise
+    except Exception as exc:
+        # Profile data is useful metadata, but must never block printing or
+        # Long Poll progress. Do not cache failures so a later message retries.
+        log.warning("VK profile lookup failed for user=%s: %s", user_id, exc)
+        return {}
+
+    _user_profile_cache[user_id] = (
+        now + USER_PROFILE_CACHE_TTL_SECONDS,
+        dict(profile),
+    )
+    _user_profile_cache.move_to_end(user_id)
+    while len(_user_profile_cache) > USER_PROFILE_CACHE_MAX_SIZE:
+        _user_profile_cache.popitem(last=False)
+    return dict(profile)
+
+
+async def record_start(
+    update: dict,
+    message: dict,
+    *,
+    profile: dict[str, str | None] | None = None,
+) -> bool:
     """Persist a VK ref parameter and report whether the message had one."""
     parameter = message.get("ref")
     if not isinstance(parameter, str) or not parameter.strip():
         return False
     parameter = parameter.strip()
     user_id = message.get("from_id")
+    profile = profile if isinstance(profile, dict) else {}
     await database.record_bot_start(
         provider="vk",
         provider_user_id=user_id,
         start_parameter=parameter,
         provider_update_id=provider_update_id(update, message),
+        username=profile.get("username"),
+        first_name=profile.get("first_name"),
+        last_name=profile.get("last_name"),
     )
     log.info("VK deep link stored for user=%s", user_id)
     return True
@@ -137,15 +188,16 @@ async def route_message_update(
     update: dict,
     message: dict,
 ) -> None:
-    started = await record_start(update, message)
+    profile = await cached_user_profile(session, message["from_id"])
+    started = await record_start(update, message, profile=profile)
     if started:
         await reply_for_current_event(session, message)
 
     # VK keyboard text buttons are regular message_new updates. Route their
     # signed job payload before treating visible button labels as commands.
-    if await vk_print.handle_action(session, message):
+    if await vk_print.handle_action(session, message, profile=profile):
         return
-    if await vk_print.handle_message(session, message):
+    if await vk_print.handle_message(session, message, profile=profile):
         return
 
     text = str(message.get("text") or "")
@@ -160,6 +212,9 @@ async def route_message_update(
     await database.ensure_bot_user(
         provider="vk",
         provider_user_id=message["from_id"],
+        username=profile.get("username"),
+        first_name=profile.get("first_name"),
+        last_name=profile.get("last_name"),
     )
     await reply_for_current_event(session, message)
 

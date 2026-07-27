@@ -30,7 +30,11 @@ class VkImage:
     metadata: dict
 
 
-def user_from_message(message: dict) -> print_flow.PrintUser:
+def user_from_message(
+    message: dict,
+    *,
+    profile: dict[str, str | None] | None = None,
+) -> print_flow.PrintUser:
     user_id = message.get("from_id")
     peer_id = message.get("peer_id")
     if (
@@ -48,11 +52,15 @@ def user_from_message(message: dict) -> print_flow.PrintUser:
         else message.get("id")
     )
     admin = vk_api.is_admin(user_id)
+    profile = profile if isinstance(profile, dict) else {}
     return print_flow.PrintUser(
         provider="vk",
         provider_user_id=user_id,
         conversation_id=peer_id,
         source_message_id=source_message_id,
+        username=profile.get("username"),
+        first_name=profile.get("first_name"),
+        last_name=profile.get("last_name"),
         allowlisted=admin,
         is_admin=admin,
         metadata={
@@ -200,10 +208,10 @@ async def download_image(
                         "файл больше "
                         f"{print_media.MAX_PRINT_FILE_SIZE_MB} МБ"
                     )
+    except (aiohttp.ClientError, asyncio.TimeoutError):
+        raise RuntimeError("не удалось скачать изображение из VK") from None
     except (ValueError, RuntimeError):
         raise
-    except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
-        raise RuntimeError("не удалось скачать изображение из VK") from exc
     if not payload:
         raise ValueError("VK прислал пустой файл")
     return bytes(payload)
@@ -316,7 +324,11 @@ class VkPrintUI:
         )
 
 
-def parse_action(message: dict) -> tuple[str, print_flow.PrintAction] | None:
+def parse_action(
+    message: dict,
+    *,
+    profile: dict[str, str | None] | None = None,
+) -> tuple[str, print_flow.PrintAction] | None:
     raw_payload = message.get("payload")
     if isinstance(raw_payload, str):
         try:
@@ -341,7 +353,7 @@ def parse_action(message: dict) -> tuple[str, print_flow.PrintAction] | None:
         return None
     try:
         action = print_flow.PrintAction(
-            user=user_from_message(message),
+            user=user_from_message(message, profile=profile),
             action=action_name,
             job_id=job_id,
             action_id=(
@@ -359,8 +371,10 @@ def parse_action(message: dict) -> tuple[str, print_flow.PrintAction] | None:
 async def handle_action(
     session: aiohttp.ClientSession,
     message: dict,
+    *,
+    profile: dict[str, str | None] | None = None,
 ) -> bool:
-    parsed = parse_action(message)
+    parsed = parse_action(message, profile=profile)
     if parsed is None:
         return False
     kind, action = parsed
@@ -373,11 +387,13 @@ async def handle_action(
 async def handle_message(
     session: aiohttp.ClientSession,
     message: dict,
+    *,
+    profile: dict[str, str | None] | None = None,
 ) -> bool:
     attachments = message.get("attachments")
     if not isinstance(attachments, list) or not attachments:
         return False
-    user = user_from_message(message)
+    user = user_from_message(message, profile=profile)
     try:
         image = extract_image(message)
     except ValueError as exc:

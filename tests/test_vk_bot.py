@@ -1,9 +1,11 @@
 import io
 import json
+import traceback
 import unittest
 from urllib.parse import parse_qs, urlsplit
 from unittest.mock import ANY, AsyncMock, MagicMock, call, patch
 
+import aiohttp
 from PIL import Image
 
 import admin_notifications
@@ -92,6 +94,87 @@ class VkMessageShapeTests(unittest.TestCase):
         self.assertIsNone(vk_bot.incoming_private_message(chat))
 
 
+class VkUserProfileTests(unittest.IsolatedAsyncioTestCase):
+    def setUp(self):
+        vk_bot._user_profile_cache.clear()
+
+    def tearDown(self):
+        vk_bot._user_profile_cache.clear()
+
+    def test_normalizes_cyrillic_profile_and_screen_name(self):
+        profile = vk_api.extract_user_profile(
+            [{
+                "id": 123,
+                "screen_name": "  foto_guest  ",
+                "first_name": " Алёна ",
+                "last_name": " Ёлкина ",
+            }],
+            123,
+        )
+
+        self.assertEqual(profile, {
+            "username": "foto_guest",
+            "first_name": "Алёна",
+            "last_name": "Ёлкина",
+        })
+
+    async def test_users_get_requests_screen_name(self):
+        response = [{
+            "id": 123,
+            "screen_name": "foto_guest",
+            "first_name": "Иван",
+            "last_name": "Иванов",
+        }]
+        session = object()
+        with patch(
+            "vk_api.api_call",
+            AsyncMock(return_value=response),
+        ) as api:
+            profile = await vk_api.get_user_profile(session, 123)
+
+        self.assertEqual(profile["username"], "foto_guest")
+        api.assert_awaited_once_with(
+            session,
+            "users.get",
+            user_ids="123",
+            fields="screen_name",
+        )
+
+    async def test_profile_is_cached_but_lookup_failure_is_not(self):
+        profile = {
+            "username": "foto_guest",
+            "first_name": "Иван",
+            "last_name": "Иванов",
+        }
+        lookup = AsyncMock(side_effect=(RuntimeError("temporary"), profile))
+        with patch("vk_bot.vk_api.get_user_profile", lookup), self.assertLogs(
+            vk_bot.log,
+            level="WARNING",
+        ):
+            first = await vk_bot.cached_user_profile(object(), 123)
+            second = await vk_bot.cached_user_profile(object(), 123)
+            third = await vk_bot.cached_user_profile(object(), 123)
+
+        self.assertEqual(first, {})
+        self.assertEqual(second, profile)
+        self.assertEqual(third, profile)
+        self.assertEqual(lookup.await_count, 2)
+
+    def test_print_user_receives_vk_profile(self):
+        user = vk_print.user_from_message(
+            {"from_id": 123, "peer_id": 123},
+            profile={
+                "username": "foto_guest",
+                "first_name": "Иван",
+                "last_name": "Иванов",
+            },
+        )
+
+        self.assertEqual(user.username, "foto_guest")
+        self.assertEqual(user.first_name, "Иван")
+        self.assertEqual(user.last_name, "Иванов")
+
+
 class VkBatchReliabilityTests(unittest.IsolatedAsyncioTestCase):
     async def test_retried_batch_skips_updates_that_already_completed(self):
         updates = [
@@ -165,6 +248,26 @@ class VkPrintAdapterTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(image.suffix, ".jpg")
         self.assertNotIn("url", image.metadata)
         self.assertNotIn("signature", repr(image.metadata))
+
+    async def test_download_error_does_not_expose_signed_url(self):
+        signed_url = "https://cdn.example/photo.jpg?signature=TEST_SECRET"
+        session = MagicMock()
+        session.get.side_effect = aiohttp.InvalidURL(signed_url)
+        image = vk_print.VkImage(
+            url=signed_url,
+            suffix=".jpg",
+            declared_size=None,
+            metadata={},
+        )
+
+        try:
+            await vk_print.download_image(session, image)
+        except RuntimeError as exc:
+            rendered = "".join(traceback.format_exception(exc))
+        else:
+            self.fail("download_image should fail")
+
+        self.assertNotIn("TEST_SECRET", rendered)
 
     def test_extracts_supported_image_document(self):
         image = vk_print.extract_image({
@@ -292,6 +395,9 @@ class VkPrintAdapterTests(unittest.IsolatedAsyncioTestCase):
             "attachments": [{"type": "photo", "photo": {}}],
         }
         with patch(
+            "vk_bot.cached_user_profile",
+            AsyncMock(return_value={}),
+        ), patch(
             "vk_bot.record_start",
             AsyncMock(return_value=False),
         ), patch(
@@ -309,7 +415,7 @@ class VkPrintAdapterTests(unittest.IsolatedAsyncioTestCase):
         ) as admin:
             await vk_bot.route_message_update(object(), update, message)
 
-        photo.assert_awaited_once_with(ANY, message)
+        photo.assert_awaited_once_with(ANY, message, profile={})
         admin.assert_not_awaited()
 
     async def test_vk_api_serializes_keyboard_and_returns_message_id(self):
@@ -344,7 +450,15 @@ class VkStartTests(unittest.IsolatedAsyncioTestCase):
             "vk_bot.database.record_bot_start",
             AsyncMock(return_value=1),
         ) as record:
-            matched = await vk_bot.record_start(update, message)
+            matched = await vk_bot.record_start(
+                update,
+                message,
+                profile={
+                    "username": "foto_guest",
+                    "first_name": "Иван",
+                    "last_name": "Иванов",
+                },
+            )
 
         self.assertTrue(matched)
         record.assert_awaited_once_with(
@@ -352,6 +466,9 @@ class VkStartTests(unittest.IsolatedAsyncioTestCase):
             provider_user_id=556972284,
             start_parameter="event_token",
             provider_update_id="event-123",
+            username="foto_guest",
+            first_name="Иван",
+            last_name="Иванов",
         )
 
     async def test_message_without_ref_is_not_a_start(self):
@@ -372,6 +489,9 @@ class VkStartTests(unittest.IsolatedAsyncioTestCase):
             "ref": "current-token",
         }
         with patch(
+            "vk_bot.cached_user_profile",
+            AsyncMock(return_value={}),
+        ), patch(
             "vk_bot.database.record_bot_start",
             AsyncMock(return_value=1),
         ), patch(
@@ -398,6 +518,9 @@ class VkStartTests(unittest.IsolatedAsyncioTestCase):
             "attachments": [{"type": "photo", "photo": {}}],
         }
         with patch(
+            "vk_bot.cached_user_profile",
+            AsyncMock(return_value={}),
+        ), patch(
             "vk_bot.record_start",
             AsyncMock(return_value=True),
         ), patch(
@@ -413,7 +536,7 @@ class VkStartTests(unittest.IsolatedAsyncioTestCase):
             await vk_bot.route_message_update(object(), update, message)
 
         reply.assert_awaited_once()
-        photo.assert_awaited_once_with(ANY, message)
+        photo.assert_awaited_once_with(ANY, message, profile={})
 
     async def test_ref_does_not_swallow_admin_command(self):
         update = {"event_id": "event-admin-ref", "type": "message_new"}
@@ -424,6 +547,9 @@ class VkStartTests(unittest.IsolatedAsyncioTestCase):
             "text": "/status",
         }
         with patch(
+            "vk_bot.cached_user_profile",
+            AsyncMock(return_value={}),
+        ), patch(
             "vk_bot.record_start",
             AsyncMock(return_value=True),
         ), patch(
@@ -453,6 +579,13 @@ class VkStartTests(unittest.IsolatedAsyncioTestCase):
         update = {"event_id": "event-456", "type": "message_new"}
         message = {"from_id": 321, "peer_id": 321, "text": "hello"}
         with patch(
+            "vk_bot.cached_user_profile",
+            AsyncMock(return_value={
+                "username": "foto_guest",
+                "first_name": "Алёна",
+                "last_name": "Ёлкина",
+            }),
+        ), patch(
             "vk_bot.database.ensure_bot_user",
             AsyncMock(return_value=1),
         ) as ensure, patch(
@@ -473,6 +606,9 @@ class VkStartTests(unittest.IsolatedAsyncioTestCase):
         ensure.assert_awaited_once_with(
             provider="vk",
             provider_user_id=321,
+            username="foto_guest",
+            first_name="Алёна",
+            last_name="Ёлкина",
         )
         self.assertIn("QR-код", send.await_args.args[2])
 
@@ -484,6 +620,9 @@ class VkStartTests(unittest.IsolatedAsyncioTestCase):
             "text": "/status",
         }
         with patch(
+            "vk_bot.cached_user_profile",
+            AsyncMock(return_value={}),
+        ), patch(
             "vk_bot.record_start",
             AsyncMock(return_value=False),
         ), patch(
@@ -724,6 +863,7 @@ class AdminNotificationTests(unittest.IsolatedAsyncioTestCase):
     async def test_vk_document_upload_uses_messages_server_and_docs_save(self):
         class UploadResponse:
             status = 200
+            headers = {"Content-Type": "application/json"}
 
             async def __aenter__(self):
                 return self
@@ -731,8 +871,8 @@ class AdminNotificationTests(unittest.IsolatedAsyncioTestCase):
             async def __aexit__(self, *_args):
                 return False
 
-            async def json(self, **_kwargs):
-                return {"file": "uploaded-file-token"}
+            async def read(self):
+                return b'{"file":"uploaded-file-token"}'
 
         class Session:
             def post(self, *_args, **_kwargs):

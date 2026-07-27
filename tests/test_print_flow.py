@@ -177,6 +177,30 @@ class SharedPrintFlowTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(metadata["provider"], "telegram")
         self.assertEqual(metadata["reply_target"], owner.target.to_dict())
 
+    async def test_preview_transport_failure_is_not_called_an_invalid_photo(self):
+        owner = user("vk", 124)
+        incoming, _download = upload(owner, (1000, 1000))
+        ui = FakeUI()
+        ui.send_choice.side_effect = RuntimeError("VK upload unavailable")
+        with TemporaryDirectory() as tmpdir, patch.object(
+            print_jobs,
+            "PENDING_ROOT",
+            Path(tmpdir),
+        ), patch.object(
+            print_flow.uuid,
+            "uuid4",
+        ) as uuid4, patch.object(
+            print_flow.log,
+            "exception",
+        ):
+            uuid4.return_value.hex = "d" * 32
+            self.assertTrue(await print_flow.handle_upload(incoming, ui))
+
+        self.fail_job.assert_awaited_once()
+        user_message = ui.send_text.await_args_list[-1].args[1]
+        self.assertIn("Не удалось отправить превью", user_message)
+        self.assertNotIn("Фото не принято", user_message)
+
     async def test_exact_vk_image_uses_same_auto_dispatch_path(self):
         owner = user("vk", 321)
         incoming, _download = upload(owner, (461, 310))

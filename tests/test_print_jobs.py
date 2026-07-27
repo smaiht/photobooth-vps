@@ -1,5 +1,6 @@
 import asyncio
 import io
+import json
 import unittest
 from pathlib import Path
 from tempfile import TemporaryDirectory
@@ -199,8 +200,11 @@ class TelegramPhotoDeliveryTests(unittest.IsolatedAsyncioTestCase):
             async def __aexit__(self, *_args):
                 return False
 
-            async def json(self):
-                return {"ok": True, "result": {"message_id": 504}}
+            async def read(self):
+                return json.dumps({
+                    "ok": True,
+                    "result": {"message_id": 504},
+                }).encode()
 
         class Telegram:
             def post(self, *_args, **_kwargs):
@@ -229,6 +233,9 @@ class TelegramPhotoDeliveryTests(unittest.IsolatedAsyncioTestCase):
 
             async def __aexit__(self, *_args):
                 return False
+
+            async def read(self):
+                return b'{"ok":true,"result":true}'
 
         class Telegram:
             payload = None

@@ -4,12 +4,16 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import os
 import secrets
+from collections.abc import Awaitable, Callable
 from typing import Any
 from urllib.parse import quote, urlencode, urlsplit
 
 import aiohttp
+
+import delivery_retry
 
 
 BOT_TOKEN = os.environ.get("VK_TOKEN", "").strip()
@@ -17,6 +21,9 @@ GROUP_USERNAME = os.environ.get("VK_GROUP_USERNAME", "").strip().lstrip("@")
 ADMIN_ID = os.environ.get("VK_ADMIN_ID", "").strip()
 API_VERSION = "5.199"
 API_BASE = "https://api.vk.com/method/"
+_RETRYABLE_API_ERROR_CODES = frozenset({1, 6, 10, 29})
+
+log = logging.getLogger(__name__)
 
 
 def is_admin(user_id: object) -> bool:
@@ -29,6 +36,41 @@ def is_admin(user_id: object) -> bool:
 
 class VkApiError(RuntimeError):
     """Safe-to-log VK failure that never contains credentials or request URLs."""
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        retryable: bool = False,
+        retry_after: float | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.retryable = retryable
+        self.retry_after = retry_after
+
+
+async def _retry(
+    operation: str,
+    callback: Callable[[], Awaitable[Any]],
+) -> Any:
+    for attempt in range(1, delivery_retry.MAX_ATTEMPTS + 1):
+        try:
+            return await callback()
+        except VkApiError as exc:
+            if not exc.retryable or attempt >= delivery_retry.MAX_ATTEMPTS:
+                raise
+            log.warning(
+                "VK %s retry attempt=%d/%d: %s",
+                operation,
+                attempt,
+                delivery_retry.MAX_ATTEMPTS,
+                exc,
+            )
+            await delivery_retry.wait_before_retry(
+                attempt,
+                retry_after=exc.retry_after,
+            )
+    raise AssertionError("unreachable VK retry state")
 
 
 def community_link(*, ref: str) -> str:
@@ -57,27 +99,46 @@ async def api_call(
             timeout=aiohttp.ClientTimeout(total=20),
         ) as response:
             status = response.status
-            try:
-                payload = await response.json(content_type=None)
-            except Exception as exc:
-                raise VkApiError(
-                    f"VK API {method} вернул некорректный JSON"
-                ) from exc
+            raw = await response.read()
+            headers = getattr(response, "headers", None)
     except VkApiError:
         raise
-    except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
-        raise VkApiError(f"не удалось подключиться к VK API ({method})") from exc
+    except (aiohttp.ClientError, asyncio.TimeoutError):
+        raise VkApiError(
+            f"не удалось подключиться к VK API ({method})",
+            retryable=True,
+        ) from None
 
     if status != 200:
-        raise VkApiError(f"VK API {method} вернул HTTP {status}")
+        raise VkApiError(
+            f"VK API {method} вернул HTTP {status}",
+            retryable=delivery_retry.retryable_http_status(status),
+            retry_after=delivery_retry.retry_after_seconds(headers, raw),
+        )
+    try:
+        payload = json.loads(raw)
+    except (TypeError, ValueError) as exc:
+        raise VkApiError(
+            f"VK API {method} вернул некорректный JSON",
+            retryable=True,
+        ) from exc
     if not isinstance(payload, dict):
-        raise VkApiError(f"VK API {method} вернул неожиданный ответ")
+        raise VkApiError(
+            f"VK API {method} вернул неожиданный ответ",
+            retryable=True,
+        )
     error = payload.get("error")
     if isinstance(error, dict):
         code = error.get("error_code", "unknown")
-        raise VkApiError(f"VK API {method} отклонил запрос, код {code}")
+        raise VkApiError(
+            f"VK API {method} отклонил запрос, код {code}",
+            retryable=code in _RETRYABLE_API_ERROR_CODES,
+        )
     if "response" not in payload:
-        raise VkApiError(f"VK API {method} не вернул response")
+        raise VkApiError(
+            f"VK API {method} не вернул response",
+            retryable=True,
+        )
     return payload["response"]
 
 
@@ -105,6 +166,52 @@ def extract_group_id(response: Any) -> int:
 
 async def get_group_id(session: aiohttp.ClientSession) -> int:
     return extract_group_id(await api_call(session, "groups.getById"))
+
+
+def _profile_text(value: Any) -> str | None:
+    if not isinstance(value, str):
+        return None
+    value = value.strip()
+    return value or None
+
+
+def extract_user_profile(response: Any, user_id: int) -> dict[str, str | None]:
+    """Normalize one ``users.get`` response for the shared user model."""
+    if not isinstance(response, list):
+        raise VkApiError("VK API users.get вернул неожиданный ответ")
+    for candidate in response:
+        if not isinstance(candidate, dict) or candidate.get("id") != user_id:
+            continue
+        return {
+            "username": _profile_text(candidate.get("screen_name")),
+            "first_name": _profile_text(candidate.get("first_name")),
+            "last_name": _profile_text(candidate.get("last_name")),
+        }
+    raise VkApiError("VK API users.get не вернул запрошенного пользователя")
+
+
+async def get_user_profile(
+    session: aiohttp.ClientSession,
+    user_id: int,
+) -> dict[str, str | None]:
+    """Fetch names missing from Bots Long Poll's ``message_new`` payload."""
+    if (
+        not isinstance(user_id, int)
+        or isinstance(user_id, bool)
+        or user_id <= 0
+    ):
+        raise ValueError("VK user_id must be a positive integer")
+
+    async def fetch_once() -> dict[str, str | None]:
+        response = await api_call(
+            session,
+            "users.get",
+            user_ids=str(user_id),
+            fields="screen_name",
+        )
+        return extract_user_profile(response, user_id)
+
+    return await _retry("users.get", fetch_once)
 
 
 async def validate_long_poll(
@@ -166,12 +273,16 @@ async def poll_long_poll(
             status = response.status
             try:
                 payload = await response.json(content_type=None)
-            except Exception as exc:
-                raise VkApiError("VK Long Poll вернул некорректный JSON") from exc
+            except Exception:
+                raise VkApiError(
+                    "VK Long Poll вернул некорректный JSON"
+                ) from None
     except VkApiError:
         raise
-    except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
-        raise VkApiError("не удалось подключиться к VK Long Poll") from exc
+    except (aiohttp.ClientError, asyncio.TimeoutError):
+        raise VkApiError(
+            "не удалось подключиться к VK Long Poll"
+        ) from None
 
     if status != 200:
         raise VkApiError(f"VK Long Poll вернул HTTP {status}")
@@ -197,12 +308,7 @@ async def send_text(
             ensure_ascii=False,
             separators=(",", ":"),
         )
-    response = await api_call(
-        session,
-        "messages.send",
-        **params,
-    )
-    return sent_message_id(response)
+    return await _send_message(session, params)
 
 
 def sent_message_id(response: Any) -> int | None:
@@ -215,6 +321,24 @@ def sent_message_id(response: Any) -> int | None:
             if isinstance(value, int) and not isinstance(value, bool) and value > 0:
                 return value
     return None
+
+
+async def _send_message(
+    session: aiohttp.ClientSession,
+    params: dict[str, Any],
+) -> int:
+    """Retry messages.send with one stable random_id for deduplication."""
+    async def send_once() -> int:
+        response = await api_call(session, "messages.send", **params)
+        message_id = sent_message_id(response)
+        if message_id is None:
+            raise VkApiError(
+                "VK API messages.send не вернул корректный message ID",
+                retryable=True,
+            )
+        return message_id
+
+    return await _retry("messages.send", send_once)
 
 
 def photo_attachment(saved_photo: Any) -> str:
@@ -243,16 +367,34 @@ def photo_attachment(saved_photo: Any) -> str:
         if isinstance(access_key, str) and access_key:
             attachment += f"_{access_key}"
         return attachment
-    raise VkApiError("VK API не вернул сохранённую фотографию")
+    raise VkApiError(
+        "VK API не вернул сохранённую фотографию",
+        retryable=True,
+    )
 
 
-async def upload_message_photo(
+def _normalize_uploaded_photo(value: Any) -> str:
+    if isinstance(value, str) and value:
+        return value
+    if isinstance(value, (list, dict)) and value:
+        return json.dumps(
+            value,
+            ensure_ascii=False,
+            separators=(",", ":"),
+        )
+    raise VkApiError(
+        "VK upload не вернул фотографию",
+        retryable=True,
+    )
+
+
+async def _upload_message_photo_once(
     session: aiohttp.ClientSession,
     peer_id: int,
     photo: bytes,
     *,
-    filename: str = "event_access.png",
-    content_type: str = "image/png",
+    filename: str,
+    content_type: str,
 ) -> str:
     upload_server = await api_call(
         session,
@@ -264,8 +406,14 @@ async def upload_message_photo(
         if isinstance(upload_server, dict)
         else None
     )
-    if not isinstance(upload_url, str) or urlsplit(upload_url).scheme != "https":
-        raise VkApiError("VK API не вернул безопасный URL загрузки фотографии")
+    if (
+        not isinstance(upload_url, str)
+        or urlsplit(upload_url).scheme != "https"
+    ):
+        raise VkApiError(
+            "VK API не вернул безопасный URL загрузки фотографии",
+            retryable=True,
+        )
 
     form = aiohttp.FormData()
     form.add_field(
@@ -281,32 +429,61 @@ async def upload_message_photo(
             timeout=aiohttp.ClientTimeout(total=60),
         ) as response:
             status = response.status
-            try:
-                uploaded = await response.json(content_type=None)
-            except Exception as exc:
-                raise VkApiError("VK upload вернул некорректный JSON") from exc
-    except VkApiError:
-        raise
-    except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
-        raise VkApiError("не удалось загрузить фотографию в VK") from exc
+            raw = await response.read()
+            headers = getattr(response, "headers", None)
+            response_type = str(
+                headers.get("Content-Type", "") if headers is not None else ""
+            ).split(";", 1)[0]
+    except (aiohttp.ClientError, asyncio.TimeoutError):
+        raise VkApiError(
+            "не удалось загрузить фотографию в VK",
+            retryable=True,
+        ) from None
 
     if status != 200:
-        raise VkApiError(f"VK upload вернул HTTP {status}")
+        raise VkApiError(
+            "VK photo upload вернул "
+            f"HTTP {status} content_type={response_type or 'unknown'} "
+            f"bytes={len(raw)}",
+            retryable=delivery_retry.retryable_http_status(status),
+            retry_after=delivery_retry.retry_after_seconds(headers, raw),
+        )
+    try:
+        uploaded = json.loads(raw)
+    except (TypeError, ValueError) as exc:
+        raise VkApiError(
+            "VK photo upload вернул некорректный JSON "
+            f"content_type={response_type or 'unknown'} bytes={len(raw)}",
+            retryable=True,
+        ) from exc
     if not isinstance(uploaded, dict):
-        raise VkApiError("VK upload вернул неожиданный ответ")
-    upload_photo = uploaded.get("photo")
+        raise VkApiError(
+            "VK photo upload вернул неожиданный тип ответа "
+            f"type={type(uploaded).__name__}",
+            retryable=True,
+        )
+    if uploaded.get("error") is not None:
+        raise VkApiError(
+            "VK photo upload отклонил фотографию",
+            retryable=True,
+        )
+
     upload_server_id = uploaded.get("server")
     upload_hash = uploaded.get("hash")
     if (
-        not isinstance(upload_photo, str)
-        or not upload_photo
-        or not isinstance(upload_server_id, (str, int))
+        not isinstance(upload_server_id, (str, int))
         or isinstance(upload_server_id, bool)
         or not isinstance(upload_hash, str)
         or not upload_hash
     ):
-        raise VkApiError("VK upload вернул неполные параметры фотографии")
-
+        raise VkApiError(
+            "VK photo upload вернул неполные параметры "
+            f"photo_type={type(uploaded.get('photo')).__name__} "
+            f"server_type={type(upload_server_id).__name__} "
+            f"hash_type={type(upload_hash).__name__}",
+            retryable=True,
+        )
+    upload_photo = _normalize_uploaded_photo(uploaded.get("photo"))
     saved = await api_call(
         session,
         "photos.saveMessagesPhoto",
@@ -315,6 +492,26 @@ async def upload_message_photo(
         hash=upload_hash,
     )
     return photo_attachment(saved)
+
+
+async def upload_message_photo(
+    session: aiohttp.ClientSession,
+    peer_id: int,
+    photo: bytes,
+    *,
+    filename: str = "event_access.png",
+    content_type: str = "image/png",
+) -> str:
+    return await _retry(
+        "photo upload",
+        lambda: _upload_message_photo_once(
+            session,
+            peer_id,
+            photo,
+            filename=filename,
+            content_type=content_type,
+        ),
+    )
 
 
 async def send_photo(
@@ -346,12 +543,7 @@ async def send_photo(
             ensure_ascii=False,
             separators=(",", ":"),
         )
-    response = await api_call(
-        session,
-        "messages.send",
-        **params,
-    )
-    return sent_message_id(response)
+    return await _send_message(session, params)
 
 
 def document_attachment(saved_document: Any) -> str:
@@ -387,16 +579,19 @@ def document_attachment(saved_document: Any) -> str:
         if isinstance(access_key, str) and access_key:
             attachment += f"_{access_key}"
         return attachment
-    raise VkApiError("VK API не вернул сохранённый документ")
+    raise VkApiError(
+        "VK API не вернул сохранённый документ",
+        retryable=True,
+    )
 
 
-async def upload_message_document(
+async def _upload_message_document_once(
     session: aiohttp.ClientSession,
     peer_id: int,
     payload: bytes,
     *,
     filename: str,
-    content_type: str = "application/octet-stream",
+    content_type: str,
 ) -> str:
     upload_server = await api_call(
         session,
@@ -409,8 +604,14 @@ async def upload_message_document(
         if isinstance(upload_server, dict)
         else None
     )
-    if not isinstance(upload_url, str) or urlsplit(upload_url).scheme != "https":
-        raise VkApiError("VK API не вернул безопасный URL загрузки документа")
+    if (
+        not isinstance(upload_url, str)
+        or urlsplit(upload_url).scheme != "https"
+    ):
+        raise VkApiError(
+            "VK API не вернул безопасный URL загрузки документа",
+            retryable=True,
+        )
 
     form = aiohttp.FormData()
     form.add_field(
@@ -426,22 +627,51 @@ async def upload_message_document(
             timeout=aiohttp.ClientTimeout(total=60),
         ) as response:
             status = response.status
-            try:
-                uploaded = await response.json(content_type=None)
-            except Exception as exc:
-                raise VkApiError("VK document upload вернул некорректный JSON") from exc
-    except VkApiError:
-        raise
-    except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
-        raise VkApiError("не удалось загрузить документ в VK") from exc
+            raw = await response.read()
+            headers = getattr(response, "headers", None)
+            response_type = str(
+                headers.get("Content-Type", "") if headers is not None else ""
+            ).split(";", 1)[0]
+    except (aiohttp.ClientError, asyncio.TimeoutError):
+        raise VkApiError(
+            "не удалось загрузить документ в VK",
+            retryable=True,
+        ) from None
 
     if status != 200:
-        raise VkApiError(f"VK document upload вернул HTTP {status}")
+        raise VkApiError(
+            "VK document upload вернул "
+            f"HTTP {status} content_type={response_type or 'unknown'} "
+            f"bytes={len(raw)}",
+            retryable=delivery_retry.retryable_http_status(status),
+            retry_after=delivery_retry.retry_after_seconds(headers, raw),
+        )
+    try:
+        uploaded = json.loads(raw)
+    except (TypeError, ValueError) as exc:
+        raise VkApiError(
+            "VK document upload вернул некорректный JSON "
+            f"content_type={response_type or 'unknown'} bytes={len(raw)}",
+            retryable=True,
+        ) from exc
     if not isinstance(uploaded, dict):
-        raise VkApiError("VK document upload вернул неожиданный ответ")
+        raise VkApiError(
+            "VK document upload вернул неожиданный тип ответа "
+            f"type={type(uploaded).__name__}",
+            retryable=True,
+        )
+    if uploaded.get("error") is not None:
+        raise VkApiError(
+            "VK document upload отклонил документ",
+            retryable=True,
+        )
     upload_file = uploaded.get("file")
     if not isinstance(upload_file, str) or not upload_file:
-        raise VkApiError("VK document upload не вернул файл")
+        raise VkApiError(
+            "VK document upload не вернул файл "
+            f"file_type={type(upload_file).__name__}",
+            retryable=True,
+        )
 
     saved = await api_call(
         session,
@@ -450,6 +680,26 @@ async def upload_message_document(
         title=filename,
     )
     return document_attachment(saved)
+
+
+async def upload_message_document(
+    session: aiohttp.ClientSession,
+    peer_id: int,
+    payload: bytes,
+    *,
+    filename: str,
+    content_type: str = "application/octet-stream",
+) -> str:
+    return await _retry(
+        "document upload",
+        lambda: _upload_message_document_once(
+            session,
+            peer_id,
+            payload,
+            filename=filename,
+            content_type=content_type,
+        ),
+    )
 
 
 async def send_documents(
@@ -470,14 +720,14 @@ async def send_documents(
                 content_type=content_type,
             )
         )
-    response = await api_call(
+    return await _send_message(
         session,
-        "messages.send",
-        peer_id=peer_id,
-        random_id=secrets.randbelow(2_147_483_647) + 1,
-        attachment=",".join(attachments),
+        {
+            "peer_id": peer_id,
+            "random_id": secrets.randbelow(2_147_483_647) + 1,
+            "attachment": ",".join(attachments),
+        },
     )
-    return sent_message_id(response)
 
 
 async def send_document(

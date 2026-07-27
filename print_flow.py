@@ -41,6 +41,10 @@ _actions_in_progress: set[str] = set()
 _background_tasks: set[asyncio.Task] = set()
 
 
+class PreviewDeliveryError(RuntimeError):
+    """A valid photo whose messenger choice card could not be delivered."""
+
+
 @dataclass(frozen=True)
 class PrintUser:
     """One messenger identity normalized by a transport adapter."""
@@ -557,13 +561,28 @@ async def handle_upload(upload: PrintUpload, ui: PrintUI) -> bool:
             payload,
             metadata,
         )
-        choice_message_id = await ui.send_choice(
-            upload,
-            preview.payload or b"",
-            job_id,
-        )
+        try:
+            choice_message_id = await ui.send_choice(
+                upload,
+                preview.payload or b"",
+                job_id,
+            )
+        except Exception as exc:
+            log.exception(
+                "Could not deliver print preview provider=%s user=%s job=%s",
+                user.provider,
+                user.provider_user_id,
+                job_id,
+            )
+            raise PreviewDeliveryError(
+                "❌ Не удалось отправить превью с вариантами печати. "
+                "Пришлите фото ещё раз."
+            ) from exc
         if choice_message_id is None:
-            raise RuntimeError("не удалось показать варианты печати")
+            raise PreviewDeliveryError(
+                "❌ Не удалось отправить превью с вариантами печати. "
+                "Пришлите фото ещё раз."
+            )
         awaiting = await database.mark_print_job_awaiting_choice(
             job_id=job_id,
             choice_message_id=choice_message_id,
@@ -593,7 +612,12 @@ async def handle_upload(upload: PrintUpload, ui: PrintUI) -> bool:
         )
         if database_job_created:
             await _fail_before_dispatch(job_id, exc)
-        await ui.send_text(user, rejected_photo_message(exc))
+        await ui.send_text(
+            user,
+            str(exc)
+            if isinstance(exc, PreviewDeliveryError)
+            else rejected_photo_message(exc),
+        )
     return True
 
 

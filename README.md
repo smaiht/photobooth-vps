@@ -58,6 +58,17 @@ payload приходит обычным `message_new` и отдельное со
 текстовый результат. VK-копия изображения загружается штатной цепочкой
 `photos.getMessagesUploadServer` → upload → `photos.saveMessagesPhoto`.
 
+Исходящие Telegram и VK сообщения делают до трёх быстрых попыток при timeout,
+HTTP 408/425/429/5xx и других явно временных transport-ошибках. Multipart для
+фото и документов собирается заново на каждой попытке. VK получает новый
+upload URL, но повторяет `messages.send` с тем же `random_id`, поэтому VK не
+создаёт второе сообщение при повторах внутри одной серии. У Telegram
+idempotency key нет: при редком timeout после фактического принятия запроса
+возможна повторная доставка — здесь намеренно выбрана семантика at-least-once.
+После исчерпания трёх попыток вторичные admin-копии остаются best effort;
+гарантированная доставка после долгого outage потребовала бы отдельного durable
+outbox.
+
 `app.py` — только composition root: инициализирует БД/Диск и запускает workers.
 `telegram_bot.py` и `vk_bot.py` содержат polling и порядок маршрутизации;
 `telegram_print.py` и `vk_print.py` переводят provider-specific фото и кнопки в
