@@ -7,6 +7,7 @@ import json
 import logging
 import re
 import time
+import uuid
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -400,10 +401,19 @@ def build_choice_preview(payload: bytes) -> PrintPreview:
         image.close()
 
 
-def _job_dir(job_id: str) -> Path:
-    if not isinstance(job_id, str) or not JOB_ID_RE.fullmatch(job_id):
+def normalize_job_id(job_id: str | uuid.UUID) -> str:
+    """Normalize PostgreSQL and application UUID forms to 32 lowercase hex."""
+    try:
+        normalized = uuid.UUID(str(job_id)).hex
+    except (ValueError, AttributeError, TypeError) as exc:
+        raise ValueError("invalid pending print job id") from exc
+    if not JOB_ID_RE.fullmatch(normalized):
         raise ValueError("invalid pending print job id")
-    return PENDING_ROOT / job_id
+    return normalized
+
+
+def _job_dir(job_id: str | uuid.UUID) -> Path:
+    return PENDING_ROOT / normalize_job_id(job_id)
 
 
 def _write_metadata(job_dir: Path, metadata: dict) -> None:
@@ -416,7 +426,7 @@ def _write_metadata(job_dir: Path, metadata: dict) -> None:
 
 
 def save_pending(
-    job_id: str,
+    job_id: str | uuid.UUID,
     suffix: str,
     payload: bytes,
     metadata: dict,
@@ -427,7 +437,8 @@ def save_pending(
         raise ValueError("invalid pending print payload")
     if not isinstance(metadata, dict):
         raise ValueError("invalid pending print metadata")
-    job_dir = _job_dir(job_id)
+    normalized_job_id = normalize_job_id(job_id)
+    job_dir = _job_dir(normalized_job_id)
     job_dir.mkdir(parents=True, exist_ok=True)
     source_path = job_dir / f"original{suffix}"
     source_temporary = source_path.with_name(source_path.name + ".tmp")
@@ -435,7 +446,7 @@ def save_pending(
     source_temporary.replace(source_path)
     pending = dict(metadata)
     pending.update({
-        "job_id": job_id,
+        "job_id": normalized_job_id,
         "source_suffix": suffix,
         "pending_created_at": time.time(),
         "pending_status": "awaiting_choice",
@@ -443,7 +454,7 @@ def save_pending(
     _write_metadata(job_dir, pending)
 
 
-def load_pending(job_id: str) -> tuple[bytes, dict]:
+def load_pending(job_id: str | uuid.UUID) -> tuple[bytes, dict]:
     job_dir = _job_dir(job_id)
     metadata_path = job_dir / "metadata.json"
     if not metadata_path.is_file():
@@ -459,14 +470,16 @@ def load_pending(job_id: str) -> tuple[bytes, dict]:
     return payload, metadata
 
 
-def update_pending(job_id: str, **changes) -> dict:
+def update_pending(job_id: str | uuid.UUID, **changes) -> dict:
+    normalized_job_id = normalize_job_id(job_id)
     _payload, metadata = load_pending(job_id)
     metadata.update(changes)
-    _write_metadata(_job_dir(job_id), metadata)
+    metadata["job_id"] = normalized_job_id
+    _write_metadata(_job_dir(normalized_job_id), metadata)
     return metadata
 
 
-def delete_pending(job_id: str) -> None:
+def delete_pending(job_id: str | uuid.UUID) -> None:
     job_dir = _job_dir(job_id)
     if not job_dir.is_dir():
         return

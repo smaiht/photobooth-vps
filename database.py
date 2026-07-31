@@ -53,6 +53,14 @@ def _uuid_text(value: str | uuid.UUID, field: str) -> str:
         raise ValueError(f"{field} must be a UUID") from exc
 
 
+def _uuid_hex(value: str | uuid.UUID, field: str) -> str:
+    """Return the application-wide UUID representation without separators."""
+    try:
+        return uuid.UUID(str(value)).hex
+    except (ValueError, AttributeError, TypeError) as exc:
+        raise ValueError(f"{field} must be a UUID") from exc
+
+
 def connection_config() -> tuple[str, dict]:
     """Return a psycopg DSN/kwargs pair without connecting at import time."""
     database_url = os.environ.get("DATABASE_URL", "").strip()
@@ -531,7 +539,7 @@ async def recover_interrupted_print_jobs() -> int:
 
 def _admin_print_job_from_row(row) -> dict:
     return {
-        "job_id": row[0],
+        "job_id": _uuid_hex(row[0], "job_id"),
         "user_id": int(row[1]),
         "event_name": row[2],
         "conversation_id": row[3],

@@ -987,6 +987,8 @@ async def _dispatch_admin_approved(result: dict) -> None:
     job_id = str(result["job_id"])
     metadata: dict | None = None
     try:
+        job_id = print_jobs.normalize_job_id(job_id)
+        result = {**result, "job_id": job_id}
         payload, metadata = await asyncio.to_thread(print_jobs.load_pending, job_id)
         mode = str(result.get("print_mode") or metadata.get("print_mode") or "")
         metadata = await asyncio.to_thread(

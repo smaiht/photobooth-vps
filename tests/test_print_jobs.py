@@ -2,6 +2,7 @@ import asyncio
 import io
 import json
 import unittest
+import uuid
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -170,6 +171,7 @@ class PendingPrintTests(unittest.TestCase):
         with TemporaryDirectory() as tmpdir, \
              patch.object(print_jobs, "PENDING_ROOT", Path(tmpdir)):
             job_id = "a" * 32
+            database_job_id = str(uuid.UUID(hex=job_id))
             print_jobs.save_pending(
                 job_id,
                 ".jpg",
@@ -177,13 +179,18 @@ class PendingPrintTests(unittest.TestCase):
                 {"sender_id": 123},
             )
 
-            payload, metadata = print_jobs.load_pending(job_id)
+            payload, metadata = print_jobs.load_pending(database_job_id)
             self.assertEqual(payload, b"image")
+            self.assertEqual(metadata["job_id"], job_id)
             self.assertEqual(metadata["pending_status"], "awaiting_choice")
-            updated = print_jobs.update_pending(job_id, print_mode="fill")
+            updated = print_jobs.update_pending(
+                database_job_id,
+                print_mode="fill",
+            )
             self.assertEqual(updated["print_mode"], "fill")
+            self.assertEqual(updated["job_id"], job_id)
             self.assertTrue((Path(tmpdir) / job_id).exists())
-            print_jobs.delete_pending(job_id)
+            print_jobs.delete_pending(database_job_id)
             self.assertFalse((Path(tmpdir) / job_id).exists())
 
 

@@ -1,6 +1,7 @@
 import asyncio
 import io
 import unittest
+import uuid
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from unittest.mock import AsyncMock, MagicMock, call, patch
@@ -626,9 +627,10 @@ class SharedPrintFlowTests(unittest.IsolatedAsyncioTestCase):
     async def test_admin_approval_dispatches_in_background_to_original_provider(self):
         print_flow.event_access.current_event.return_value = ("Кафе", None, True)
         job_id = "4" * 32
+        database_job_id = str(uuid.UUID(hex=job_id))
         result = {
             "outcome": "authorized",
-            "job_id": job_id,
+            "job_id": database_job_id,
             "provider": "vk",
             "conversation_id": "4321",
             "provider_user_id": "4321",
@@ -701,6 +703,7 @@ class SharedPrintFlowTests(unittest.IsolatedAsyncioTestCase):
             dispatch.await_args.kwargs["reply_target"],
             ReplyTarget("vk", 4321),
         )
+        self.assertEqual(dispatch.await_args.kwargs["job_id"], job_id)
         notify.assert_awaited_once_with(
             ReplyTarget("vk", 4321),
             "✅ Оплата подтверждена. Ваше фото добавлено в очередь "
@@ -718,9 +721,10 @@ class SharedPrintFlowTests(unittest.IsolatedAsyncioTestCase):
     async def test_admin_dispatch_error_sends_one_final_status_to_both(self):
         print_flow.event_access.current_event.return_value = ("Кафе", None, True)
         job_id = "5" * 32
+        database_job_id = str(uuid.UUID(hex=job_id))
         result = {
             "outcome": "authorized",
-            "job_id": job_id,
+            "job_id": database_job_id,
             "provider": "telegram",
             "conversation_id": "123",
             "provider_user_id": "123",
@@ -779,6 +783,7 @@ class SharedPrintFlowTests(unittest.IsolatedAsyncioTestCase):
         self.send_admin_status.assert_awaited_once()
         final_status = self.send_admin_status.await_args.args[0]
         self.assertIn("❌ Ошибка передачи на печать", final_status)
+        self.assertIn("Диск временно недоступен", final_status)
         self.assertIn(f"Job: {job_id}", final_status)
         self.assertIn("Пользователь: Анна Петрова", final_status)
 

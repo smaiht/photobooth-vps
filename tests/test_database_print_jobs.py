@@ -281,6 +281,7 @@ class PrintJobDatabaseTests(unittest.IsolatedAsyncioTestCase):
             )
 
         self.assertEqual(result["outcome"], "authorized")
+        self.assertEqual(result["job_id"], JOB_ID.replace("-", ""))
         self.assertEqual(result["authorization_kind"], "cashier")
         self.assertEqual(result["user_provider_user_id"], "456")
         sql, parameters = connection.executed[0]
@@ -303,6 +304,7 @@ class PrintJobDatabaseTests(unittest.IsolatedAsyncioTestCase):
             )
 
         self.assertEqual(result["outcome"], "cancelled")
+        self.assertEqual(result["job_id"], JOB_ID.replace("-", ""))
         sql = connection.executed[0][0]
         self.assertIn("close_reason = 'cashier_rejected'", sql)
         self.assertIn("status = 'awaiting_authorization'", sql)
