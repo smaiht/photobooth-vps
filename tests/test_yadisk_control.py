@@ -405,6 +405,51 @@ class CafeUnblockCommandTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("от 0 до 1000", send_text.await_args.args[1])
 
 
+class PrintQueueAdminCommandTests(unittest.IsolatedAsyncioTestCase):
+    def test_parses_status_and_clear_without_arguments(self):
+        self.assertEqual(
+            admin_commands.parse("/print_queue"),
+            ("print_queue", None),
+        )
+        self.assertEqual(
+            admin_commands.parse("/clear_print_queue@photobooth_bot"),
+            ("clear_print_queue", None),
+        )
+
+    def test_rejects_arguments_for_both_commands(self):
+        for text in ("/print_queue grid", "/clear_print_queue strips"):
+            with self.subTest(text=text), self.assertRaisesRegex(
+                ValueError,
+                "Использование",
+            ):
+                admin_commands.parse(text)
+
+    def test_commands_are_listed_in_admin_help(self):
+        self.assertIn("/print_queue", admin_commands.HELP_MESSAGE)
+        self.assertIn("/clear_print_queue", admin_commands.HELP_MESSAGE)
+
+    async def test_clear_command_is_forwarded_to_the_booth(self):
+        target = ReplyTarget("telegram", 123)
+        with patch(
+            "admin_command_service.yadisk_control.send_command",
+            AsyncMock(return_value={"command_id": "a" * 32}),
+        ) as send, patch(
+            "admin_command_service.messenger_delivery.send_text",
+            AsyncMock(return_value=True),
+        ) as reply:
+            await admin_command_service.handle_message(
+                target,
+                "/clear_print_queue",
+            )
+
+        send.assert_awaited_once_with(
+            "clear_print_queue",
+            target,
+            None,
+        )
+        self.assertIn("Очищаю очереди", reply.await_args.args[1])
+
+
 class CameraSettingCommandTests(unittest.IsolatedAsyncioTestCase):
     def test_parses_dynamic_camera_setting(self):
         self.assertEqual(

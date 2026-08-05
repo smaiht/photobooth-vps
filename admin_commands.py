@@ -18,6 +18,8 @@ CAMERA_FIELD_RE = re.compile(r"^[a-z][a-z0-9_]{0,63}$")
 KNOWN_COMMANDS = {
     "/run": "run",
     "/status": "status",
+    "/print_queue": "print_queue",
+    "/clear_print_queue": "clear_print_queue",
     "/unblock": "unblock",
     "/block": "unblock",
     "/logs": "send_logs",
@@ -83,6 +85,17 @@ def _parse_block(argument: str | None) -> ParsedCommand:
     return "unblock", {"sessions": 0}
 
 
+def _parse_print_queue(
+    command: str,
+    argument: str | None,
+) -> ParsedCommand:
+    """Reject arguments: print administration always covers both queues."""
+    if argument is not None:
+        command_name = "/" + command
+        raise ValueError(f"Использование: {command_name}")
+    return command, None
+
+
 def parse(text: str) -> ParsedCommand | None:
     """Parse and validate one admin message without performing side effects."""
     parts = (text or "").strip().split(maxsplit=1)
@@ -99,6 +112,8 @@ def parse(text: str) -> ParsedCommand | None:
         return _parse_block(argument)
     if known_command == "unblock":
         return _parse_unblock(argument)
+    if known_command in ("print_queue", "clear_print_queue"):
+        return _parse_print_queue(known_command, argument)
     if known_command:
         return known_command, None
 
@@ -135,6 +150,12 @@ def sent_message(command: str, data: dict | None) -> str:
         )
     if command == "get_config":
         return "⏳ Запрашиваю конфиги фотобудки..."
+    if command == "print_queue":
+        return (
+            "⏳ Запрашиваю состояние очередей Windows-принтеров..."
+        )
+    if command == "clear_print_queue":
+        return "⏳ Очищаю очереди Windows-принтеров..."
     return f"⏳ {command}: команда отправлена"
 
 
@@ -143,5 +164,7 @@ def failed_message(command: str, error: Exception) -> str:
         "set_event": "Команда смены мероприятия не отправлена",
         "unblock": "Изменение блокировки не отправлено",
         "set_camera_config": "Настройка камеры не отправлена",
+        "print_queue": "Запрос очередей печати не отправлен",
+        "clear_print_queue": "Очистка очередей печати не отправлена",
     }.get(command, "Команда не отправлена")
     return f"❌ {label}: {error}"
