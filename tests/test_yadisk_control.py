@@ -104,6 +104,30 @@ class SendCommandTests(unittest.IsolatedAsyncioTestCase):
         )
 
 
+class ControlConnectionSettingsTests(unittest.IsolatedAsyncioTestCase):
+    async def test_api_session_uses_desktop_client_user_agent(self):
+        api_session = MagicMock(closed=False)
+        transfer_session = MagicMock(closed=False)
+        with patch.object(yadisk_control, "_configured", True), \
+             patch.object(yadisk_control, "_token", "secret"), \
+             patch.object(yadisk_control, "_root", "/control"), \
+             patch.object(yadisk_control, "_session", None), \
+             patch.object(yadisk_control, "_transfer_session", None), \
+             patch("yadisk_control.aiohttp.ClientSession", side_effect=[
+                 api_session,
+                 transfer_session,
+             ]) as client_session, \
+             patch("yadisk_control._ensure_directory", AsyncMock()):
+            self.assertTrue(await yadisk_control._connect())
+
+        headers = client_session.call_args_list[0].kwargs["headers"]
+        self.assertEqual(headers["Authorization"], "OAuth secret")
+        self.assertEqual(
+            headers["User-Agent"],
+            yadisk_control.YADISK_API_USER_AGENT,
+        )
+
+
 class EventSwitchTests(unittest.IsolatedAsyncioTestCase):
     async def test_switches_to_one_active_folder(self):
         yadisk_poll._folder = "/old_event"

@@ -30,6 +30,9 @@ import yadisk_control
 log = logging.getLogger(__name__)
 
 API = "https://cloud-api.yandex.net/v1/disk"
+# Keep upload-link requests consistent with the booth and avoid Yandex.Disk's
+# generic-client throttling if new media types are accepted in this path.
+YADISK_API_USER_AGENT = 'Yandex.Disk {"os":"windows"}'
 POLL_INTERVAL = 10
 PAGE_SIZE = 1000
 STATE_FILE = Path(__file__).resolve().parent / "vps_yadisk_state.json"
@@ -201,7 +204,10 @@ async def _connect() -> bool:
 
     await _close_sessions()
     _session = aiohttp.ClientSession(
-        headers={"Authorization": f"OAuth {_token}"},
+        headers={
+            "Authorization": f"OAuth {_token}",
+            "User-Agent": YADISK_API_USER_AGENT,
+        },
         timeout=aiohttp.ClientTimeout(total=60, connect=15),
     )
     _transfer_session = aiohttp.ClientSession(

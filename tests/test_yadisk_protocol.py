@@ -3,7 +3,7 @@ import json
 import unittest
 from pathlib import Path
 from tempfile import TemporaryDirectory
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import yadisk_poll
 import telegram_session_delivery
@@ -55,6 +55,31 @@ class ManifestTests(unittest.TestCase):
             validate_manifest(dict(base, event_folder="../other", files=[{
                 "name": "photo.jpg", "kind": "photo", "size": 1, "md5": None,
             }]))
+
+
+class ConnectionSettingsTests(unittest.IsolatedAsyncioTestCase):
+    async def test_api_session_uses_desktop_client_user_agent(self):
+        api_session = MagicMock(closed=False)
+        transfer_session = MagicMock(closed=False)
+        with patch.object(yadisk_poll, "_configured", True), \
+             patch.object(yadisk_poll, "_token", "secret"), \
+             patch.object(yadisk_poll, "_folder", "/event"), \
+             patch.object(yadisk_poll, "_bus_root", "/control"), \
+             patch.object(yadisk_poll, "_session", None), \
+             patch.object(yadisk_poll, "_transfer_session", None), \
+             patch("yadisk_poll.aiohttp.ClientSession", side_effect=[
+                 api_session,
+                 transfer_session,
+             ]) as client_session, \
+             patch("yadisk_poll._ensure_directory", AsyncMock(return_value=True)):
+            self.assertTrue(await yadisk_poll._connect())
+
+        headers = client_session.call_args_list[0].kwargs["headers"]
+        self.assertEqual(headers["Authorization"], "OAuth secret")
+        self.assertEqual(
+            headers["User-Agent"],
+            yadisk_poll.YADISK_API_USER_AGENT,
+        )
 
 
 class DeliveryTests(unittest.IsolatedAsyncioTestCase):

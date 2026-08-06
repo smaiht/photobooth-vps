@@ -18,6 +18,9 @@ from messaging import ReplyTarget
 log = logging.getLogger(__name__)
 
 API = "https://cloud-api.yandex.net/v1/disk"
+# Generic REST clients can receive throttled upload links for compressed or
+# video files. Use the same minimal desktop-client shape as the booth.
+YADISK_API_USER_AGENT = 'Yandex.Disk {"os":"windows"}'
 SCHEMA_VERSION = 3
 COMMAND_ID_RE = re.compile(r"^[a-f0-9]{32}$")
 
@@ -116,7 +119,10 @@ async def _connect() -> bool:
         return True
     await _close_sessions()
     _session = aiohttp.ClientSession(
-        headers={"Authorization": f"OAuth {_token}"},
+        headers={
+            "Authorization": f"OAuth {_token}",
+            "User-Agent": YADISK_API_USER_AGENT,
+        },
         timeout=aiohttp.ClientTimeout(total=60, connect=15),
     )
     _transfer_session = aiohttp.ClientSession(

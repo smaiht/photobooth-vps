@@ -18,6 +18,9 @@ from aiohttp.payload import Payload
 log = logging.getLogger(__name__)
 
 API = "https://cloud-api.yandex.net/v1/disk"
+# Direct fallback uploads use a .zip destination, one of the media types for
+# which generic REST clients can receive upload links capped near 128 KiB/s.
+YADISK_API_USER_AGENT = 'Yandex.Disk {"os":"windows"}'
 SCHEMA_VERSION = 1
 TRANSFER_CHUNK_SIZE = 1024 * 1024
 PROGRESS_BYTES = 10 * 1024 * 1024
@@ -398,7 +401,11 @@ async def publish_update(
     transfer_timeout = aiohttp.ClientTimeout(
         total=TRANSFER_TIMEOUT_SECONDS, connect=30)
     async with aiohttp.ClientSession(
-        headers={"Authorization": f"OAuth {token}"}, timeout=api_timeout,
+        headers={
+            "Authorization": f"OAuth {token}",
+            "User-Agent": YADISK_API_USER_AGENT,
+        },
+        timeout=api_timeout,
     ) as api_session, aiohttp.ClientSession(timeout=transfer_timeout) as transfer_session:
         await _ensure_directories(api_session, root)
         status = {

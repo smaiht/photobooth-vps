@@ -70,6 +70,26 @@ class PublishUpdateTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(body.size, len(payload))
         self.assertIn("upload progress", "\n".join(captured.output))
 
+    async def test_api_session_uses_desktop_client_user_agent(self):
+        with patch.dict("os.environ", {"YADISK_TOKEN": "test-token"}), \
+             patch("yadisk_updates.aiohttp.ClientSession", side_effect=[
+                 _Session(),
+                 _Session(),
+             ]) as client_session, \
+             patch("yadisk_updates._ensure_directories", AsyncMock()), \
+             patch("yadisk_updates._upload_bytes", AsyncMock()):
+            await yadisk_updates.publish_update(
+                b"zip payload",
+                "photobooth_system/updates",
+            )
+
+        headers = client_session.call_args_list[0].kwargs["headers"]
+        self.assertEqual(headers["Authorization"], "OAuth test-token")
+        self.assertEqual(
+            headers["User-Agent"],
+            yadisk_updates.YADISK_API_USER_AGENT,
+        )
+
     async def test_uploads_full_artifact_before_status_pointer(self):
         uploads = []
 
