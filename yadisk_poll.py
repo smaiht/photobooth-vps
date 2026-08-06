@@ -33,7 +33,7 @@ API = "https://cloud-api.yandex.net/v1/disk"
 # Keep upload-link requests consistent with the booth and avoid Yandex.Disk's
 # generic-client throttling if new media types are accepted in this path.
 YADISK_API_USER_AGENT = 'Yandex.Disk {"os":"windows"}'
-POLL_INTERVAL = 10
+POLL_INTERVAL = 5
 PAGE_SIZE = 1000
 STATE_FILE = Path(__file__).resolve().parent / "vps_yadisk_state.json"
 SCHEMA_VERSION = 2
