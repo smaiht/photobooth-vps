@@ -276,6 +276,77 @@ class DeliveryTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("gone.json", yadisk_poll._retry_after)
         self.assertNotIn("gone.json", yadisk_poll._failures)
 
+    async def test_booth_notice_is_dispatched_to_the_response_worker(self):
+        notice_id = "c" * 32
+        notice = {
+            "schema_version": 3,
+            "message_type": "booth_notice",
+            "notice_id": notice_id,
+            "kind": "camera_config",
+            "title": "Конфигурация камеры",
+            "text": "ISO=100",
+        }
+        name = f"notice_20260809T110000Z_{notice_id}.json"
+        item = {"name": name, "path": f"disk:/bus/to_vps/{name}"}
+        session_queue = asyncio.Queue()
+        response_queue = asyncio.Queue()
+        yadisk_poll._state = {"handled_messages": []}
+
+        with patch("yadisk_poll._connect", AsyncMock(return_value=True)), \
+             patch("yadisk_poll._list_inbox", AsyncMock(return_value=[item])), \
+             patch("yadisk_poll._download_bytes", AsyncMock(
+                 return_value=json.dumps(notice).encode())):
+            await yadisk_poll._poll_once(session_queue, response_queue)
+
+        # A notice is short text, so it shares the existing response worker and
+        # only stays out of the slow media queue.
+        self.assertEqual(session_queue.qsize(), 0)
+        self.assertEqual(response_queue.qsize(), 1)
+        self.assertEqual((await response_queue.get())[2], "booth_notice")
+
+    async def test_notice_is_deleted_only_after_successful_delivery(self):
+        notice_id = "d" * 32
+        name = f"notice_20260809T110000Z_{notice_id}.json"
+        item = {"name": name, "path": f"disk:/bus/to_vps/{name}"}
+        notice = {
+            "schema_version": 3,
+            "message_type": "booth_notice",
+            "notice_id": notice_id,
+            "kind": "camera_config",
+            "text": "ISO=100",
+        }
+        yadisk_poll._state = {"handled_messages": []}
+
+        with patch("yadisk_poll._delete_inbox_message",
+                   AsyncMock(return_value=True)) as delete:
+            failed = await yadisk_poll._process_notice(
+                item, notice, AsyncMock(return_value=False))
+            self.assertFalse(failed)
+            delete.assert_not_awaited()
+
+            handled = await yadisk_poll._process_notice(
+                item, notice, AsyncMock(return_value=True))
+
+        self.assertTrue(handled)
+        delete.assert_awaited_once_with(name)
+        self.assertEqual(yadisk_poll._state["handled_messages"], [])
+
+    async def test_malformed_notice_is_not_delivered(self):
+        notice_id = "e" * 32
+        name = f"notice_20260809T110000Z_{notice_id}.json"
+        item = {"name": name, "path": f"disk:/bus/to_vps/{name}"}
+        handler = AsyncMock(return_value=True)
+        yadisk_poll._state = {"handled_messages": []}
+
+        with patch("yadisk_poll._delete_inbox_message",
+                   AsyncMock(return_value=True)) as delete:
+            handled = await yadisk_poll._process_notice(
+                item, {"message_type": "booth_notice"}, handler)
+
+        self.assertFalse(handled)
+        handler.assert_not_awaited()
+        delete.assert_not_awaited()
+
 
 class PhotoSizeLimitTests(unittest.IsolatedAsyncioTestCase):
     """Telegram rejects a photo over 10 MiB with a permanent HTTP 400."""

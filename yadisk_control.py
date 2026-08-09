@@ -23,6 +23,11 @@ API = "https://cloud-api.yandex.net/v1/disk"
 YADISK_API_USER_AGENT = 'Yandex.Disk {"os":"windows"}'
 SCHEMA_VERSION = 3
 COMMAND_ID_RE = re.compile(r"^[a-f0-9]{32}$")
+NOTICE_ID_RE = re.compile(r"^[a-f0-9]{32}$")
+NOTICE_KIND_RE = re.compile(r"^[a-z][a-z0-9_]{0,39}$")
+NOTICE_NAME_RE = re.compile(
+    r"^notice_[0-9]{8}T[0-9]{6}Z_[a-f0-9]{32}\.json$")
+MAX_NOTICE_TEXT = 3500
 
 _session: aiohttp.ClientSession | None = None
 _transfer_session: aiohttp.ClientSession | None = None
@@ -90,6 +95,44 @@ def validate_response(data: dict, filename: str = "") -> dict:
         "start_locked": start_locked,
         "unlock_sessions_remaining": unlock_sessions_remaining,
         "reply_target": reply_target,
+        "created_at": str(data.get("created_at", "")),
+    }
+
+
+def validate_notice(data: dict, filename: str = "") -> dict:
+    """Validate an unsolicited booth notice and return a normalized copy.
+
+    A notice is not an answer to a command, so it carries no ``command_id`` and
+    no ``reply_target``: the booth holds no messenger credentials and the VPS
+    delivers it to its own configured administrators.
+    """
+    if not isinstance(data, dict) or data.get("schema_version") != SCHEMA_VERSION:
+        raise ValueError("unsupported notice schema")
+    if data.get("message_type") != "booth_notice":
+        raise ValueError("invalid notice message_type")
+    notice_id = data.get("notice_id")
+    if not isinstance(notice_id, str) or not NOTICE_ID_RE.fullmatch(notice_id):
+        raise ValueError("invalid notice_id")
+    if filename and not NOTICE_NAME_RE.fullmatch(filename):
+        raise ValueError("invalid notice filename")
+    if filename and not filename.endswith(f"_{notice_id}.json"):
+        raise ValueError("notice filename does not match notice_id")
+    kind = data.get("kind")
+    if not isinstance(kind, str) or not NOTICE_KIND_RE.fullmatch(kind):
+        raise ValueError("invalid notice kind")
+    text = data.get("text")
+    if not isinstance(text, str) or not text.strip():
+        raise ValueError("notice text is required")
+    title = data.get("title")
+    if title is not None and not isinstance(title, str):
+        raise ValueError("invalid notice title")
+    return {
+        "schema_version": SCHEMA_VERSION,
+        "message_type": "booth_notice",
+        "notice_id": notice_id,
+        "kind": kind,
+        "title": str(title or "")[:200],
+        "text": text[:MAX_NOTICE_TEXT],
         "created_at": str(data.get("created_at", "")),
     }
 

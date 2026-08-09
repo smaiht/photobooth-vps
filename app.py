@@ -42,7 +42,10 @@ async def main() -> None:
                 log.error("Yandex.Disk inbox poller is not configured")
             else:
                 workers.create_task(
-                    yadisk_poll.yadisk_poll_loop(control_response_service.handle),
+                    yadisk_poll.yadisk_poll_loop(
+                        control_response_service.handle,
+                        control_response_service.handle_notice,
+                    ),
                     name="yadisk-inbox-poll",
                 )
             workers.create_task(

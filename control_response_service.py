@@ -224,6 +224,44 @@ async def _event_update(
     )
 
 
+async def handle_notice(notice: dict) -> bool:
+    """Deliver one unsolicited booth notice to every configured administrator.
+
+    The booth cannot address a messenger itself, so the notice has no
+    ``reply_target`` and is broadcast to the administrators this VPS knows.
+    Returning False keeps the message on Disk for a later retry.
+    """
+    title = str(notice.get("title") or "").strip()
+    text = str(notice.get("text") or "").strip()
+    caption = f"ℹ️ {title}\n\n{text}" if title else f"ℹ️ {text}"
+    delivery = await admin_notifications.send_admin_text(caption)
+    if not delivery.delivered_targets:
+        log.warning(
+            "Control: notice %s (%s) not delivered to any administrator",
+            notice.get("notice_id"),
+            notice.get("kind"),
+        )
+        return False
+    if delivery.failed_targets:
+        # At least one administrator has the notice, so retrying would only
+        # duplicate it for the channels that already succeeded.
+        log.warning(
+            "Control: notice %s delivered partially; failed=%s",
+            notice.get("notice_id"),
+            ", ".join(
+                f"{target.provider}:{target.conversation_id}"
+                for target in delivery.failed_targets
+            ),
+        )
+    log.info(
+        "Control: notice %s (%s) delivered to %d administrator channel(s)",
+        notice.get("notice_id"),
+        notice.get("kind"),
+        len(delivery.delivered_targets),
+    )
+    return True
+
+
 async def handle(response: dict) -> bool:
     """Apply one validated booth response and deliver its user-facing result."""
     target = ReplyTarget.from_value(response.get("reply_target"))

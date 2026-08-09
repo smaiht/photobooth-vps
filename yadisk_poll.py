@@ -59,6 +59,7 @@ _retry_after: dict[str, float] = {}
 _failures: dict[str, int] = {}
 
 ResponseHandler = Callable[[dict], Awaitable[bool]]
+NoticeHandler = Callable[[dict], Awaitable[bool]]
 
 
 class _PrintUploadPayload(Payload):
@@ -509,6 +510,19 @@ async def _process_response(
     return await _finish_message(item, lambda: handler(response))
 
 
+async def _process_notice(
+    item: dict,
+    data: dict,
+    handler: NoticeHandler,
+) -> bool:
+    try:
+        notice = yadisk_control.validate_notice(data, item["name"])
+    except Exception as exc:
+        log.warning(f"YaDisk: invalid booth notice {item['name']}: {exc}")
+        return False
+    return await _finish_message(item, lambda: handler(notice))
+
+
 def _note_success(message_name: str) -> None:
     _retry_after.pop(message_name, None)
     _failures.pop(message_name, None)
@@ -540,6 +554,7 @@ def _message_is_deferred(message_name: str) -> bool:
 async def _message_worker(
     queue: asyncio.Queue,
     response_handler: ResponseHandler,
+    notice_handler: NoticeHandler | None = None,
 ) -> None:
     while True:
         item, data, message_type = await queue.get()
@@ -549,6 +564,10 @@ async def _message_worker(
                 completed = await _finish_message(item)
             elif message_type == "session_ready":
                 completed = await _process_manifest(item, data)
+            elif message_type == "booth_notice":
+                if notice_handler is None:
+                    raise ValueError("no notice handler configured")
+                completed = await _process_notice(item, data, notice_handler)
             else:
                 completed = await _process_response(item, data, response_handler)
             if completed:
@@ -588,6 +607,11 @@ async def _poll_once(
                 target_queue = session_queue
             elif message_type == "command_response":
                 target_queue = response_queue
+            elif message_type == "booth_notice":
+                # A notice is one short text, so it shares the response worker
+                # instead of needing a queue of its own.
+                yadisk_control.validate_notice(data, message_name)
+                target_queue = response_queue
             else:
                 raise ValueError("unknown message_type")
         except Exception as exc:
@@ -603,13 +627,17 @@ async def _poll_once(
         del _failures[message_name]
 
 
-async def yadisk_poll_loop(response_handler: ResponseHandler) -> None:
-    """Poll one stable inbox and dispatch media and responses independently."""
+async def yadisk_poll_loop(
+    response_handler: ResponseHandler,
+    notice_handler: NoticeHandler | None = None,
+) -> None:
+    """Poll one stable inbox and keep media from delaying command responses."""
     session_queue = asyncio.Queue()
     response_queue = asyncio.Queue()
     workers = [
         asyncio.create_task(_message_worker(session_queue, response_handler)),
-        asyncio.create_task(_message_worker(response_queue, response_handler)),
+        asyncio.create_task(_message_worker(
+            response_queue, response_handler, notice_handler)),
     ]
     try:
         while True:

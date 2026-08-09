@@ -69,6 +69,139 @@ class ResponseValidationTests(unittest.TestCase):
             }, f"response_{command_id}.json")
 
 
+class BoothNoticeValidationTests(unittest.TestCase):
+    """Unsolicited booth notices carry no command_id and no reply_target."""
+
+    def _valid(self, **overrides) -> dict:
+        notice = {
+            "schema_version": 3,
+            "message_type": "booth_notice",
+            "notice_id": "a" * 32,
+            "kind": "camera_config",
+            "title": "Конфигурация камеры",
+            "text": "ISO=100, Av=16",
+            "created_at": "2026-08-09T11:00:00+00:00",
+        }
+        notice.update(overrides)
+        return notice
+
+    def _filename(self, notice_id: str = "a" * 32) -> str:
+        return f"notice_20260809T110000Z_{notice_id}.json"
+
+    def test_valid_notice_is_normalized(self):
+        notice = yadisk_control.validate_notice(self._valid(), self._filename())
+        self.assertEqual(notice["message_type"], "booth_notice")
+        self.assertEqual(notice["kind"], "camera_config")
+        self.assertEqual(notice["text"], "ISO=100, Av=16")
+        self.assertEqual(notice["title"], "Конфигурация камеры")
+        # A notice is not a reply, so no target may be inherited from it.
+        self.assertNotIn("reply_target", notice)
+        self.assertNotIn("command_id", notice)
+
+    def test_missing_title_is_allowed(self):
+        notice = yadisk_control.validate_notice(
+            self._valid(title=None), self._filename())
+        self.assertEqual(notice["title"], "")
+
+    def test_rejects_wrong_schema_and_message_type(self):
+        with self.assertRaisesRegex(ValueError, "schema"):
+            yadisk_control.validate_notice(self._valid(schema_version=2))
+        with self.assertRaisesRegex(ValueError, "message_type"):
+            yadisk_control.validate_notice(
+                self._valid(message_type="command_response"))
+
+    def test_rejects_invalid_identifier_kind_and_text(self):
+        for overrides, message in (
+            ({"notice_id": "zz"}, "notice_id"),
+            ({"notice_id": 5}, "notice_id"),
+            ({"kind": "Camera Config"}, "kind"),
+            ({"kind": ""}, "kind"),
+            ({"text": ""}, "text"),
+            ({"text": "   "}, "text"),
+            ({"text": None}, "text"),
+            ({"title": 5}, "title"),
+        ):
+            with self.subTest(overrides=overrides), \
+                    self.assertRaisesRegex(ValueError, message):
+                yadisk_control.validate_notice(self._valid(**overrides))
+
+    def test_rejects_filename_that_does_not_match_the_notice(self):
+        with self.assertRaisesRegex(ValueError, "filename"):
+            yadisk_control.validate_notice(
+                self._valid(), self._filename("b" * 32))
+        with self.assertRaisesRegex(ValueError, "filename"):
+            yadisk_control.validate_notice(self._valid(), "notice.json")
+        with self.assertRaisesRegex(ValueError, "filename"):
+            yadisk_control.validate_notice(
+                self._valid(), f"response_{'a' * 32}.json")
+
+    def test_long_text_is_truncated_to_the_documented_limit(self):
+        notice = yadisk_control.validate_notice(
+            self._valid(text="x" * 9000), self._filename())
+        self.assertEqual(len(notice["text"]), yadisk_control.MAX_NOTICE_TEXT)
+
+
+class BoothNoticeDeliveryTests(unittest.IsolatedAsyncioTestCase):
+    def _notice(self, **overrides) -> dict:
+        notice = {
+            "notice_id": "a" * 32,
+            "kind": "camera_config",
+            "title": "Конфигурация камеры",
+            "text": "ISO=100",
+        }
+        notice.update(overrides)
+        return notice
+
+    async def test_notice_is_broadcast_to_all_admin_channels(self):
+        delivery = admin_notifications.AdminBroadcastDelivery(
+            delivered_targets=(
+                ReplyTarget("telegram", "1"), ReplyTarget("vk", "2")),
+            failed_targets=(),
+        )
+        with patch("control_response_service.admin_notifications.send_admin_text",
+                   AsyncMock(return_value=delivery)) as send:
+            handled = await control_response_service.handle_notice(self._notice())
+
+        self.assertTrue(handled)
+        text = send.await_args.args[0]
+        self.assertIn("Конфигурация камеры", text)
+        self.assertIn("ISO=100", text)
+
+    async def test_notice_without_title_still_delivers_its_text(self):
+        delivery = admin_notifications.AdminBroadcastDelivery(
+            delivered_targets=(ReplyTarget("telegram", "1"),),
+            failed_targets=(),
+        )
+        with patch("control_response_service.admin_notifications.send_admin_text",
+                   AsyncMock(return_value=delivery)) as send:
+            self.assertTrue(
+                await control_response_service.handle_notice(
+                    self._notice(title="")))
+        self.assertIn("ISO=100", send.await_args.args[0])
+
+    async def test_total_failure_keeps_the_message_for_a_retry(self):
+        delivery = admin_notifications.AdminBroadcastDelivery(
+            delivered_targets=(),
+            failed_targets=(ReplyTarget("telegram", "1"),),
+        )
+        with patch("control_response_service.admin_notifications.send_admin_text",
+                   AsyncMock(return_value=delivery)):
+            handled = await control_response_service.handle_notice(self._notice())
+
+        self.assertFalse(handled)
+
+    async def test_partial_failure_is_accepted_to_avoid_duplicates(self):
+        delivery = admin_notifications.AdminBroadcastDelivery(
+            delivered_targets=(ReplyTarget("telegram", "1"),),
+            failed_targets=(ReplyTarget("vk", "2"),),
+        )
+        with patch("control_response_service.admin_notifications.send_admin_text",
+                   AsyncMock(return_value=delivery)):
+            handled = await control_response_service.handle_notice(self._notice())
+
+        self.assertTrue(handled)
+
+
 class SendCommandTests(unittest.IsolatedAsyncioTestCase):
     async def test_uploads_one_command_json(self):
         uploads = []
