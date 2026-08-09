@@ -88,10 +88,11 @@ async def _post_with_retry(
             )
             continue
         log.warning(
-            "TG %s failed HTTP %d after %d attempt(s)",
+            "TG %s failed HTTP %d after %d attempt(s): %s",
             operation,
             status,
             attempt,
+            delivery_retry.error_description(body) or "no description",
         )
         return None
     return None

@@ -537,6 +537,78 @@ class CameraSettingCommandTests(unittest.IsolatedAsyncioTestCase):
         send.assert_not_awaited()
         self.assertIn("Использование", send_text.await_args.args[1])
 
+    async def test_booth_rejection_is_delivered_once_and_not_retried(self):
+        """A rejected value is a final verdict, not a delivery failure."""
+        response = {
+            "schema_version": 3,
+            "message_type": "command_response",
+            "command_id": "b" * 32,
+            "command": "set_camera_config",
+            "status": "error",
+            "message": "iso: значение 101 недопустимо",
+            "reply_target": {
+                "provider": "telegram",
+                "conversation_id": "123",
+            },
+        }
+        item = {
+            "name": f"response_{'b' * 32}.json",
+            "path": f"disk:/bus/to_vps/response_{'b' * 32}.json",
+        }
+        yadisk_poll._state = {"handled_messages": []}
+        yadisk_poll._retry_after.clear()
+        yadisk_poll._failures.clear()
+
+        with patch(
+            "control_response_service.messenger_delivery.send_text",
+            AsyncMock(return_value=True),
+        ) as send_text, patch(
+            "yadisk_poll._delete_inbox_message", AsyncMock(return_value=True),
+        ) as delete:
+            handled = await yadisk_poll._process_response(
+                item, response, control_response_service.handle,
+            )
+
+        self.assertTrue(handled)
+        self.assertIn("101", send_text.await_args.args[1])
+        self.assertTrue(send_text.await_args.args[1].startswith("❌"))
+        # The message leaves the inbox, so the poller never sees it again.
+        delete.assert_awaited_once()
+        self.assertNotIn(item["name"], yadisk_poll._retry_after)
+
+    async def test_rejection_is_retried_only_when_delivery_fails(self):
+        response = {
+            "schema_version": 3,
+            "message_type": "command_response",
+            "command_id": "c" * 32,
+            "command": "set_camera_config",
+            "status": "error",
+            "message": "iso: значение 101 недопустимо",
+            "reply_target": {
+                "provider": "telegram",
+                "conversation_id": "123",
+            },
+        }
+        item = {
+            "name": f"response_{'c' * 32}.json",
+            "path": f"disk:/bus/to_vps/response_{'c' * 32}.json",
+        }
+        yadisk_poll._state = {"handled_messages": []}
+
+        with patch(
+            "control_response_service.messenger_delivery.send_text",
+            AsyncMock(return_value=False),
+        ), patch(
+            "yadisk_poll._delete_inbox_message", AsyncMock(return_value=True),
+        ) as delete:
+            handled = await yadisk_poll._process_response(
+                item, response, control_response_service.handle,
+            )
+
+        self.assertFalse(handled)
+        delete.assert_not_awaited()
+        self.assertEqual(yadisk_poll._state["handled_messages"], [])
+
     async def test_get_config_is_forwarded_as_fixed_command(self):
         with patch(
             "admin_command_service.yadisk_control.send_command",

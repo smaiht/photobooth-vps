@@ -11,6 +11,7 @@ from collections.abc import Mapping
 MAX_ATTEMPTS = 3
 RETRY_DELAYS = (0.5, 1.5)
 MAX_RETRY_AFTER = 30.0
+MAX_DESCRIPTION_CHARS = 300
 _RETRYABLE_HTTP_STATUSES = frozenset({408, 425, 429})
 
 
@@ -41,6 +42,23 @@ def retry_after_seconds(
     if seconds is None or not math.isfinite(seconds) or seconds < 0:
         return None
     return min(seconds, MAX_RETRY_AFTER)
+
+
+def error_description(body: bytes | None) -> str:
+    """Extract the provider's own failure reason for actionable log lines."""
+    if not body:
+        return ""
+    try:
+        payload = json.loads(body)
+    except (TypeError, ValueError):
+        text = body.decode("utf-8", "replace") if isinstance(body, bytes) else str(body)
+        return text.strip().replace("\n", " ")[:MAX_DESCRIPTION_CHARS]
+    if isinstance(payload, dict):
+        for key in ("description", "error_msg", "message", "error"):
+            value = payload.get(key)
+            if isinstance(value, str) and value.strip():
+                return value.strip()[:MAX_DESCRIPTION_CHARS]
+    return ""
 
 
 async def wait_before_retry(

@@ -34,6 +34,9 @@ API = "https://cloud-api.yandex.net/v1/disk"
 # generic-client throttling if new media types are accepted in this path.
 YADISK_API_USER_AGENT = 'Yandex.Disk {"os":"windows"}'
 POLL_INTERVAL = 5
+# One failed message must not be re-downloaded and re-uploaded every poll: a
+# permanent provider rejection would otherwise burn bandwidth in a tight loop.
+RETRY_BACKOFF_SECONDS = (30, 60, 120, 300)
 PAGE_SIZE = 1000
 STATE_FILE = Path(__file__).resolve().parent / "vps_yadisk_state.json"
 SCHEMA_VERSION = 2
@@ -52,6 +55,8 @@ _bus_root = ""
 _token = ""
 _configured = False
 _inflight: set[str] = set()
+_retry_after: dict[str, float] = {}
+_failures: dict[str, int] = {}
 
 ResponseHandler = Callable[[dict], Awaitable[bool]]
 
@@ -504,23 +509,57 @@ async def _process_response(
     return await _finish_message(item, lambda: handler(response))
 
 
+def _note_success(message_name: str) -> None:
+    _retry_after.pop(message_name, None)
+    _failures.pop(message_name, None)
+
+
+def _note_failure(message_name: str) -> None:
+    """Delay the next attempt for one message using a bounded backoff."""
+    attempts = _failures.get(message_name, 0) + 1
+    _failures[message_name] = attempts
+    index = min(attempts - 1, len(RETRY_BACKOFF_SECONDS) - 1)
+    delay = RETRY_BACKOFF_SECONDS[index]
+    _retry_after[message_name] = time.monotonic() + delay
+    log.warning(
+        "YaDisk: %s failed %d time(s); next attempt in %ds",
+        message_name, attempts, delay,
+    )
+
+
+def _message_is_deferred(message_name: str) -> bool:
+    deadline = _retry_after.get(message_name)
+    if deadline is None:
+        return False
+    if time.monotonic() >= deadline:
+        del _retry_after[message_name]
+        return False
+    return True
+
+
 async def _message_worker(
     queue: asyncio.Queue,
     response_handler: ResponseHandler,
 ) -> None:
     while True:
         item, data, message_type = await queue.get()
+        message_name = item.get("name", "")
         try:
             if message_type == "handled":
-                await _finish_message(item)
+                completed = await _finish_message(item)
             elif message_type == "session_ready":
-                await _process_manifest(item, data)
+                completed = await _process_manifest(item, data)
             else:
-                await _process_response(item, data, response_handler)
+                completed = await _process_response(item, data, response_handler)
+            if completed:
+                _note_success(message_name)
+            else:
+                _note_failure(message_name)
         except Exception as exc:
-            log.warning(f"YaDisk: processing {item.get('name', '?')} failed: {exc}")
+            log.warning(f"YaDisk: processing {message_name or '?'} failed: {exc}")
+            _note_failure(message_name)
         finally:
-            _inflight.discard(item.get("name", ""))
+            _inflight.discard(message_name)
             queue.task_done()
 
 
@@ -530,9 +569,11 @@ async def _poll_once(
 ) -> None:
     if not await _connect():
         return
+    listed = set()
     for item in await _list_inbox():
         message_name = item["name"]
-        if message_name in _inflight:
+        listed.add(message_name)
+        if message_name in _inflight or _message_is_deferred(message_name):
             continue
         if message_name in _state["handled_messages"]:
             _inflight.add(message_name)
@@ -551,9 +592,15 @@ async def _poll_once(
                 raise ValueError("unknown message_type")
         except Exception as exc:
             log.warning(f"YaDisk: invalid inbox message {message_name}: {exc}")
+            _note_failure(message_name)
             continue
         _inflight.add(message_name)
         await target_queue.put((item, data, message_type))
+
+    for message_name in set(_retry_after) - listed:
+        del _retry_after[message_name]
+    for message_name in set(_failures) - listed:
+        del _failures[message_name]
 
 
 async def yadisk_poll_loop(response_handler: ResponseHandler) -> None:
@@ -585,6 +632,8 @@ async def yadisk_init(
     global _folder, _bus_root, _token, _configured
     _state_load()
     _inflight.clear()
+    _retry_after.clear()
+    _failures.clear()
     _token = os.environ.get("YADISK_TOKEN", "").strip()
     folder_name = str(folder or "").strip().strip("/")
     bus_name = str(control_folder or "").strip().strip("/")
