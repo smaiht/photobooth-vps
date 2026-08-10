@@ -118,6 +118,7 @@ async def _prepare_files(files: list[SessionFile]) -> list[SessionFile] | None:
 def _form(
     files: list[SessionFile],
     stack: ExitStack,
+    caption: str = "",
 ) -> aiohttp.FormData:
     form = aiohttp.FormData()
     form.add_field("chat_id", telegram_api.ARCHIVE_CHAT_ID)
@@ -129,15 +130,21 @@ def _form(
             stack.enter_context(path.open("rb")),
             filename=path.name,
         )
+        if caption:
+            form.add_field("caption", caption)
         return form
 
     media = []
     for index, (path, kind) in enumerate(files):
         field = f"file{index}"
-        media.append({
+        item = {
             "type": "video" if kind == "video" else "photo",
             "media": f"attach://{field}",
-        })
+        }
+        # Telegram shows a group caption only when it sits on the first item.
+        if caption and index == 0:
+            item["caption"] = caption
+        media.append(item)
         form.add_field(
             field,
             stack.enter_context(path.open("rb")),
@@ -147,13 +154,17 @@ def _form(
     return form
 
 
-async def _post(endpoint: str, files: list[SessionFile]) -> bool:
+async def _post(
+    endpoint: str,
+    files: list[SessionFile],
+    caption: str = "",
+) -> bool:
     timeout = aiohttp.ClientTimeout(total=180, connect=30)
     async with aiohttp.ClientSession(timeout=timeout) as session:
         for attempt in range(1, delivery_retry.MAX_ATTEMPTS + 1):
             try:
                 with ExitStack() as stack:
-                    form = _form(files, stack)
+                    form = _form(files, stack, caption)
                     async with session.post(
                         f"{telegram_api.BOT_API_BASE}/{endpoint}",
                         data=form,
@@ -218,23 +229,32 @@ async def _post(endpoint: str, files: list[SessionFile]) -> bool:
     return False
 
 
-async def _send_chunk(files: list[SessionFile]) -> bool:
+async def _send_chunk(files: list[SessionFile], caption: str = "") -> bool:
     if len(files) == 1:
         endpoint = "sendVideo" if files[0][1] == "video" else "sendPhoto"
     else:
         endpoint = "sendMediaGroup"
-    return await _post(endpoint, files)
+    return await _post(endpoint, files, caption)
 
 
-async def send_session(files: list[SessionFile]) -> bool:
-    """Send files in Telegram's groups of at most ten attachments."""
+async def send_session(files: list[SessionFile], public_url: str = "") -> bool:
+    """Send files in Telegram's groups of at most ten attachments.
+
+    ``public_url`` is the guest-facing Yandex.Disk folder for this session. It
+    is captioned on the first group only, so a long session does not repeat the
+    same link on every chunk.
+    """
     if not telegram_api.BOT_TOKEN or not telegram_api.ARCHIVE_CHAT_ID:
         log.warning("Telegram token/chat is missing")
         return False
     prepared = await _prepare_files(files)
     if prepared is None:
         return False
+    caption = f"Оригиналы: {public_url}" if public_url else ""
     for start in range(0, len(prepared), 10):
-        if not await _send_chunk(prepared[start:start + 10]):
+        if not await _send_chunk(
+            prepared[start:start + 10],
+            caption if start == 0 else "",
+        ):
             return False
     return True

@@ -16,6 +16,7 @@ import os
 import re
 import tempfile
 import time
+import urllib.parse
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Awaitable, Callable
@@ -174,8 +175,38 @@ def validate_manifest(data: dict) -> dict:
         "event_folder": "/" + event_name,
         "session_id": session_id,
         "created_at": str(data.get("created_at", "")),
+        "public_url": validate_public_url(data.get("public_url")),
         "files": normalized,
     }
+
+
+def validate_public_url(value: object) -> str:
+    """Return a safe Yandex.Disk share link, or "" when there is none.
+
+    A booth older than this VPS sends no ``public_url`` at all, so a missing
+    value is normal and must not reject the whole session. Anything present but
+    not a plain Yandex https link is dropped: the URL ends up in a Telegram
+    caption, so only a trusted host may be echoed there.
+    """
+    if not isinstance(value, str) or not value:
+        return ""
+    url = value.strip()
+    if len(url) > 500 or any(ord(char) < 32 for char in url):
+        log.warning("YaDisk: ignoring malformed session public_url")
+        return ""
+    try:
+        parsed = urllib.parse.urlsplit(url)
+    except ValueError:
+        log.warning("YaDisk: ignoring unparsable session public_url")
+        return ""
+    host = parsed.hostname or ""
+    if parsed.scheme != "https" or not (
+        host == "disk.yandex.ru" or host.endswith(".yandex.ru")
+        or host == "yadi.sk"
+    ):
+        log.warning("YaDisk: ignoring session public_url from host %r", host)
+        return ""
+    return url
 
 
 async def _close_sessions() -> None:
@@ -454,7 +485,9 @@ async def _deliver_session(manifest: dict) -> bool:
             log.warning(f"YaDisk: session download failed, keeping inbox: {exc}")
             return False
 
-        if not await telegram_session_delivery.send_session(local_files):
+        if not await telegram_session_delivery.send_session(
+            local_files, manifest.get("public_url", ""),
+        ):
             log.warning(f"YaDisk: Telegram failed for {manifest['session_id']}, keeping inbox")
             return False
     return True

@@ -3,6 +3,7 @@ import json
 import os
 import time
 import unittest
+from contextlib import ExitStack
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -35,6 +36,50 @@ class ManifestTests(unittest.TestCase):
         self.assertEqual(manifest["session_id"], "abc123def456")
         self.assertEqual(manifest["event_folder"], "/event_2026")
         self.assertEqual(manifest["files"][0]["size"], 1234)
+
+    def test_public_url_is_carried_through_and_optional(self):
+        base = {
+            "schema_version": 2,
+            "message_type": "session_ready",
+            "event_folder": "event_2026",
+            "session_id": "abc123def456",
+            "files": [{
+                "name": "photo_01.jpg", "kind": "photo", "size": 1, "md5": None,
+            }],
+        }
+        link = "https://disk.yandex.ru/d/abcDEF123"
+
+        self.assertEqual(
+            validate_manifest(dict(base, public_url=link))["public_url"], link)
+        # A booth older than this VPS sends no link at all; that is not an error
+        # and must not reject the session media.
+        self.assertEqual(validate_manifest(base)["public_url"], "")
+
+    def test_untrusted_public_url_is_dropped_not_captioned(self):
+        base = {
+            "schema_version": 2,
+            "message_type": "session_ready",
+            "event_folder": "event_2026",
+            "session_id": "abc123def456",
+            "files": [{
+                "name": "photo_01.jpg", "kind": "photo", "size": 1, "md5": None,
+            }],
+        }
+        # The link is echoed into a Telegram caption, so only a plain https
+        # Yandex host may survive validation.
+        for value in (
+            "http://disk.yandex.ru/d/abc",
+            "https://evil.example.com/d/abc",
+            "javascript:alert(1)",
+            "https://disk.yandex.ru.evil.com/d/abc",
+            "https://disk.yandex.ru/d/a\nb",
+            "https://disk.yandex.ru/d/" + "a" * 500,
+            12345,
+            None,
+        ):
+            with self.subTest(value=value):
+                manifest = validate_manifest(dict(base, public_url=value))
+                self.assertEqual(manifest["public_url"], "")
 
     def test_rejects_paths_and_duplicate_names(self):
         base = {
@@ -111,6 +156,45 @@ class DeliveryTests(unittest.IsolatedAsyncioTestCase):
                     [(photo, "photo")],
                 ))
             self.assertEqual(post.await_args.args[0], "sendPhoto")
+
+    async def test_delivered_session_passes_its_public_url_to_telegram(self):
+        manifest = {
+            "schema_version": 2,
+            "message_type": "session_ready",
+            "event_folder": "event",
+            "session_id": "abc123",
+            "created_at": "2026-07-17T12:00:00+00:00",
+            "public_url": "https://disk.yandex.ru/d/abcDEF",
+            "files": [{
+                "name": "photo.jpg",
+                "kind": "photo",
+                "size": 5,
+                "md5": None,
+            }],
+        }
+        yadisk_poll._state = {"handled_messages": []}
+
+        async def download(_remote, local_path, _entry):
+            Path(local_path).write_bytes(b"jpeg")
+
+        with patch("yadisk_poll._download_bytes", AsyncMock(
+                return_value=json.dumps(manifest).encode("utf-8"))), \
+             patch("yadisk_poll._download_file", AsyncMock(side_effect=download)), \
+             patch(
+                 "yadisk_poll.telegram_session_delivery.send_session",
+                 AsyncMock(return_value=True),
+             ) as send, \
+             patch("yadisk_poll._delete_inbox_message",
+                   AsyncMock(return_value=True)):
+            self.assertTrue(await _process_manifest({
+                "name": "abc123.json",
+                "path": "disk:/photobooth_system/control/to_vps/abc123.json",
+            }))
+
+        # The link reaches Telegram as the second positional argument, so the
+        # guest gets media and the folder URL in one message.
+        self.assertEqual(
+            send.await_args.args[1], "https://disk.yandex.ru/d/abcDEF")
 
     async def test_download_failure_keeps_manifest_in_inbox(self):
         manifest = {
@@ -346,6 +430,96 @@ class DeliveryTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(handled)
         handler.assert_not_awaited()
         delete.assert_not_awaited()
+
+
+class SessionLinkCaptionTests(unittest.IsolatedAsyncioTestCase):
+    """The guest-facing folder link travels with the media, in one caption."""
+
+    @staticmethod
+    def _media(tmpdir: Path, count: int) -> list[tuple[Path, str]]:
+        files = []
+        for index in range(count):
+            path = tmpdir / f"photo_{index:02d}.jpg"
+            Image.new("RGB", (32, 32), "navy").save(path, "JPEG")
+            files.append((path, "photo"))
+        return files
+
+    async def test_single_photo_is_captioned_with_the_link(self):
+        with TemporaryDirectory() as tmpdir:
+            files = self._media(Path(tmpdir), 1)
+            sent = []
+
+            async def post(endpoint, chunk, caption=""):
+                sent.append((endpoint, caption))
+                return True
+
+            with patch("telegram_session_delivery._post", side_effect=post), \
+                 patch.object(telegram_api, "BOT_TOKEN", "token"), \
+                 patch.object(telegram_api, "ARCHIVE_CHAT_ID", "1"):
+                self.assertTrue(await telegram_session_delivery.send_session(
+                    files, "https://disk.yandex.ru/d/abcDEF",
+                ))
+
+            self.assertEqual(sent, [
+                ("sendPhoto", "Оригиналы: https://disk.yandex.ru/d/abcDEF"),
+            ])
+
+    async def test_only_the_first_group_repeats_the_link(self):
+        with TemporaryDirectory() as tmpdir:
+            # 12 files span two Telegram groups of at most ten attachments.
+            files = self._media(Path(tmpdir), 12)
+            captions = []
+
+            async def post(_endpoint, _chunk, caption=""):
+                captions.append(caption)
+                return True
+
+            with patch("telegram_session_delivery._post", side_effect=post), \
+                 patch.object(telegram_api, "BOT_TOKEN", "token"), \
+                 patch.object(telegram_api, "ARCHIVE_CHAT_ID", "1"):
+                self.assertTrue(await telegram_session_delivery.send_session(
+                    files, "https://disk.yandex.ru/d/abcDEF",
+                ))
+
+            self.assertEqual(captions, [
+                "Оригиналы: https://disk.yandex.ru/d/abcDEF", "",
+            ])
+
+    async def test_media_group_puts_the_caption_on_the_first_item_only(self):
+        with TemporaryDirectory() as tmpdir:
+            files = self._media(Path(tmpdir), 3)
+            with ExitStack() as stack:
+                form = telegram_session_delivery._form(
+                    files, stack, "Оригиналы: https://disk.yandex.ru/d/abcDEF")
+            fields = {
+                field[0].get("name"): field[2]
+                for field in form._fields
+            }
+            media = json.loads(fields["media"])
+
+            self.assertEqual(
+                media[0]["caption"],
+                "Оригиналы: https://disk.yandex.ru/d/abcDEF",
+            )
+            self.assertNotIn("caption", media[1])
+            self.assertNotIn("caption", media[2])
+
+    async def test_no_link_sends_media_without_a_caption(self):
+        with TemporaryDirectory() as tmpdir:
+            files = self._media(Path(tmpdir), 2)
+            captions = []
+
+            async def post(_endpoint, _chunk, caption=""):
+                captions.append(caption)
+                return True
+
+            with patch("telegram_session_delivery._post", side_effect=post), \
+                 patch.object(telegram_api, "BOT_TOKEN", "token"), \
+                 patch.object(telegram_api, "ARCHIVE_CHAT_ID", "1"):
+                self.assertTrue(
+                    await telegram_session_delivery.send_session(files))
+
+            self.assertEqual(captions, [""])
 
 
 class PhotoSizeLimitTests(unittest.IsolatedAsyncioTestCase):
