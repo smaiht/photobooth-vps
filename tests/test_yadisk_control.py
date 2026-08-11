@@ -766,6 +766,71 @@ class CameraSettingCommandTests(unittest.IsolatedAsyncioTestCase):
         )
 
 
+class CameraPresetCommandTests(unittest.IsolatedAsyncioTestCase):
+    def test_parses_light_preset_and_bot_suffix(self):
+        self.assertEqual(
+            admin_commands.parse("/light evening"),
+            ("set_camera_preset", {"name": "evening"}),
+        )
+        self.assertEqual(
+            admin_commands.parse("/light@photobooth_bot INDOOR_DARK"),
+            ("set_camera_preset", {"name": "indoor_dark"}),
+        )
+
+    def test_rejects_missing_or_malformed_preset_name(self):
+        for text in (
+            "/light",
+            "/light two names",
+            "/light bad-name",
+            "/light _hidden",
+            "/light солнце",
+        ):
+            with self.subTest(text=text), self.assertRaises(ValueError):
+                admin_commands.parse(text)
+
+    def test_help_explains_where_to_find_presets(self):
+        self.assertIn("/light <имя>", admin_commands.HELP_MESSAGE)
+        self.assertIn("/status", admin_commands.HELP_MESSAGE)
+
+    async def test_forwards_preset_name_to_booth(self):
+        target = ReplyTarget("telegram", 123)
+        with patch(
+            "admin_command_service.yadisk_control.send_command",
+            AsyncMock(return_value="a" * 32),
+        ) as send, patch(
+            "admin_command_service.messenger_delivery.send_text",
+            AsyncMock(return_value=True),
+        ) as send_text:
+            await admin_command_service.handle_message(
+                target,
+                "/light cloudy",
+            )
+
+        send.assert_awaited_once_with(
+            "set_camera_preset",
+            target,
+            {"name": "cloudy"},
+        )
+        self.assertIn("Пресет света: cloudy", send_text.await_args.args[1])
+        self.assertIn("подтверждение будки", send_text.await_args.args[1])
+
+    async def test_missing_name_returns_usage_without_disk_command(self):
+        with patch(
+            "admin_command_service.yadisk_control.send_command",
+            new_callable=AsyncMock,
+        ) as send, patch(
+            "admin_command_service.messenger_delivery.send_text",
+            AsyncMock(return_value=True),
+        ) as send_text:
+            await admin_command_service.handle_message(
+                ReplyTarget("telegram", 123),
+                "/light",
+            )
+
+        send.assert_not_awaited()
+        self.assertIn("Использование", send_text.await_args.args[1])
+
+
 class UpdateCommandTests(unittest.IsolatedAsyncioTestCase):
     async def test_update_uses_runtime_folder_by_default(self):
         with patch(

@@ -22,6 +22,7 @@ KNOWN_COMMANDS = {
     "/clear_print_queue": "clear_print_queue",
     "/unblock": "unblock",
     "/block": "unblock",
+    "/light": "set_camera_preset",
     "/logs": "send_logs",
     "/get_config": "get_config",
     "/clear_logs": "clear_logs",
@@ -30,9 +31,14 @@ KNOWN_COMMANDS = {
     "/event": "set_event",
 }
 
+# The booth owns the preset list in config_camera.json, so the VPS only checks
+# the shape of the name and lets the booth report which presets exist.
+PRESET_NAME_RE = re.compile(r"^[a-z][a-z0-9_]{0,39}$")
+
 HELP_MESSAGE = (
     "Не понял команду. Доступные команды:\n\n"
     + "\n\n".join(KNOWN_COMMANDS)
+    + "\n\nПресет света: /light <имя> (список — /status)"
     + "\n\nНастройка камеры, например: /iso 100"
 )
 
@@ -85,6 +91,20 @@ def _parse_block(argument: str | None) -> ParsedCommand:
     return "unblock", {"sessions": 0}
 
 
+def _parse_light(argument: str | None) -> ParsedCommand:
+    if not argument:
+        raise ValueError(
+            "Использование: /light имя_пресета. "
+            "Список доступных пресетов показывает /status"
+        )
+    name = argument.strip().lower()
+    if not PRESET_NAME_RE.fullmatch(name):
+        raise ValueError(
+            "Имя пресета может содержать только латиницу, цифры и _"
+        )
+    return "set_camera_preset", {"name": name}
+
+
 def _parse_print_queue(
     command: str,
     argument: str | None,
@@ -112,6 +132,8 @@ def parse(text: str) -> ParsedCommand | None:
         return _parse_block(argument)
     if known_command == "unblock":
         return _parse_unblock(argument)
+    if known_command == "set_camera_preset":
+        return _parse_light(argument)
     if known_command in ("print_queue", "clear_print_queue"):
         return _parse_print_queue(known_command, argument)
     if known_command:
@@ -148,6 +170,11 @@ def sent_message(command: str, data: dict | None) -> str:
             f"⏳ Камера: {data['field']} → {data['value']}; "
             "ожидаю подтверждение будки"
         )
+    if command == "set_camera_preset":
+        return (
+            f"⏳ Пресет света: {data['name']}; "
+            "ожидаю подтверждение будки"
+        )
     if command == "get_config":
         return "⏳ Запрашиваю конфиги фотобудки..."
     if command == "print_queue":
@@ -164,6 +191,7 @@ def failed_message(command: str, error: Exception) -> str:
         "set_event": "Команда смены мероприятия не отправлена",
         "unblock": "Изменение блокировки не отправлено",
         "set_camera_config": "Настройка камеры не отправлена",
+        "set_camera_preset": "Пресет света не отправлен",
         "print_queue": "Запрос очередей печати не отправлен",
         "clear_print_queue": "Очистка очередей печати не отправлена",
     }.get(command, "Команда не отправлена")
