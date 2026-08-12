@@ -15,7 +15,7 @@ from messaging import ReplyTarget
 
 
 class ResponseValidationTests(unittest.TestCase):
-    def test_validates_response_and_artifact_path(self):
+    def test_validates_embedded_response_document(self):
         command_id = "a" * 32
         response = yadisk_control.validate_response({
             "schema_version": 3,
@@ -24,22 +24,29 @@ class ResponseValidationTests(unittest.TestCase):
             "command": "send_logs",
             "status": "ok",
             "message": "done",
-            "artifact_path": "/photobooth_system/control/logs/test.log",
+            "document": "log contents",
             "reply_target": {
                 "provider": "telegram",
                 "conversation_id": 123,
             },
         }, f"response_{command_id}.json")
         self.assertEqual(response["status"], "ok")
+        self.assertEqual(response["document"], "log contents")
         self.assertEqual(
             response["reply_target"],
             ReplyTarget("telegram", 123),
         )
 
-        with self.assertRaisesRegex(ValueError, "artifact"):
+        with self.assertRaisesRegex(ValueError, "document"):
             yadisk_control.validate_response({
                 **response,
-                "artifact_path": "/control/../secret",
+                "document": "x" * (yadisk_control.MAX_RESPONSE_DOCUMENT_SIZE + 1),
+            })
+
+        with self.assertRaisesRegex(ValueError, "unexpected response document"):
+            yadisk_control.validate_response({
+                **response,
+                "command": "status",
             })
 
     def test_rejects_response_without_reply_target(self):
@@ -250,7 +257,7 @@ class ControlConnectionSettingsTests(unittest.IsolatedAsyncioTestCase):
                  api_session,
                  transfer_session,
              ]) as client_session, \
-             patch("yadisk_control._ensure_directory", AsyncMock()):
+             patch("yadisk_control._ensure_directory", AsyncMock()) as ensure:
             self.assertTrue(await yadisk_control._connect())
 
         headers = client_session.call_args_list[0].kwargs["headers"]
@@ -258,6 +265,10 @@ class ControlConnectionSettingsTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(
             headers["User-Agent"],
             yadisk_control.YADISK_API_USER_AGENT,
+        )
+        self.assertEqual(
+            [call.args[0] for call in ensure.await_args_list],
+            ["/control", "/control/to_booth", "/control/to_vps"],
         )
 
 
@@ -951,25 +962,21 @@ class LogDeliveryTests(unittest.IsolatedAsyncioTestCase):
 
         form.add_field.assert_any_call("chat_id", "5683598562")
 
-    async def test_successful_document_is_not_retried_for_cleanup_or_text(self):
+    async def test_embedded_document_is_delivered_without_extra_text(self):
         response = {
             "status": "ok",
             "command": "send_logs",
-            "message": "Лог загружен",
-            "artifact_path": "/control/logs/test.log",
+            "message": "Лог готов",
+            "document": "log",
             "reply_target": {
                 "provider": "telegram",
                 "conversation_id": "5683598562",
             },
         }
-        with patch("control_response_service.yadisk_control.download_bytes",
-                   AsyncMock(return_value=b"log")), \
-             patch("control_response_service.messenger_delivery.send_document",
+        with patch("control_response_service.messenger_delivery.send_document",
                    AsyncMock(return_value=True)) as send_document, \
              patch("control_response_service.messenger_delivery.send_text",
-                   new_callable=AsyncMock) as send_text, \
-             patch("control_response_service.yadisk_control.delete_resource", AsyncMock(
-                 side_effect=RuntimeError("cleanup unavailable"))) as delete:
+                   new_callable=AsyncMock) as send_text:
             self.assertTrue(await control_response_service.handle(response))
 
         send_document.assert_awaited_once_with(
@@ -979,29 +986,22 @@ class LogDeliveryTests(unittest.IsolatedAsyncioTestCase):
             "text/plain",
         )
         send_text.assert_not_awaited()
-        delete.assert_awaited_once_with("/control/logs/test.log")
 
     async def test_log_response_can_be_delivered_to_vk(self):
         response = {
             "status": "ok",
             "command": "send_logs",
-            "message": "Лог загружен",
-            "artifact_path": "/control/logs/test.log",
+            "message": "Лог готов",
+            "document": "log",
             "reply_target": {
                 "provider": "vk",
                 "conversation_id": "556972284",
             },
         }
         with patch(
-            "control_response_service.yadisk_control.download_bytes",
-            AsyncMock(return_value=b"log"),
-        ), patch(
             "control_response_service.messenger_delivery.send_document",
             AsyncMock(return_value=True),
-        ) as send, patch(
-            "control_response_service.yadisk_control.delete_resource",
-            AsyncMock(return_value=True),
-        ) as delete:
+        ) as send:
             self.assertTrue(await control_response_service.handle(response))
 
         send.assert_awaited_once_with(
@@ -1010,7 +1010,6 @@ class LogDeliveryTests(unittest.IsolatedAsyncioTestCase):
             "photobooth.log",
             "text/plain",
         )
-        delete.assert_awaited_once_with("/control/logs/test.log")
 
 
 class PrintCommandResponseTests(unittest.IsolatedAsyncioTestCase):
@@ -1126,12 +1125,12 @@ class ConfigDeliveryTests(unittest.IsolatedAsyncioTestCase):
             content_type="text/plain; charset=utf-8",
         )
 
-    async def test_control_response_delivers_configs_and_cleans_export(self):
+    async def test_control_response_delivers_embedded_booth_and_vps_configs(self):
         response = {
             "status": "ok",
             "command": "get_config",
             "message": "Конфиги готовы",
-            "artifact_path": "/control/configs/test.txt",
+            "document": "===== config_app.json =====\n{}\n",
             "reply_target": {
                 "provider": "telegram",
                 "conversation_id": "123",
@@ -1141,14 +1140,10 @@ class ConfigDeliveryTests(unittest.IsolatedAsyncioTestCase):
         vps_config = b'{"yadisk_folder":"event"}\n'
         with patch("control_response_service.runtime_config.read_bytes",
                    return_value=vps_config), \
-             patch("control_response_service.yadisk_control.download_bytes",
-                   AsyncMock(return_value=export)), \
              patch("control_response_service.messenger_delivery.send_documents",
                    AsyncMock(return_value=True)) as send, \
              patch("control_response_service.messenger_delivery.send_document",
-                   new_callable=AsyncMock) as send_document, \
-             patch("control_response_service.yadisk_control.delete_resource",
-                   AsyncMock(return_value=True)) as delete:
+                   new_callable=AsyncMock) as send_document:
             self.assertTrue(await control_response_service.handle(response))
 
         send.assert_awaited_once_with(
@@ -1167,7 +1162,6 @@ class ConfigDeliveryTests(unittest.IsolatedAsyncioTestCase):
             ],
         )
         send_document.assert_not_awaited()
-        delete.assert_awaited_once_with("/control/configs/test.txt")
 
 
 if __name__ == "__main__":

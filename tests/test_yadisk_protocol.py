@@ -122,7 +122,8 @@ class ConnectionSettingsTests(unittest.IsolatedAsyncioTestCase):
                  api_session,
                  transfer_session,
              ]) as client_session, \
-             patch("yadisk_poll._ensure_directory", AsyncMock(return_value=True)):
+             patch("yadisk_poll._ensure_directory",
+                   AsyncMock(return_value=True)) as ensure:
             self.assertTrue(await yadisk_poll._connect())
 
         headers = client_session.call_args_list[0].kwargs["headers"]
@@ -130,6 +131,10 @@ class ConnectionSettingsTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(
             headers["User-Agent"],
             yadisk_poll.YADISK_API_USER_AGENT,
+        )
+        self.assertEqual(
+            [call.args[0] for call in ensure.await_args_list],
+            ["/control", "/control/to_booth", "/control/to_vps", "/event"],
         )
 
 

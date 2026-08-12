@@ -1,4 +1,4 @@
-"""VPS helpers for commands and control artifacts on Yandex.Disk."""
+"""VPS helpers for the two-folder Yandex.Disk control channel."""
 
 from __future__ import annotations
 
@@ -28,6 +28,8 @@ NOTICE_KIND_RE = re.compile(r"^[a-z][a-z0-9_]{0,39}$")
 NOTICE_NAME_RE = re.compile(
     r"^notice_[0-9]{8}T[0-9]{6}Z_[a-f0-9]{32}\.json$")
 MAX_NOTICE_TEXT = 3500
+MAX_RESPONSE_DOCUMENT_SIZE = 512 * 1024
+DOCUMENT_COMMANDS = frozenset({"send_logs", "get_config"})
 
 _session: aiohttp.ClientSession | None = None
 _transfer_session: aiohttp.ClientSession | None = None
@@ -59,11 +61,13 @@ def validate_response(data: dict, filename: str = "") -> dict:
     status = data.get("status")
     if status not in ("ok", "error"):
         raise ValueError("invalid response status")
-    artifact_path = data.get("artifact_path")
-    if artifact_path is not None and (
-            not isinstance(artifact_path, str) or not artifact_path.startswith("/")
-            or ".." in artifact_path.split("/")):
-        raise ValueError("invalid artifact path")
+    document = data.get("document")
+    if command in DOCUMENT_COMMANDS and status == "ok":
+        if (not isinstance(document, str) or not document
+                or len(document.encode("utf-8")) > MAX_RESPONSE_DOCUMENT_SIZE):
+            raise ValueError("invalid response document")
+    elif document is not None:
+        raise ValueError("unexpected response document")
     event_folder = data.get("event_folder")
     if event_folder is not None and not isinstance(event_folder, str):
         raise ValueError("invalid event folder")
@@ -90,7 +94,7 @@ def validate_response(data: dict, filename: str = "") -> dict:
         "command": command,
         "status": status,
         "message": str(data.get("message", ""))[:4000],
-        "artifact_path": artifact_path,
+        "document": document,
         "event_folder": event_folder,
         "start_locked": start_locked,
         "unlock_sessions_remaining": unlock_sessions_remaining,
@@ -175,7 +179,7 @@ async def _connect() -> bool:
         for part in _root.strip("/").split("/"):
             current += "/" + part
             await _ensure_directory(current)
-        for suffix in ("to_booth", "to_vps", "logs", "configs"):
+        for suffix in ("to_booth", "to_vps"):
             await _ensure_directory(f"{_root}/{suffix}")
         return True
     except Exception as exc:
@@ -246,43 +250,6 @@ async def send_command(
     await _upload_bytes(payload, f"{_root}/to_booth/{command_id}.json")
     log.info(f"Control: sent {command} ({command_id})")
     return body
-
-
-async def download_bytes(remote_path: str, max_size: int = 10 * 1024 * 1024) -> bytes:
-    if (not isinstance(remote_path, str) or not remote_path.startswith("/")
-            or ".." in remote_path.split("/")):
-        raise ValueError("invalid download path")
-    if not await _connect():
-        raise RuntimeError("Yandex.Disk control is unavailable")
-    async with _session.get(
-        f"{API}/resources/download", params={"path": remote_path},
-    ) as response:
-        if response.status != 200:
-            raise RuntimeError(f"get download URL: {response.status} {await response.text()}")
-        href = (await response.json())["href"]
-    async with _transfer_session.get(href) as response:
-        if response.status != 200:
-            raise RuntimeError(f"download control file: {response.status} {await response.text()}")
-        payload = await response.read()
-    if len(payload) > max_size:
-        raise ValueError("control artifact is too large")
-    return payload
-
-
-async def delete_resource(remote_path: str) -> bool:
-    if (not isinstance(remote_path, str) or not remote_path.startswith("/")
-            or ".." in remote_path.split("/")):
-        raise ValueError("invalid delete path")
-    if not await _connect():
-        return False
-    async with _session.delete(
-        f"{API}/resources",
-        params={"path": remote_path, "permanently": "true"},
-    ) as response:
-        if response.status in (202, 204, 404):
-            return True
-        log.warning(f"Control: delete {remote_path}: {response.status} {await response.text()}")
-        return False
 
 
 async def control_init(folder: str) -> bool:

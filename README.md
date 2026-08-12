@@ -7,8 +7,8 @@ VPS связывает Telegram и VK с фотобудкой через сер�
 - commands: `photobooth_system/control/to_booth`;
 - command responses: общий с сессиями `photobooth_system/control/to_vps`;
 - booth notices: инициативные `booth_notice` будки в том же `to_vps`;
-- обработанные служебные JSON удаляются, логи лежат в
-  `photobooth_system/control/logs`;
+- в `photobooth_system/control` есть только `to_booth` и `to_vps`;
+  обработанные служебные JSON удаляются;
 - update bundles and `status_bundle/status.json`:
   `photobooth_system/updates` на Диске;
 - delivery: Telegram Bot API и VK community API; готовые media-сессии пока
@@ -100,6 +100,9 @@ VPS раз в 10 секунд листит один стабильный `to_vps
 администратору. VPS не удаляет и не перемещает медиа. При
 ошибке скачивания или обязательной доставки сообщение остаётся в `to_vps` и
 повторяется.
+Лог и экспорт конфигурации встроены текстом прямо в `command_response`.
+Отдельных папок `logs`/`configs`, второй загрузки и отдельной очистки артефакта
+нет: после доставки удаляется один ответный JSON из `to_vps`.
 `session_ready` содержит свой `event_folder`, поэтому доставка не зависит от
 одновременного переключения event на будке и VPS. `/event` отклоняется будкой,
 если ещё идёт сессия или локальная загрузка.
@@ -183,13 +186,12 @@ control-канал, что `/status` и `/restart`.
 
 Команда `/get_config` возвращает администратору два отдельных документа одним
 Telegram media group или одним VK-сообщением с двумя вложениями.
-`photobooth_configs.txt` приходит с будки через Яндекс.Диск и содержит сначала
-runtime-состояние `cafe_unlock_state.json`, затем актуальные `config_app.json` и
-`config_camera.json`. Если runtime-файл ещё не создан, будка показывает в
+`photobooth_configs.txt` встроен в ответный JSON будки и содержит сначала
+runtime-состояние `cafe_unlock_state.json`, затем актуальные `config_app.json`
+и `config_camera.json`. Если runtime-файл ещё не создан, будка показывает в
 экспорте фактический нулевой остаток.
 `config_vps.json` читается и отправляется напрямую с VPS; секреты из `.env` в
-него не входят. После успешной отправки временная копия файла будки удаляется с
-Диска. Команда ничего не меняет и не перезапускает будку.
+него не входят. Команда ничего не меняет и не перезапускает будку.
 
 Администратор может изменить любое существующее рабочее поле
 `config_camera.json` командой `/<поле> <значение>`, например `/iso 200`,

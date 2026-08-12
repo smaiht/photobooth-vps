@@ -39,6 +39,7 @@ POLL_INTERVAL = 5
 # permanent provider rejection would otherwise burn bandwidth in a tight loop.
 RETRY_BACKOFF_SECONDS = (30, 60, 120, 300)
 PAGE_SIZE = 1000
+MAX_INBOX_MESSAGE_SIZE = 4 * 1024 * 1024
 STATE_FILE = Path(__file__).resolve().parent / "vps_yadisk_state.json"
 SCHEMA_VERSION = 2
 MD5_RE = re.compile(r"^[a-f0-9]{32}$")
@@ -255,8 +256,7 @@ async def _connect() -> bool:
         for part in _bus_root.strip("/").split("/"):
             current += "/" + part
             paths.append(current)
-        paths.extend((f"{_bus_root}/to_booth", f"{_bus_root}/to_vps",
-                      f"{_bus_root}/logs", _folder))
+        paths.extend((f"{_bus_root}/to_booth", f"{_bus_root}/to_vps", _folder))
         for path in paths:
             if not await _ensure_directory(path):
                 await _close_sessions()
@@ -296,7 +296,10 @@ async def _list_inbox() -> list[dict]:
     return result
 
 
-async def _download_bytes(remote_path: str, max_size: int = 1024 * 1024) -> bytes:
+async def _download_bytes(
+    remote_path: str,
+    max_size: int = MAX_INBOX_MESSAGE_SIZE,
+) -> bytes:
     async with _session.get(
         f"{API}/resources/download", params={"path": remote_path}
     ) as response:

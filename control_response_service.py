@@ -12,7 +12,6 @@ import database
 import event_access
 import messenger_delivery
 import runtime_config
-import yadisk_control
 import yadisk_poll
 from messaging import ReplyTarget
 
@@ -83,13 +82,12 @@ async def _activate_event(response: dict) -> tuple[str | None, str | None] | Non
         return None, str(exc)
 
 
-async def _deliver_artifact(
+async def _deliver_document(
     response: dict,
     target: ReplyTarget,
 ) -> bool:
-    artifact_path = response["artifact_path"]
+    payload = response["document"].encode("utf-8")
     try:
-        payload = await yadisk_control.download_bytes(artifact_path)
         if response["command"] == "get_config":
             vps_config = await asyncio.to_thread(runtime_config.read_bytes)
             delivered = await messenger_delivery.send_documents(
@@ -119,26 +117,8 @@ async def _deliver_artifact(
         if not delivered:
             return False
     except Exception as exc:
-        log.warning("Control: artifact delivery failed: %s", exc)
+        log.warning("Control: document delivery failed: %s", exc)
         return False
-
-    # Delivery is complete even if best-effort cleanup fails. Retrying the
-    # response would duplicate an already delivered messenger attachment.
-    try:
-        deleted = await yadisk_control.delete_resource(artifact_path)
-    except Exception as exc:
-        deleted = None
-        log.warning(
-            "Control: delivered %s; artifact cleanup failed: %s",
-            artifact_label,
-            exc,
-        )
-    if deleted is False:
-        log.warning(
-            "Control: delivered %s but could not delete %s",
-            artifact_label,
-            artifact_path,
-        )
     log.info(
         "Control: %s delivered provider=%s conversation=%s",
         artifact_label,
@@ -281,8 +261,8 @@ async def handle(response: dict) -> bool:
             return False
         event_public_url, event_publish_error = activation
 
-    if response.get("artifact_path"):
-        return await _deliver_artifact(response, target)
+    if response.get("document") is not None:
+        return await _deliver_document(response, target)
 
     prefix = "✅" if response["status"] == "ok" else "❌"
     if response["status"] == "ok" and response["command"] == "set_event":
