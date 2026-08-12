@@ -106,7 +106,10 @@ async def main() -> int:
             poller._folder = folder
             poller._bus_root = bus
             poller._configured = True
-            poller._state = {"handled_messages": []}
+            poller._state = {
+                "handled_messages": [],
+                "session_deliveries": {},
+            }
             poller.STATE_FILE = root / "vps_state.json"
             received = []
 
@@ -114,7 +117,10 @@ async def main() -> int:
                 received.extend((path.read_bytes(), kind) for path, kind in files)
                 return True
 
-            poller.telegram_session_delivery.send_session = receive_originals
+            poller.session_delivery.enabled_providers = lambda: ("telegram",)
+            poller.session_delivery.send_session = (
+                lambda _provider, files, _public_url="": receive_originals(files)
+            )
             if not await poller._connect():
                 raise RuntimeError("production VPS poller failed to connect")
             inbox = await poller._list_inbox()

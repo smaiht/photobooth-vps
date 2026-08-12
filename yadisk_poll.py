@@ -2,7 +2,7 @@
 
 The booth publishes both completed-session manifests and command responses to
 the stable ``control/to_vps`` channel.  One poller dispatches those message
-types to independent asyncio workers, so a large Telegram upload cannot delay
+types to independent asyncio workers, so a large messenger upload cannot delay
 a command response.  Session media stay flat in their event folder.
 """
 
@@ -25,7 +25,7 @@ import aiohttp
 from aiohttp.payload import Payload
 
 import print_media
-import telegram_session_delivery
+import session_delivery
 import yadisk_control
 
 log = logging.getLogger(__name__)
@@ -49,7 +49,7 @@ PRINT_UPLOAD_CHUNK_SIZE = 1024 * 1024
 PRINT_UPLOAD_PROGRESS_BYTES = 5 * 1024 * 1024
 PRINT_UPLOAD_PROGRESS_SECONDS = 3
 
-_state: dict = {"handled_messages": []}
+_state: dict = {"handled_messages": [], "session_deliveries": {}}
 _session: aiohttp.ClientSession | None = None
 _transfer_session: aiohttp.ClientSession | None = None
 _folder = ""
@@ -121,15 +121,34 @@ def _state_save() -> None:
 def _state_load() -> None:
     global _state
     if not STATE_FILE.exists():
-        _state = {"handled_messages": []}
+        _state = {"handled_messages": [], "session_deliveries": {}}
         return
     try:
         data = json.loads(STATE_FILE.read_text(encoding="utf-8"))
         handled = data.get("handled_messages", []) if isinstance(data, dict) else []
-        _state = {"handled_messages": [str(name) for name in handled]}
+        if not isinstance(handled, list):
+            handled = []
+        raw_deliveries = (
+            data.get("session_deliveries", {}) if isinstance(data, dict) else {}
+        )
+        deliveries = {}
+        if isinstance(raw_deliveries, dict):
+            for message_name, providers in raw_deliveries.items():
+                if not isinstance(providers, list):
+                    continue
+                normalized = [
+                    provider for provider in providers
+                    if provider in session_delivery.PROVIDERS
+                ]
+                if normalized:
+                    deliveries[str(message_name)] = list(dict.fromkeys(normalized))
+        _state = {
+            "handled_messages": [str(name) for name in handled],
+            "session_deliveries": deliveries,
+        }
     except Exception as exc:
         log.warning(f"YaDisk: state load failed: {exc}")
-        _state = {"handled_messages": []}
+        _state = {"handled_messages": [], "session_deliveries": {}}
 
 
 def validate_manifest(data: dict) -> dict:
@@ -479,9 +498,30 @@ async def _delete_inbox_message(message_name: str) -> bool:
         return False
 
 
-async def _deliver_session(manifest: dict) -> bool:
+def _completed_session_deliveries(message_name: str) -> list[str]:
+    deliveries = _state.setdefault("session_deliveries", {})
+    completed = deliveries.get(message_name)
+    if not isinstance(completed, list):
+        completed = []
+        deliveries[message_name] = completed
+    return completed
+
+
+async def _deliver_session(manifest: dict, message_name: str) -> bool:
     log.info(f"YaDisk: session {manifest['session_id']} ready "
              f"({len(manifest['files'])} files from {manifest['event_folder']})")
+    enabled = session_delivery.enabled_providers()
+    completed = _completed_session_deliveries(message_name)
+    pending = [provider for provider in enabled if provider not in completed]
+    if not pending:
+        if not enabled:
+            log.info(
+                "YaDisk: completed-session delivery is disabled; "
+                "acknowledging %s",
+                manifest["session_id"],
+            )
+        return True
+
     with tempfile.TemporaryDirectory(prefix=f"photobooth_{manifest['session_id']}_") as tmpdir:
         local_files = []
         try:
@@ -494,12 +534,38 @@ async def _deliver_session(manifest: dict) -> bool:
             log.warning(f"YaDisk: session download failed, keeping inbox: {exc}")
             return False
 
-        if not await telegram_session_delivery.send_session(
-            local_files, manifest.get("public_url", ""),
-        ):
-            log.warning(f"YaDisk: Telegram failed for {manifest['session_id']}, keeping inbox")
-            return False
-    return True
+        delivered_all = True
+        for provider in pending:
+            try:
+                delivered = await session_delivery.send_session(
+                    provider,
+                    local_files,
+                    manifest.get("public_url", ""),
+                )
+            except Exception as exc:
+                log.warning(
+                    "YaDisk: %s failed for %s: %s",
+                    provider,
+                    manifest["session_id"],
+                    exc,
+                )
+                delivered = False
+            if delivered:
+                completed.append(provider)
+                _state_save()
+                log.info(
+                    "YaDisk: session %s delivered to %s",
+                    manifest["session_id"],
+                    provider,
+                )
+            else:
+                delivered_all = False
+                log.warning(
+                    "YaDisk: %s delivery failed for %s, keeping inbox",
+                    provider,
+                    manifest["session_id"],
+                )
+        return delivered_all
 
 
 async def _finish_message(
@@ -517,8 +583,14 @@ async def _finish_message(
 
     if not await _delete_inbox_message(message_name):
         return False
+    state_changed = False
     if message_name in handled:
         handled.remove(message_name)
+        state_changed = True
+    deliveries = _state.setdefault("session_deliveries", {})
+    if deliveries.pop(message_name, None) is not None:
+        state_changed = True
+    if state_changed:
         _state_save()
     log.info(f"YaDisk: completed inbox message {message_name}")
     return True
@@ -536,7 +608,10 @@ async def _process_manifest(item: dict, data: dict | None = None) -> bool:
     except Exception as exc:
         log.warning(f"YaDisk: invalid session message {item['name']}: {exc}")
         return False
-    return await _finish_message(item, lambda: _deliver_session(manifest))
+    return await _finish_message(
+        item,
+        lambda: _deliver_session(manifest, item["name"]),
+    )
 
 
 async def _process_response(

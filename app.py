@@ -31,6 +31,11 @@ async def main() -> None:
 
     yadisk_folder = runtime_config.yadisk_folder()
     control_folder = runtime_config.control_folder()
+    archive_providers = runtime_config.archive_delivery_providers()
+    log.info(
+        "Automatic media archive delivery: %s",
+        ", ".join(archive_providers) if archive_providers else "disabled",
+    )
     inbox_ready = await yadisk_poll.yadisk_init(
         yadisk_folder,
         control_folder,

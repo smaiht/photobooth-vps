@@ -855,7 +855,7 @@ class PrintSubmissionTests(unittest.IsolatedAsyncioTestCase):
             "send_command",
             AsyncMock(return_value={"command_id": command_id}),
         ) as send, patch.object(
-            print_flow.telegram_print_archive,
+            print_flow.print_archive,
             "send",
             AsyncMock(side_effect=archive_copy),
         ) as archive, patch.object(print_flow.uuid, "uuid4") as uuid4:
@@ -901,7 +901,7 @@ class PrintSubmissionTests(unittest.IsolatedAsyncioTestCase):
             "send_command",
             AsyncMock(return_value={"command_id": command_id}),
         ), patch.object(
-            print_flow.telegram_print_archive,
+            print_flow.print_archive,
             "send",
             new_callable=AsyncMock,
         ) as archive, patch.object(
@@ -923,8 +923,32 @@ class PrintSubmissionTests(unittest.IsolatedAsyncioTestCase):
         logged.assert_called_once()
 
 
-class TelegramPrintArchiveTests(unittest.IsolatedAsyncioTestCase):
-    async def test_archive_stays_telegram_only_and_preserves_html(self):
+class PrintArchiveTests(unittest.IsolatedAsyncioTestCase):
+    async def test_disabled_archive_does_not_prepare_or_send_preview(self):
+        with patch.object(
+            print_flow.print_archive.runtime_config,
+            "archive_delivery_providers",
+            return_value=(),
+        ), patch.object(
+            print_flow.print_archive.print_media,
+            "jpeg_preview",
+        ) as preview, patch.object(
+            print_flow.print_archive.messenger_delivery,
+            "send_photo",
+            new_callable=AsyncMock,
+        ) as send:
+            await print_flow.print_archive.send(
+                job_id="0" * 32,
+                payload=b"image",
+                metadata={},
+                source_target=ReplyTarget("telegram", 1),
+                mode_label="как есть",
+            )
+
+        preview.assert_not_called()
+        send.assert_not_awaited()
+
+    async def test_archive_sends_telegram_html_and_vk_plain_text(self):
         target = ReplyTarget("vk", 123)
         metadata = {
             "event_folder": "Кафе & тест",
@@ -934,19 +958,27 @@ class TelegramPrintArchiveTests(unittest.IsolatedAsyncioTestCase):
             "source_filename": "photo & copy.jpg",
         }
         with patch.object(
-            print_flow.telegram_print_archive.telegram_api,
+            print_flow.print_archive.runtime_config,
+            "archive_delivery_providers",
+            return_value=("telegram", "vk"),
+        ), patch.object(
+            print_flow.print_archive.telegram_api,
             "ARCHIVE_CHAT_ID",
             "999",
         ), patch.object(
-            print_flow.telegram_print_archive.print_media,
+            print_flow.print_archive.vk_api,
+            "ARCHIVE_CHAT_ID",
+            "888",
+        ), patch.object(
+            print_flow.print_archive.print_media,
             "jpeg_preview",
             return_value=b"preview",
         ), patch.object(
-            print_flow.telegram_print_archive.messenger_delivery,
+            print_flow.print_archive.messenger_delivery,
             "send_photo",
             AsyncMock(return_value=True),
         ) as send:
-            await print_flow.telegram_print_archive.send(
+            await print_flow.print_archive.send(
                 job_id="a" * 32,
                 payload=b"image",
                 metadata=metadata,
@@ -954,28 +986,92 @@ class TelegramPrintArchiveTests(unittest.IsolatedAsyncioTestCase):
                 mode_label="как есть & без обрезки",
             )
 
-        send.assert_awaited_once()
-        self.assertEqual(send.await_args.args[0], ReplyTarget("telegram", 999))
-        caption = send.await_args.args[2]
-        self.assertIn("<b>Фото отправлено на печать</b>", caption)
-        self.assertIn("Кафе &amp; тест", caption)
-        self.assertIn("Иван &lt;Иванов&gt;", caption)
-        self.assertNotIn("Файл:", caption)
-        self.assertNotIn("photo &amp; copy.jpg", caption)
-        self.assertEqual(send.await_args.kwargs["parse_mode"], "HTML")
+        self.assertEqual(send.await_count, 2)
+        telegram_call, vk_call = send.await_args_list
+        self.assertEqual(
+            telegram_call.args[0],
+            ReplyTarget("telegram", 999),
+        )
+        telegram_caption = telegram_call.args[2]
+        self.assertIn("<b>Фото отправлено на печать</b>", telegram_caption)
+        self.assertIn("Кафе &amp; тест", telegram_caption)
+        self.assertIn("Иван &lt;Иванов&gt;", telegram_caption)
+        self.assertNotIn("Файл:", telegram_caption)
+        self.assertNotIn("photo &amp; copy.jpg", telegram_caption)
+        self.assertEqual(telegram_call.kwargs["parse_mode"], "HTML")
 
-    async def test_archive_skips_an_identical_telegram_source(self):
-        archive_target = ReplyTarget("telegram", 999)
+        self.assertEqual(vk_call.args[0], ReplyTarget("vk", 888))
+        vk_caption = vk_call.args[2]
+        self.assertIn("Фото отправлено на печать", vk_caption)
+        self.assertIn("Кафе & тест", vk_caption)
+        self.assertIn("Иван <Иванов>", vk_caption)
+        self.assertNotIn("<b>", vk_caption)
+        self.assertIsNone(vk_call.kwargs["parse_mode"])
+
+    async def test_one_archive_failure_does_not_suppress_the_other(self):
         with patch.object(
-            print_flow.telegram_print_archive.telegram_api,
+            print_flow.print_archive.runtime_config,
+            "archive_delivery_providers",
+            return_value=("telegram", "vk"),
+        ), patch.object(
+            print_flow.print_archive.telegram_api,
             "ARCHIVE_CHAT_ID",
             "999",
         ), patch.object(
-            print_flow.telegram_print_archive.messenger_delivery,
+            print_flow.print_archive.vk_api,
+            "ARCHIVE_CHAT_ID",
+            "888",
+        ), patch.object(
+            print_flow.print_archive.print_media,
+            "jpeg_preview",
+            return_value=b"preview",
+        ), patch.object(
+            print_flow.print_archive.messenger_delivery,
             "send_photo",
-            AsyncMock(),
+            AsyncMock(side_effect=(RuntimeError("telegram down"), True)),
+        ) as send, patch.object(
+            print_flow.print_archive.log,
+            "exception",
+        ) as logged:
+            await print_flow.print_archive.send(
+                job_id="1" * 32,
+                payload=b"image",
+                metadata={},
+                source_target=ReplyTarget("vk", 123),
+                mode_label="как есть",
+            )
+
+        self.assertEqual(send.await_count, 2)
+        self.assertEqual(
+            [call.args[0].provider for call in send.await_args_list],
+            ["telegram", "vk"],
+        )
+        logged.assert_called_once()
+
+    async def test_archive_skips_matching_source_but_sends_other_provider(self):
+        archive_target = ReplyTarget("telegram", 999)
+        with patch.object(
+            print_flow.print_archive.runtime_config,
+            "archive_delivery_providers",
+            return_value=("telegram", "vk"),
+        ), patch.object(
+            print_flow.print_archive.telegram_api,
+            "ARCHIVE_CHAT_ID",
+            "999",
+        ), patch.object(
+            print_flow.print_archive.vk_api,
+            "ARCHIVE_CHAT_ID",
+            "888",
+        ), patch.object(
+            print_flow.print_archive.print_media,
+            "jpeg_preview",
+            return_value=b"preview",
+        ), patch.object(
+            print_flow.print_archive.messenger_delivery,
+            "send_photo",
+            AsyncMock(return_value=True),
         ) as send:
-            await print_flow.telegram_print_archive.send(
+            await print_flow.print_archive.send(
                 job_id="b" * 32,
                 payload=b"image",
                 metadata={},
@@ -983,7 +1079,8 @@ class TelegramPrintArchiveTests(unittest.IsolatedAsyncioTestCase):
                 mode_label="как есть",
             )
 
-        send.assert_not_awaited()
+        send.assert_awaited_once()
+        self.assertEqual(send.await_args.args[0], ReplyTarget("vk", 888))
 
 
 if __name__ == "__main__":

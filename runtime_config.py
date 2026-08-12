@@ -8,6 +8,7 @@ from pathlib import Path
 
 
 PROJECT_ROOT = Path(__file__).resolve().parent
+SESSION_DELIVERY_PROVIDERS = ("telegram", "vk")
 _configured_path = Path(os.environ.get("VPS_CONFIG", "config_vps.json"))
 CONFIG_PATH = (
     _configured_path
@@ -38,6 +39,27 @@ def yadisk_folder() -> str:
 
 def control_folder() -> str:
     return _required_text("yadisk_control_folder")
+
+
+def archive_delivery_providers() -> tuple[str, ...]:
+    """Return the explicitly enabled automatic media archive destinations."""
+    settings = CONFIG.get("archive_delivery")
+    if not isinstance(settings, dict):
+        raise RuntimeError(
+            "config_vps.json: archive_delivery must be an object"
+        )
+
+    enabled = []
+    for provider in SESSION_DELIVERY_PROVIDERS:
+        value = settings.get(provider)
+        if not isinstance(value, bool):
+            raise RuntimeError(
+                "config_vps.json: "
+                f"archive_delivery.{provider} must be true or false"
+            )
+        if value:
+            enabled.append(provider)
+    return tuple(enabled)
 
 
 def save_event(name: str) -> None:

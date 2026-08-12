@@ -19,6 +19,7 @@ import delivery_retry
 BOT_TOKEN = os.environ.get("VK_TOKEN", "").strip()
 GROUP_USERNAME = os.environ.get("VK_GROUP_USERNAME", "").strip().lstrip("@")
 ADMIN_ID = os.environ.get("VK_ADMIN_ID", "").strip()
+ARCHIVE_CHAT_ID = os.environ.get("VK_CHAT_ID", "").strip() or ADMIN_ID
 API_VERSION = "5.199"
 API_BASE = "https://api.vk.com/method/"
 _RETRYABLE_API_ERROR_CODES = frozenset({1, 6, 10, 29})
@@ -755,7 +756,9 @@ async def _upload_message_document_once(
         async with session.post(
             upload_url,
             data=form,
-            timeout=aiohttp.ClientTimeout(total=60),
+            # Completed-session videos use this document path too and can be
+            # much larger than command log/config exports.
+            timeout=aiohttp.ClientTimeout(total=600, connect=30),
         ) as response:
             status = response.status
             raw = await response.read()
@@ -859,6 +862,30 @@ async def send_documents(
             "attachment": ",".join(attachments),
         },
     )
+
+
+async def send_attachments(
+    session: aiohttp.ClientSession,
+    peer_id: int,
+    attachments: list[str],
+    text: str = "",
+) -> int | None:
+    """Send one VK message containing an arbitrary attachment mix."""
+    if not 1 <= len(attachments) <= 10:
+        raise ValueError("VK message must contain 1-10 attachments")
+    if any(
+        not isinstance(attachment, str) or not attachment
+        for attachment in attachments
+    ):
+        raise ValueError("VK attachment reference must be a non-empty string")
+    params: dict[str, Any] = {
+        "peer_id": peer_id,
+        "random_id": secrets.randbelow(2_147_483_647) + 1,
+        "attachment": ",".join(attachments),
+    }
+    if text:
+        params["message"] = text
+    return await _send_message(session, params)
 
 
 async def send_document(

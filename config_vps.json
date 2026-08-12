@@ -3,5 +3,10 @@
     "yadisk_folder": "Кафе",
     "_yadisk_folder_comment": "Active event media folder. Session notifications arrive through yadisk_control_folder/to_vps.",
     "yadisk_control_folder": "photobooth_system/control",
-    "_yadisk_control_folder_comment": "Stable private bus with only to_booth and to_vps. Processed command and response JSON files are deleted. Must match the photobooth config."
+    "_yadisk_control_folder_comment": "Stable private bus with only to_booth and to_vps. Processed command and response JSON files are deleted. Must match the photobooth config.",
+    "archive_delivery": {
+        "_comment": "Independent automatic media archive circuits for completed sessions and accepted remote prints.",
+        "telegram": true,
+        "vk": true
+    }
 }

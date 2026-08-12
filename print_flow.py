@@ -15,9 +15,9 @@ import admin_notifications
 import database
 import event_access
 import messenger_delivery
+import print_archive
 import print_jobs
 import print_media
-import telegram_print_archive
 import yadisk_control
 import yadisk_poll
 from messaging import ReplyTarget
@@ -447,11 +447,11 @@ async def submit_print_job(
         # must not change the successful dispatch result.
         log.exception("Could not prepare print archive copy job=%s", job_id)
     else:
-        # The Telegram archive is best effort. Do not make the user or the
+        # The messenger archive is best effort. Do not make the user or the
         # administrators wait for another messenger after the booth command
         # has already been published successfully.
         _start_background(
-            telegram_print_archive.send(
+            print_archive.send(
                 job_id=job_id,
                 payload=payload,
                 metadata=metadata,

@@ -186,7 +186,11 @@ class DeliveryTests(unittest.IsolatedAsyncioTestCase):
                 return_value=json.dumps(manifest).encode("utf-8"))), \
              patch("yadisk_poll._download_file", AsyncMock(side_effect=download)), \
              patch(
-                 "yadisk_poll.telegram_session_delivery.send_session",
+                 "yadisk_poll.session_delivery.enabled_providers",
+                 return_value=("telegram",),
+             ), \
+             patch(
+                 "yadisk_poll.session_delivery.send_session",
                  AsyncMock(return_value=True),
              ) as send, \
              patch("yadisk_poll._delete_inbox_message",
@@ -196,10 +200,12 @@ class DeliveryTests(unittest.IsolatedAsyncioTestCase):
                 "path": "disk:/photobooth_system/control/to_vps/abc123.json",
             }))
 
-        # The link reaches Telegram as the second positional argument, so the
+        # The link reaches the Telegram adapter, so the
         # guest gets media and the folder URL in one message.
         self.assertEqual(
-            send.await_args.args[1], "https://disk.yandex.ru/d/abcDEF")
+            send.await_args.args[0], "telegram")
+        self.assertEqual(
+            send.await_args.args[2], "https://disk.yandex.ru/d/abcDEF")
 
     async def test_download_failure_keeps_manifest_in_inbox(self):
         manifest = {
@@ -222,7 +228,11 @@ class DeliveryTests(unittest.IsolatedAsyncioTestCase):
                 return_value=json.dumps(manifest).encode("utf-8"))), \
              patch("yadisk_poll._download_file", download_file), \
              patch(
-                 "yadisk_poll.telegram_session_delivery.send_session",
+                 "yadisk_poll.session_delivery.enabled_providers",
+                 return_value=("telegram",),
+             ), \
+             patch(
+                 "yadisk_poll.session_delivery.send_session",
                  AsyncMock(),
              ) as send, \
              patch("yadisk_poll._delete_inbox_message", AsyncMock()) as delete:
