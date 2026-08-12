@@ -9,8 +9,8 @@ VPS связывает Telegram и VK с фотобудкой через сер�
 - booth notices: инициативные `booth_notice` будки в том же `to_vps`;
 - в `photobooth_system/control` есть только `to_booth` и `to_vps`;
   обработанные служебные JSON удаляются;
-- update bundles and `status_bundle/status.json`:
-  `photobooth_system/updates` на Диске;
+- update bundles and `status_bundle/status.json` публикуются GitHub Actions в
+  `photobooth_system/updates` на Диске; VPS в обновлениях не участвует;
 - delivery: Telegram Bot API и VK community API; готовые media-сессии пока
   доставляются только в Telegram.
 
@@ -196,16 +196,18 @@ runtime-состояние `cafe_unlock_state.json`, затем актуальн
 Администратор может изменить любое существующее рабочее поле
 `config_camera.json` командой `/<поле> <значение>`, например `/iso 200`,
 `/iso auto`, `/white_balance auto`, `/av 6.3` или `/continuous_af false`.
-VPS передаёт имя поля и исходное значение без собственной копии схемы; тип,
-допустимые `_..._options` и наличие поля проверяет будка по актуальному конфигу.
+Help VPS содержит явный allowlist всех таких команд, поэтому неизвестное имя
+поля на Диск не отправляется. Этот список намеренно дублирует публичные поля
+`config_camera.json` и обновляется вместе с ними. Тип, допустимые
+`_..._options` и значение окончательно проверяет будка по актуальному конфигу.
 
 Команда `/light <имя>` применяет именованный набор из `_presets` того же
-`config_camera.json`; например, `/light sun` или `/light indoor_dark`.
-Актуальные готовые команды показывает `/status`. Список и значения пресетов на
-VPS намеренно не дублируются: новый пресет требует только изменения конфига
-будки. Будка сначала проверяет весь набор, затем одной атомарной записью меняет
-поля и после доставки подтверждения штатно перезапускается. Мощность внешней
-вспышки меняется вручную по подсказке в ответе.
+`config_camera.json`. VPS явно перечисляет в help все готовые команды:
+`/light sun`, `/light cloudy`, `/light evening`, `/light indoor` и
+`/light indoor_dark`; имена и подписи намеренно продублированы в VPS. Будка
+сначала проверяет весь набор, затем одной атомарной записью меняет поля и после
+доставки подтверждения штатно перезапускается. Мощность внешней вспышки меняется
+вручную по подсказке в ответе.
 
 При успешной проверке будка атомарно записывает изменившийся конфиг, публикует
 ответ для исходного мессенджера в надёжный канал Диска и затем штатно
@@ -321,16 +323,14 @@ push в main → GitHub Actions перезаписывает artifacts/full_bund
 ```
 
 `status_bundle/status.json` хранит метаданные единственного полного артефакта,
-включая путь папки `bundle_path`, и поле
-поле `active: "full"`. Будка сравнивает SHA ZIP с локальным `.update_hash`;
-отдельной нумерации версий нет. `/update` остаётся ручным резервным способом
-повторной публикации готового Windows release; будке доступ к GitHub не нужен.
-
-GitHub Actions и ручной `/update` используют одинаковый порядок: проверяют ZIP,
-до пяти раз пробуют server-side import конечного GitHub asset URL, сверяют
-size/MD5, атомарно заменяют `artifacts/full_bundle/full.zip` и только затем публикуют
-`status_bundle/status.json`. После пяти неудач CI напрямую загружает локальный ZIP со своего
-временного runner-а, а VPS — скачанную локальную копию со своего процесса.
+включая путь папки `bundle_path` и поле `active: "full"`. Будка сравнивает SHA
+ZIP с локальным `.update_hash`;
+отдельной нумерации версий нет. GitHub Actions проверяет ZIP, до пяти раз
+пробует server-side import конечного GitHub asset URL, сверяет size/MD5,
+атомарно заменяет `artifacts/full_bundle/full.zip` и только затем публикует
+`status_bundle/status.json`. После пяти неудач CI напрямую загружает локальный
+ZIP со своего временного runner-а. Команды `/update` и издателя обновлений на
+VPS больше нет.
 
 ## Переменные окружения
 
@@ -341,7 +341,6 @@ size/MD5, атомарно заменяют `artifacts/full_bundle/full.zip` и 
 - `VK_TOKEN`, `VK_GROUP_USERNAME`, `VK_ADMIN_ID` — VK community bot;
 - `EVENT_KEY` — секрет HMAC для event QR; задаётся только на VPS и не передаётся
   фотобудке;
-- `GITHUB_RELEASE_URL` — URL `photobooth-win.zip` из release `latest`.
 - `POSTGRES_PASSWORD` — обязательный пароль локального PostgreSQL;
 - `POSTGRES_DB`, `POSTGRES_USER` — необязательные имя базы и пользователь,
   по умолчанию оба используют `photobooth`.
@@ -354,8 +353,8 @@ size/MD5, атомарно заменяют `artifacts/full_bundle/full.zip` и 
 считываются через `os.environ` в `telegram_api.py`, VK-настройки — в `vk_api.py`.
 Секреты не хранятся в репозитории.
 
-Пути `yadisk_folder`, `yadisk_control_folder` и `yadisk_updates_folder`
-обязательны в `config_vps.json`; код не подставляет скрытые fallback-пути.
+Пути `yadisk_folder` и `yadisk_control_folder` обязательны в
+`config_vps.json`; код не подставляет скрытые fallback-пути.
 
 ## PostgreSQL и миграции
 

@@ -6,8 +6,6 @@ import logging
 
 import admin_commands
 import messenger_delivery
-import runtime_config
-import vps_update
 import yadisk_control
 from messaging import ReplyTarget
 
@@ -30,31 +28,9 @@ async def _reply(target: ReplyTarget, text: str) -> bool:
         return False
 
 
-async def _run_update(
-    target: ReplyTarget,
-    updates_folder: str,
-) -> None:
-    await _reply(target, "⏳ Скачиваю полный релиз...")
-
-    async def report_progress(message: str) -> None:
-        await _reply(target, message)
-
-    try:
-        result = await vps_update.publish_latest_release(
-            updates_folder,
-            report_progress,
-        )
-    except Exception as exc:
-        log.exception("VPS update failed")
-        result = f"❌ Ошибка: {exc}"
-    await _reply(target, result)
-
-
 async def handle_message(
     target: ReplyTarget,
     text: str,
-    *,
-    updates_folder: str | None = None,
 ) -> None:
     """Parse and execute one message from an authenticated administrator."""
     target = ReplyTarget.from_value(target)
@@ -69,15 +45,6 @@ async def handle_message(
         return
 
     command, data = parsed
-    if command == "update":
-        await _run_update(
-            target,
-            updates_folder
-            if updates_folder is not None
-            else runtime_config.updates_folder(),
-        )
-        return
-
     try:
         await yadisk_control.send_command(command, target, data)
     except Exception as exc:

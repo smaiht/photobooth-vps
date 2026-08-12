@@ -12,9 +12,49 @@ MAX_UNBLOCK_SESSIONS = 1000
 EVENT_NAME_RE = re.compile(r"^(\d{4}-\d{2}-\d{2}) (.+)$")
 CAMERA_FIELD_RE = re.compile(r"^[a-z][a-z0-9_]{0,63}$")
 
-# These are the only named admin commands understood by the VPS. Everything
-# else in the form /field value is forwarded as a camera setting and validated
-# by the booth against its current config_camera.json.
+# Operator-facing command names are intentionally duplicated from the booth's
+# config_camera.json.  The help must be complete even when the booth is offline;
+# keep these tuples in sync when a preset or a public camera field is added.
+LIGHT_PRESETS = (
+    ("sun", "Яркое солнце"),
+    ("cloudy", "Улица, пасмурно"),
+    ("evening", "Улица, тёмный вечер"),
+    ("indoor", "Помещение со светом"),
+    ("indoor_dark", "Помещение, темно"),
+)
+LIGHT_PRESET_NAMES = frozenset(name for name, _label in LIGHT_PRESETS)
+
+CAMERA_SETTING_FIELDS = (
+    "image_quality",
+    "ae_mode",
+    "shutter_type",
+    "av",
+    "tv",
+    "iso",
+    "white_balance",
+    "color_temperature",
+    "picture_style",
+    "evf_af_mode",
+    "af_mode",
+    "subject_tracking",
+    "evf_view_type",
+    "continuous_af",
+    "eye_detection_af",
+    "focus_before_capture",
+    "focus_delay",
+    "disable_auto_power_off",
+    "min_free_disk_gib",
+    "evf_keep_camera_screen",
+    "drive_mode",
+    "color_space",
+    "lock_camera_ui",
+    "lock_mode_dial",
+)
+CAMERA_SETTING_FIELD_NAMES = frozenset(CAMERA_SETTING_FIELDS)
+
+# These are the only named admin commands understood by the VPS. Camera fields
+# use the explicit allowlist above; the booth still performs final validation
+# against its current config_camera.json.
 KNOWN_COMMANDS = {
     "/run": "run",
     "/status": "status",
@@ -27,19 +67,28 @@ KNOWN_COMMANDS = {
     "/get_config": "get_config",
     "/clear_logs": "clear_logs",
     "/restart": "restart",
-    "/update": "update",
     "/event": "set_event",
 }
 
-# The booth owns the preset list in config_camera.json, so the VPS only checks
-# the shape of the name and lets the booth report which presets exist.
 PRESET_NAME_RE = re.compile(r"^[a-z][a-z0-9_]{0,39}$")
+
+_GENERAL_HELP_COMMANDS = tuple(
+    name for name in KNOWN_COMMANDS if name != "/light"
+)
+_PRESET_HELP_COMMANDS = tuple(
+    f"/light {name} — {label}" for name, label in LIGHT_PRESETS
+)
+_CAMERA_HELP_COMMANDS = tuple(
+    f"/{field} <значение>" for field in CAMERA_SETTING_FIELDS
+)
 
 HELP_MESSAGE = (
     "Не понял команду. Доступные команды:\n\n"
-    + "\n\n".join(KNOWN_COMMANDS)
-    + "\n\nПресет света: /light <имя> (список — /status)"
-    + "\n\nНастройка камеры, например: /iso 100"
+    + "\n".join(_GENERAL_HELP_COMMANDS)
+    + "\n\nПресеты света:\n"
+    + "\n".join(_PRESET_HELP_COMMANDS)
+    + "\n\nНастройки камеры:\n"
+    + "\n".join(_CAMERA_HELP_COMMANDS)
 )
 
 
@@ -92,15 +141,17 @@ def _parse_block(argument: str | None) -> ParsedCommand:
 
 
 def _parse_light(argument: str | None) -> ParsedCommand:
+    available = "\n".join(
+        f"/light {name} — {label}" for name, label in LIGHT_PRESETS
+    )
     if not argument:
         raise ValueError(
-            "Использование: /light имя_пресета. "
-            "Список доступных пресетов показывает /status"
+            "Выберите пресет света:\n" + available
         )
     name = argument.strip().lower()
-    if not PRESET_NAME_RE.fullmatch(name):
+    if not PRESET_NAME_RE.fullmatch(name) or name not in LIGHT_PRESET_NAMES:
         raise ValueError(
-            "Имя пресета может содержать только латиницу, цифры и _"
+            "Неизвестный пресет света. Доступно:\n" + available
         )
     return "set_camera_preset", {"name": name}
 
@@ -145,7 +196,8 @@ def parse(text: str) -> ParsedCommand | None:
         return None
 
     field = command_name.removeprefix("/")
-    if not CAMERA_FIELD_RE.fullmatch(field):
+    if (not CAMERA_FIELD_RE.fullmatch(field)
+            or field not in CAMERA_SETTING_FIELD_NAMES):
         return None
     if argument is None:
         raise ValueError(f"Использование: /{field} значение")

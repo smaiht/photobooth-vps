@@ -15,16 +15,16 @@ class RuntimeConfigTests(unittest.TestCase):
             {
                 "yadisk_folder": "Кафе",
                 "yadisk_control_folder": "custom/control",
-                "yadisk_updates_folder": "custom/updates",
             },
         ):
             self.assertEqual(runtime_config.yadisk_folder(), "Кафе")
             self.assertEqual(runtime_config.control_folder(), "custom/control")
-            self.assertEqual(runtime_config.updates_folder(), "custom/updates")
 
         with patch.object(runtime_config, "CONFIG", {}):
-            with self.assertRaisesRegex(RuntimeError, "yadisk_updates_folder"):
-                runtime_config.updates_folder()
+            with self.assertRaisesRegex(RuntimeError, "yadisk_folder"):
+                runtime_config.yadisk_folder()
+            with self.assertRaisesRegex(RuntimeError, "yadisk_control_folder"):
+                runtime_config.control_folder()
 
     def test_event_update_is_atomic_and_preserves_other_settings(self):
         with TemporaryDirectory() as tmpdir:

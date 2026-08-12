@@ -40,10 +40,6 @@ def control_folder() -> str:
     return _required_text("yadisk_control_folder")
 
 
-def updates_folder() -> str:
-    return _required_text("yadisk_updates_folder")
-
-
 def save_event(name: str) -> None:
     data = load()
     data["yadisk_folder"] = name

@@ -645,6 +645,27 @@ class CameraSettingCommandTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaisesRegex(ValueError, "Использование"):
             admin_commands.parse("/continuous_af")
 
+    def test_help_lists_every_supported_camera_setting(self):
+        expected = {
+            "image_quality", "ae_mode", "shutter_type", "av", "tv", "iso",
+            "white_balance", "color_temperature", "picture_style",
+            "evf_af_mode", "af_mode", "subject_tracking", "evf_view_type",
+            "continuous_af", "eye_detection_af", "focus_before_capture",
+            "focus_delay", "disable_auto_power_off", "min_free_disk_gib",
+            "evf_keep_camera_screen", "drive_mode", "color_space",
+            "lock_camera_ui", "lock_mode_dial",
+        }
+        self.assertEqual(set(admin_commands.CAMERA_SETTING_FIELDS), expected)
+        for field in admin_commands.CAMERA_SETTING_FIELDS:
+            with self.subTest(field=field):
+                self.assertIn(
+                    f"/{field} <значение>",
+                    admin_commands.HELP_MESSAGE,
+                )
+
+    def test_unknown_camera_field_is_not_forwarded(self):
+        self.assertIsNone(admin_commands.parse("/not_a_camera_field value"))
+
     async def test_forwards_raw_value_to_booth(self):
         with patch(
             "admin_command_service.yadisk_control.send_command",
@@ -795,13 +816,30 @@ class CameraPresetCommandTests(unittest.IsolatedAsyncioTestCase):
             "/light bad-name",
             "/light _hidden",
             "/light солнце",
+            "/light missing",
         ):
             with self.subTest(text=text), self.assertRaises(ValueError):
                 admin_commands.parse(text)
 
-    def test_help_explains_where_to_find_presets(self):
-        self.assertIn("/light <имя>", admin_commands.HELP_MESSAGE)
-        self.assertIn("/status", admin_commands.HELP_MESSAGE)
+    def test_help_lists_every_preset_as_a_ready_command(self):
+        self.assertEqual(
+            dict(admin_commands.LIGHT_PRESETS),
+            {
+                "sun": "Яркое солнце",
+                "cloudy": "Улица, пасмурно",
+                "evening": "Улица, тёмный вечер",
+                "indoor": "Помещение со светом",
+                "indoor_dark": "Помещение, темно",
+            },
+        )
+        for name, label in admin_commands.LIGHT_PRESETS:
+            with self.subTest(name=name):
+                self.assertIn(
+                    f"/light {name} — {label}",
+                    admin_commands.HELP_MESSAGE,
+                )
+        self.assertNotIn("/light <имя>", admin_commands.HELP_MESSAGE)
+        self.assertLessEqual(len(admin_commands.HELP_MESSAGE), 4096)
 
     async def test_forwards_preset_name_to_booth(self):
         target = ReplyTarget("telegram", 123)
@@ -839,53 +877,34 @@ class CameraPresetCommandTests(unittest.IsolatedAsyncioTestCase):
             )
 
         send.assert_not_awaited()
-        self.assertIn("Использование", send_text.await_args.args[1])
+        for name, _label in admin_commands.LIGHT_PRESETS:
+            self.assertIn(f"/light {name}", send_text.await_args.args[1])
 
 
-class UpdateCommandTests(unittest.IsolatedAsyncioTestCase):
-    async def test_update_uses_runtime_folder_by_default(self):
+class RemovedUpdateCommandTests(unittest.IsolatedAsyncioTestCase):
+    def test_update_is_not_a_named_or_camera_command(self):
+        self.assertNotIn("/update", admin_commands.KNOWN_COMMANDS)
+        self.assertNotIn("/update", admin_commands.HELP_MESSAGE)
+        self.assertIsNone(admin_commands.parse("/update"))
+        self.assertIsNone(admin_commands.parse("/update now"))
+
+    async def test_update_returns_help_without_touching_yandex_disk(self):
         with patch(
-            "admin_command_service.runtime_config.updates_folder",
-            return_value="configured-updates",
-        ), patch(
-            "admin_command_service.vps_update.publish_latest_release",
-            AsyncMock(return_value="published"),
-        ) as do_update, patch(
+            "admin_command_service.yadisk_control.send_command",
+            new_callable=AsyncMock,
+        ) as send, patch(
             "admin_command_service.messenger_delivery.send_text",
             AsyncMock(return_value=True),
-        ):
-            await admin_command_service.handle_message(
-                ReplyTarget("vk", 556972284),
-                "/update",
-            )
-
-        self.assertEqual(do_update.await_args.args[0], "configured-updates")
-
-    async def test_update_does_not_restart_automatically(self):
-        async def update(_updates_folder, progress_callback):
-            await progress_callback("retry notice")
-            return "published"
-
-        with patch(
-            "admin_command_service.vps_update.publish_latest_release",
-            AsyncMock(side_effect=update),
-        ) as do_update, \
-             patch("admin_command_service.yadisk_control.send_command",
-                   AsyncMock(return_value="a" * 32)) as send, \
-             patch("admin_command_service.messenger_delivery.send_text",
-                   AsyncMock(return_value=True)) as send_text:
+        ) as send_text:
             await admin_command_service.handle_message(
                 ReplyTarget("telegram", 123),
                 "/update",
-                updates_folder="test-updates",
             )
 
-        do_update.assert_awaited_once()
-        self.assertEqual(do_update.await_args.args[0], "test-updates")
         send.assert_not_awaited()
-        self.assertEqual(
-            [item.args[1] for item in send_text.await_args_list],
-            ["⏳ Скачиваю полный релиз...", "retry notice", "published"],
+        send_text.assert_awaited_once_with(
+            ReplyTarget("telegram", 123),
+            admin_commands.HELP_MESSAGE,
         )
 
 
