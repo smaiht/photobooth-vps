@@ -618,6 +618,42 @@ class PrintQueueAdminCommandTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("Очищаю очереди", reply.await_args.args[1])
 
 
+class RuntimeDirectoryAdminCommandTests(unittest.IsolatedAsyncioTestCase):
+    def test_parses_both_cleanup_commands_without_arguments(self):
+        self.assertEqual(
+            admin_commands.parse("/clear_photos"),
+            ("clear_photos", None),
+        )
+        self.assertEqual(
+            admin_commands.parse("/clear_print_jobs@photobooth_bot"),
+            ("clear_print_jobs", None),
+        )
+
+    def test_rejects_cleanup_arguments_and_lists_commands_in_help(self):
+        for command in ("/clear_photos", "/clear_print_jobs"):
+            with self.subTest(command=command):
+                self.assertIn(command, admin_commands.HELP_MESSAGE)
+                with self.assertRaisesRegex(ValueError, "Использование"):
+                    admin_commands.parse(f"{command} anything")
+
+    async def test_cleanup_command_is_forwarded_to_the_booth(self):
+        target = ReplyTarget("vk", 456)
+        with patch(
+            "admin_command_service.yadisk_control.send_command",
+            AsyncMock(return_value={"command_id": "a" * 32}),
+        ) as send, patch(
+            "admin_command_service.messenger_delivery.send_text",
+            AsyncMock(return_value=True),
+        ) as reply:
+            await admin_command_service.handle_message(
+                target,
+                "/clear_print_jobs",
+            )
+
+        send.assert_awaited_once_with("clear_print_jobs", target, None)
+        self.assertIn("photos_print_jobs", reply.await_args.args[1])
+
+
 class CameraSettingCommandTests(unittest.IsolatedAsyncioTestCase):
     def test_parses_dynamic_camera_setting(self):
         self.assertEqual(

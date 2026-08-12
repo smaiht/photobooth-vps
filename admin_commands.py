@@ -60,6 +60,8 @@ KNOWN_COMMANDS = {
     "/status": "status",
     "/print_queue": "print_queue",
     "/clear_print_queue": "clear_print_queue",
+    "/clear_photos": "clear_photos",
+    "/clear_print_jobs": "clear_print_jobs",
     "/unblock": "unblock",
     "/block": "unblock",
     "/light": "set_camera_preset",
@@ -185,7 +187,12 @@ def parse(text: str) -> ParsedCommand | None:
         return _parse_unblock(argument)
     if known_command == "set_camera_preset":
         return _parse_light(argument)
-    if known_command in ("print_queue", "clear_print_queue"):
+    if known_command in (
+        "print_queue",
+        "clear_print_queue",
+        "clear_photos",
+        "clear_print_jobs",
+    ):
         return _parse_print_queue(known_command, argument)
     if known_command:
         return known_command, None
@@ -235,6 +242,10 @@ def sent_message(command: str, data: dict | None) -> str:
         )
     if command == "clear_print_queue":
         return "⏳ Очищаю очереди Windows-принтеров..."
+    if command == "clear_photos":
+        return "⏳ Очищаю локальную папку photos на фотобудке..."
+    if command == "clear_print_jobs":
+        return "⏳ Очищаю локальную папку photos_print_jobs на фотобудке..."
     return f"⏳ {command}: команда отправлена"
 
 
@@ -246,5 +257,7 @@ def failed_message(command: str, error: Exception) -> str:
         "set_camera_preset": "Пресет света не отправлен",
         "print_queue": "Запрос очередей печати не отправлен",
         "clear_print_queue": "Очистка очередей печати не отправлена",
+        "clear_photos": "Очистка папки photos не отправлена",
+        "clear_print_jobs": "Очистка папки photos_print_jobs не отправлена",
     }.get(command, "Команда не отправлена")
     return f"❌ {label}: {error}"
