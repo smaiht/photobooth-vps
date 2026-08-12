@@ -107,7 +107,14 @@ class PublishUpdateTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(uploads[0][0], status["artifacts"]["full"]["path"])
         self.assertTrue(uploads[0][0].endswith("/full.zip"))
         self.assertEqual(uploads[0][1], b"zip payload")
-        self.assertEqual(uploads[1][0], "/photobooth_system/updates/status.json")
+        self.assertEqual(
+            uploads[1][0],
+            "/photobooth_system/updates/status_bundle/status.json",
+        )
+        self.assertEqual(
+            status["artifacts"]["full"]["bundle_path"],
+            "/photobooth_system/updates/artifacts/full_bundle",
+        )
         self.assertEqual(json.loads(uploads[1][1]), status)
         self.assertEqual(status["active"], "full")
         self.assertEqual(set(status["artifacts"]), {"full"})
@@ -138,7 +145,10 @@ class PublishUpdateTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(imports[0][1], status["artifacts"]["full"]["path"])
         self.assertEqual(imports[0][2], b"zip payload")
         self.assertEqual(len(uploads), 1)
-        self.assertEqual(uploads[0][0], "/photobooth_system/updates/status.json")
+        self.assertEqual(
+            uploads[0][0],
+            "/photobooth_system/updates/status_bundle/status.json",
+        )
 
     async def test_falls_back_to_direct_put_when_import_fails(self):
         uploads = []
@@ -168,7 +178,10 @@ class PublishUpdateTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(len(uploads), 2)
         self.assertEqual(uploads[0][0], status["artifacts"]["full"]["path"])
-        self.assertEqual(uploads[1][0], "/photobooth_system/updates/status.json")
+        self.assertEqual(
+            uploads[1][0],
+            "/photobooth_system/updates/status_bundle/status.json",
+        )
         messages = [item.args[0] for item in progress.await_args_list]
         self.assertEqual(len(messages), 6)
         self.assertIn("попытка 1/5", messages[0])
@@ -205,7 +218,7 @@ class PublishUpdateTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(sleep.await_args_list, [call(2), call(4)])
         self.assertEqual(
             [path for path, _payload in uploads],
-            ["/photobooth_system/updates/status.json"],
+            ["/photobooth_system/updates/status_bundle/status.json"],
         )
         messages = [item.args[0] for item in progress.await_args_list]
         self.assertEqual(len(messages), 3)

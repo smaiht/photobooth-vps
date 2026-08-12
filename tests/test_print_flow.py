@@ -10,6 +10,7 @@ from PIL import Image
 
 import print_flow
 import print_jobs
+import yadisk_poll
 from messaging import ReplyTarget
 
 
@@ -63,6 +64,41 @@ def upload(
         ),
         download,
     )
+
+
+class PrintJobStorageTests(unittest.IsolatedAsyncioTestCase):
+    async def test_stores_image_and_metadata_inside_one_job_folder(self):
+        job_id = "a" * 32
+        ensure = AsyncMock(return_value=True)
+        upload_file = AsyncMock()
+        with patch.object(
+            yadisk_poll, "_folder", "/event",
+        ), patch.object(
+            yadisk_poll, "_connect", AsyncMock(return_value=True),
+        ), patch.object(
+            yadisk_poll, "_ensure_directory", ensure,
+        ), patch.object(
+            yadisk_poll, "_upload_print_file", upload_file,
+        ):
+            result = await yadisk_poll.store_print_job(
+                job_id,
+                123,
+                ".jpg",
+                b"image",
+                {"provider": "telegram"},
+            )
+
+        job_folder = result["job_folder"]
+        basename = job_folder.rsplit("/", 1)[-1]
+        self.assertEqual(
+            job_folder.rsplit("/", 1)[0],
+            "/event_by_sessions/0000_print_jobs",
+        )
+        self.assertEqual(result["artifact_path"], f"{job_folder}/{basename}.jpg")
+        self.assertEqual(result["info_path"], f"{job_folder}/{basename}.txt")
+        self.assertIn(call(job_folder), ensure.await_args_list)
+        self.assertEqual(upload_file.await_args_list[0].args[0], result["artifact_path"])
+        self.assertEqual(upload_file.await_args_list[1].args[0], result["info_path"])
 
 
 class SharedPrintFlowTests(unittest.IsolatedAsyncioTestCase):

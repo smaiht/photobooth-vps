@@ -95,15 +95,22 @@ async def _ensure_directories(session: aiohttp.ClientSession, root: str) -> None
                 "YaDisk update: directory ready path=%s HTTP %s",
                 current, response.status,
             )
-    artifacts = f"{root}/artifacts"
-    async with session.put(f"{API}/resources", params={"path": artifacts}) as response:
-        if response.status not in (201, 409):
-            raise RuntimeError(
-                f"create update directory {artifacts}: {response.status} {await response.text()}")
-        log.info(
-            "YaDisk update: directory ready path=%s HTTP %s",
-            artifacts, response.status,
-        )
+    for path in (
+        f"{root}/artifacts",
+        f"{root}/artifacts/full_bundle",
+        f"{root}/status_bundle",
+    ):
+        async with session.put(
+            f"{API}/resources", params={"path": path},
+        ) as response:
+            if response.status not in (201, 409):
+                raise RuntimeError(
+                    f"create update directory {path}: "
+                    f"{response.status} {await response.text()}")
+            log.info(
+                "YaDisk update: directory ready path=%s HTTP %s",
+                path, response.status,
+            )
 
 
 async def _resource_matches(session: aiohttp.ClientSession, path: str,
@@ -219,8 +226,12 @@ async def _import_url(
     """Let Yandex fetch an immutable release URL, verify it, then move atomically."""
     expected_size = len(payload)
     expected_md5 = hashlib.md5(payload).hexdigest()
-    parent, filename = destination.rsplit("/", 1)
-    staging = f"{parent}/.{filename}.{uuid.uuid4().hex}.incoming.zip"
+    bundle_path, filename = destination.rsplit("/", 1)
+    staging_parent, bundle_name = bundle_path.rsplit("/", 1)
+    staging = (
+        f"{staging_parent}/.{bundle_name}.{filename}."
+        f"{uuid.uuid4().hex}.incoming.zip"
+    )
     log.info(
         "YaDisk update: server-side import requested staging=%s "
         "size=%.1f MiB md5=%s",
@@ -383,10 +394,12 @@ async def publish_update(
 
     root = normalize_folder(folder)
     sha256 = hashlib.sha256(payload).hexdigest()
-    artifact_path = f"{root}/artifacts/full.zip"
-    status_path = f"{root}/status.json"
+    artifact_bundle_path = f"{root}/artifacts/full_bundle"
+    artifact_path = f"{artifact_bundle_path}/full.zip"
+    status_path = f"{root}/status_bundle/status.json"
     artifact = {
         "path": artifact_path,
+        "bundle_path": artifact_bundle_path,
         "size": len(payload),
         "sha256": sha256,
         "updated_at": datetime.now(timezone.utc).isoformat(),

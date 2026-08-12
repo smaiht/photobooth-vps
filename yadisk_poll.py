@@ -357,6 +357,7 @@ async def store_print_job(
     if (not PRINT_JOB_ID_RE.fullmatch(str(job_id or ""))
             or not isinstance(user_id, int) or user_id <= 0
             or not PRINT_SUFFIX_RE.fullmatch(normalized_suffix)
+            or normalized_suffix not in set(print_media.IMAGE_FILE_SUFFIXES.values())
             or not isinstance(image_payload, bytes) or not image_payload
             or len(image_payload) > print_media.MAX_PRINT_FILE_SIZE
             or not isinstance(metadata, dict)):
@@ -375,8 +376,11 @@ async def store_print_job(
     now = datetime.now(timezone.utc)
     timestamp = now.strftime("%Y%m%dT%H%M%SZ")
     basename = f"{user_id}_{timestamp}_{job_id}"
-    image_path = f"{jobs_root}/{basename}{normalized_suffix}"
-    info_path = f"{jobs_root}/{basename}.txt"
+    job_folder = f"{jobs_root}/{basename}"
+    if not await _ensure_directory(job_folder):
+        raise RuntimeError(f"cannot create print job directory {job_folder}")
+    image_path = f"{job_folder}/{basename}{normalized_suffix}"
+    info_path = f"{job_folder}/{basename}.txt"
     info = dict(metadata)
     info.update({
         "job_id": job_id,
@@ -385,6 +389,7 @@ async def store_print_job(
         "stored_at": now.isoformat(),
         "image_path": image_path,
         "info_path": info_path,
+        "job_folder": job_folder,
         "image_size_bytes": len(image_payload),
     })
     info_payload = (
@@ -394,13 +399,14 @@ async def store_print_job(
     await _upload_print_file(image_path, image_payload)
     await _upload_print_file(info_path, info_payload)
     log.info(
-        "YaDisk print: two files stored job=%s user=%s image=%s info=%s",
-        job_id, user_id, image_path, info_path,
+        "YaDisk print: job folder stored job=%s user=%s folder=%s image=%s info=%s",
+        job_id, user_id, job_folder, image_path, info_path,
     )
     return {
         "event_folder": event_name,
         "artifact_path": image_path,
         "info_path": info_path,
+        "job_folder": job_folder,
     }
 
 
