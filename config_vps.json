@@ -1,6 +1,6 @@
 {
     "_comment": "VPS runtime settings. Secrets stay in .env.",
-    "yadisk_folder": "Кафе",
+    "yadisk_folder": "2026-08-16 ДР Света",
     "_yadisk_folder_comment": "Active event media folder. Session notifications arrive through yadisk_control_folder/to_vps.",
     "yadisk_control_folder": "photobooth_system/control",
     "_yadisk_control_folder_comment": "Stable private bus with only to_booth and to_vps. Processed command and response JSON files are deleted. Must match the photobooth config.",
