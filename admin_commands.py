@@ -11,6 +11,7 @@ DEFAULT_UNBLOCK_SESSIONS = 1
 MAX_UNBLOCK_SESSIONS = 1000
 EVENT_NAME_RE = re.compile(r"^(\d{4}-\d{2}-\d{2}) (.+)$")
 CAMERA_FIELD_RE = re.compile(r"^[a-z][a-z0-9_]{0,63}$")
+TEMPLATE_PACK_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,63}$")
 
 # Operator-facing command names are intentionally duplicated from the booth's
 # config_camera.json.  The help must be complete even when the booth is offline;
@@ -70,12 +71,14 @@ KNOWN_COMMANDS = {
     "/clear_logs": "clear_logs",
     "/restart": "restart",
     "/event": "set_event",
+    "/template": "set_template_pack",
 }
 
 PRESET_NAME_RE = re.compile(r"^[a-z][a-z0-9_]{0,39}$")
 
 _GENERAL_HELP_COMMANDS = tuple(
-    name for name in KNOWN_COMMANDS if name != "/light"
+    "/template <pack>" if name == "/template" else name
+    for name in KNOWN_COMMANDS if name != "/light"
 )
 _PRESET_HELP_COMMANDS = tuple(
     f"/light {name} — {label}" for name, label in LIGHT_PRESETS
@@ -158,6 +161,18 @@ def _parse_light(argument: str | None) -> ParsedCommand:
     return "set_camera_preset", {"name": name}
 
 
+def _parse_template(argument: str | None) -> ParsedCommand:
+    if not argument:
+        raise ValueError("Использование: /template <pack>")
+    name = argument.strip().lower()
+    if not TEMPLATE_PACK_RE.fullmatch(name):
+        raise ValueError(
+            "Имя pack может содержать только a-z, 0-9, "
+            "дефис и подчёркивание"
+        )
+    return "set_template_pack", {"name": name}
+
+
 def _parse_print_queue(
     command: str,
     argument: str | None,
@@ -187,6 +202,8 @@ def parse(text: str) -> ParsedCommand | None:
         return _parse_unblock(argument)
     if known_command == "set_camera_preset":
         return _parse_light(argument)
+    if known_command == "set_template_pack":
+        return _parse_template(argument)
     if known_command in (
         "print_queue",
         "clear_print_queue",
@@ -234,6 +251,11 @@ def sent_message(command: str, data: dict | None) -> str:
             f"⏳ Пресет света: {data['name']}; "
             "ожидаю подтверждение будки"
         )
+    if command == "set_template_pack":
+        return (
+            f"⏳ Переключаю template pack на {data['name']}; "
+            "ожидаю подтверждение будки"
+        )
     if command == "get_config":
         return "⏳ Запрашиваю конфиги фотобудки..."
     if command == "print_queue":
@@ -255,6 +277,7 @@ def failed_message(command: str, error: Exception) -> str:
         "unblock": "Изменение блокировки не отправлено",
         "set_camera_config": "Настройка камеры не отправлена",
         "set_camera_preset": "Пресет света не отправлен",
+        "set_template_pack": "Template pack не переключён",
         "print_queue": "Запрос очередей печати не отправлен",
         "clear_print_queue": "Очистка очередей печати не отправлена",
         "clear_photos": "Очистка папки photos не отправлена",

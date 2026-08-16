@@ -834,6 +834,54 @@ class CameraSettingCommandTests(unittest.IsolatedAsyncioTestCase):
         )
 
 
+class TemplatePackCommandTests(unittest.IsolatedAsyncioTestCase):
+    def test_parses_pack_name_and_lists_command_in_help(self):
+        self.assertEqual(
+            admin_commands.parse("/template birthday"),
+            ("set_template_pack", {"name": "birthday"}),
+        )
+        self.assertEqual(
+            admin_commands.parse(
+                "/template@photobooth_bot PARK_UNIVERSAL"
+            ),
+            ("set_template_pack", {"name": "park_universal"}),
+        )
+        self.assertIn("/template <pack>", admin_commands.HELP_MESSAGE)
+
+    def test_rejects_missing_or_unsafe_pack_name(self):
+        for text in (
+            "/template",
+            "/template two names",
+            "/template ../birthday",
+            "/template _hidden",
+            "/template день-рождения",
+        ):
+            with self.subTest(text=text), self.assertRaises(ValueError):
+                admin_commands.parse(text)
+
+    async def test_forwards_pack_name_to_booth(self):
+        target = ReplyTarget("telegram", 123)
+        with patch(
+            "admin_command_service.yadisk_control.send_command",
+            AsyncMock(return_value="a" * 32),
+        ) as send, patch(
+            "admin_command_service.messenger_delivery.send_text",
+            AsyncMock(return_value=True),
+        ) as send_text:
+            await admin_command_service.handle_message(
+                target,
+                "/template birthday",
+            )
+
+        send.assert_awaited_once_with(
+            "set_template_pack",
+            target,
+            {"name": "birthday"},
+        )
+        self.assertIn("birthday", send_text.await_args.args[1])
+        self.assertIn("подтверждение будки", send_text.await_args.args[1])
+
+
 class CameraPresetCommandTests(unittest.IsolatedAsyncioTestCase):
     def test_parses_light_preset_and_bot_suffix(self):
         self.assertEqual(
