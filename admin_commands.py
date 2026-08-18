@@ -10,7 +10,7 @@ ParsedCommand = tuple[str, dict | None]
 DEFAULT_UNBLOCK_SESSIONS = 1
 MAX_UNBLOCK_SESSIONS = 1000
 EVENT_NAME_RE = re.compile(r"^(\d{4}-\d{2}-\d{2}) (.+)$")
-CAMERA_FIELD_RE = re.compile(r"^[a-z][a-z0-9_]{0,63}$")
+CONFIG_FIELD_RE = re.compile(r"^[a-z][a-z0-9_]{0,63}$")
 TEMPLATE_PACK_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,63}$")
 
 # Operator-facing command names are intentionally duplicated from the booth's
@@ -86,6 +86,10 @@ _PRESET_HELP_COMMANDS = tuple(
 _CAMERA_HELP_COMMANDS = tuple(
     f"/{field} <значение>" for field in CAMERA_SETTING_FIELDS
 )
+_APP_HELP_COMMAND = (
+    "/<поле config_app> <значение> — только из "
+    "_admin_editable_fields"
+)
 
 HELP_MESSAGE = (
     "Не понял команду. Доступные команды:\n\n"
@@ -94,6 +98,8 @@ HELP_MESSAGE = (
     + "\n".join(_PRESET_HELP_COMMANDS)
     + "\n\nНастройки камеры:\n"
     + "\n".join(_CAMERA_HELP_COMMANDS)
+    + "\n\nНастройки приложения:\n"
+    + _APP_HELP_COMMAND
 )
 
 
@@ -214,18 +220,23 @@ def parse(text: str) -> ParsedCommand | None:
     if known_command:
         return known_command, None
 
-    # /start is consumed by a provider adapter and must never be treated as a
-    # camera field if this parser is called directly.
+    # /start belongs to the provider adapter.
     if command_name == "/start":
         return None
 
     field = command_name.removeprefix("/")
-    if (not CAMERA_FIELD_RE.fullmatch(field)
-            or field not in CAMERA_SETTING_FIELD_NAMES):
+    if not CONFIG_FIELD_RE.fullmatch(field):
         return None
     if argument is None:
-        raise ValueError(f"Использование: /{field} значение")
-    return "set_camera_config", {"field": field, "value": argument}
+        if field in CAMERA_SETTING_FIELD_NAMES:
+            raise ValueError(f"Использование: /{field} значение")
+        return None
+    command = (
+        "set_camera_config"
+        if field in CAMERA_SETTING_FIELD_NAMES
+        else "set_app_config"
+    )
+    return command, {"field": field, "value": argument}
 
 
 def sent_message(command: str, data: dict | None) -> str:
@@ -244,6 +255,11 @@ def sent_message(command: str, data: dict | None) -> str:
     if command == "set_camera_config":
         return (
             f"⏳ Камера: {data['field']} → {data['value']}; "
+            "ожидаю подтверждение будки"
+        )
+    if command == "set_app_config":
+        return (
+            f"⏳ Приложение: {data['field']} → {data['value']}; "
             "ожидаю подтверждение будки"
         )
     if command == "set_camera_preset":
@@ -276,6 +292,7 @@ def failed_message(command: str, error: Exception) -> str:
         "set_event": "Команда смены мероприятия не отправлена",
         "unblock": "Изменение блокировки не отправлено",
         "set_camera_config": "Настройка камеры не отправлена",
+        "set_app_config": "Настройка приложения не отправлена",
         "set_camera_preset": "Пресет света не отправлен",
         "set_template_pack": "Template pack не переключён",
         "print_queue": "Запрос очередей печати не отправлен",

@@ -699,8 +699,18 @@ class CameraSettingCommandTests(unittest.IsolatedAsyncioTestCase):
                     admin_commands.HELP_MESSAGE,
                 )
 
-    def test_unknown_camera_field_is_not_forwarded(self):
-        self.assertIsNone(admin_commands.parse("/not_a_camera_field value"))
+    def test_non_camera_field_is_forwarded_for_booth_allowlist_check(self):
+        self.assertEqual(
+            admin_commands.parse("/photo_choice_default_with_frame true"),
+            (
+                "set_app_config",
+                {
+                    "field": "photo_choice_default_with_frame",
+                    "value": "true",
+                },
+            ),
+        )
+        self.assertIn("_admin_editable_fields", admin_commands.HELP_MESSAGE)
 
     async def test_forwards_raw_value_to_booth(self):
         with patch(
@@ -832,6 +842,32 @@ class CameraSettingCommandTests(unittest.IsolatedAsyncioTestCase):
             send_text.await_args.args[1],
             "⏳ Запрашиваю конфиги фотобудки...",
         )
+
+
+class AppConfigCommandTests(unittest.IsolatedAsyncioTestCase):
+    async def test_forwards_direct_field_command_to_booth(self):
+        target = ReplyTarget("telegram", 123)
+        with patch(
+            "admin_command_service.yadisk_control.send_command",
+            AsyncMock(return_value="a" * 32),
+        ) as send, patch(
+            "admin_command_service.messenger_delivery.send_text",
+            AsyncMock(return_value=True),
+        ) as send_text:
+            await admin_command_service.handle_message(
+                target,
+                "/photo_choice_default_with_frame true",
+            )
+
+        send.assert_awaited_once_with(
+            "set_app_config",
+            target,
+            {
+                "field": "photo_choice_default_with_frame",
+                "value": "true",
+            },
+        )
+        self.assertIn("ожидаю подтверждение", send_text.await_args.args[1])
 
 
 class TemplatePackCommandTests(unittest.IsolatedAsyncioTestCase):
@@ -970,7 +1006,6 @@ class RemovedUpdateCommandTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("/update", admin_commands.KNOWN_COMMANDS)
         self.assertNotIn("/update", admin_commands.HELP_MESSAGE)
         self.assertIsNone(admin_commands.parse("/update"))
-        self.assertIsNone(admin_commands.parse("/update now"))
 
     async def test_update_returns_help_without_touching_yandex_disk(self):
         with patch(
