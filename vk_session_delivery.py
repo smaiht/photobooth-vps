@@ -9,6 +9,7 @@ from pathlib import Path
 
 import aiohttp
 
+import print_media
 import vk_api
 
 
@@ -39,6 +40,7 @@ async def _upload_file(
     kind: str,
 ) -> str:
     payload = await asyncio.to_thread(path.read_bytes)
+    filename = path.name
     content_type = _content_type(path, kind)
     if kind == "video":
         # Reuse the application's existing community-token document upload
@@ -47,14 +49,32 @@ async def _upload_file(
             session,
             peer_id,
             payload,
-            filename=path.name,
+            filename=filename,
             content_type=content_type,
+        )
+    if len(payload) > print_media.MESSENGER_PHOTO_SIZE_LIMIT:
+        original_size = len(payload)
+        payload, quality, max_edge = await asyncio.to_thread(
+            print_media.compress_jpeg,
+            payload,
+            max_bytes=print_media.MESSENGER_PHOTO_SIZE_LIMIT,
+        )
+        filename = f"{path.stem}_vk.jpg"
+        content_type = "image/jpeg"
+        log.info(
+            "VK photo %s recompressed %.1f -> %.1f MiB "
+            "(quality=%d, max_edge=%d)",
+            path.name,
+            original_size / 1048576,
+            len(payload) / 1048576,
+            quality,
+            max_edge,
         )
     return await vk_api.upload_message_photo(
         session,
         peer_id,
         payload,
-        filename=path.name,
+        filename=filename,
         content_type=content_type,
     )
 

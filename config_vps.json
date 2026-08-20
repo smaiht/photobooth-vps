@@ -8,5 +8,42 @@
         "_comment": "Independent automatic media archive circuits for completed sessions and accepted remote prints.",
         "telegram": true,
         "vk": true
+    },
+    "ai_image_edit": {
+        "_comment": "Outside cafe mode, a photo enters this flow only when its caption is exactly AI, ИИ or изменить. In cafe mode AI is available only to admins and allowlisted users. KIE_API_KEY stays in .env. Output is always 1K; source orientation automatically selects 3:2 or 2:3.",
+        "enabled": true,
+        "generator": "kie",
+        "templates": [
+            {
+                "id": "event_hero",
+                "button": "🌟 Я — ГЕРОЙ СОБЫТИЯ",
+                "prompt": "Preserve the person's recognizable identity, age, facial features, skin tone and expression. Transform their clothing, lighting and environment into a polished signature hero scene for the current event. Keep the result photorealistic, flattering and suitable for a premium 10x15 print. Do not generate any text, letters, logos or watermarks."
+            },
+            {
+                "id": "poster",
+                "button": "🎬 ПОСТЕР / ОБЛОЖКА",
+                "prompt": "Preserve the person's recognizable identity, age, facial features, skin tone and expression. Create a cinematic poster-quality portrait with dramatic professional lighting, a strong composition and clean areas where deterministic event typography can be overlaid later. Do not generate any text, letters, logos or watermarks."
+            },
+            {
+                "id": "era",
+                "button": "🕰 ПЕРСОНАЖ ЭПОХИ",
+                "prompt": "Preserve the person's recognizable identity, age, facial features, skin tone and expression. Reimagine the person as a stylish character from a distinctive historical or retrofuturistic era, with authentic clothing, lighting and environment. Keep the image photorealistic and suitable for printing. Do not generate any text, letters, logos or watermarks."
+            },
+            {
+                "id": "collector_card",
+                "button": "🃏 КОЛЛЕКЦИОННАЯ КАРТОЧКА",
+                "prompt": "Preserve the person's recognizable identity, age, facial features, skin tone and expression. Create a premium collectible-card portrait with a dynamic pose, layered lighting and a clean designed background. Leave uncluttered areas for exact name, characteristics and event branding to be added later. Do not generate any text, letters, numbers, logos or watermarks."
+            },
+            {
+                "id": "character",
+                "button": "🎭 Я — ПЕРСОНАЖ",
+                "prompt": "Preserve the person's recognizable identity, age, facial features, skin tone and expression. Transform them into a clearly fictional event character with a coherent costume, natural anatomy, cinematic lighting and an immersive themed environment. Do not imitate a real public figure. Do not generate any text, logos or watermarks."
+            },
+            {
+                "id": "comic",
+                "button": "💥 AI-КОМИКС",
+                "prompt": "Preserve the recognizable identity and key facial features of the person. Create one polished three-panel comic composition telling a short celebratory visual story, with consistent character appearance across all panels and clear panel separation. Leave speech areas empty. Do not generate any text, letters, logos or watermarks."
+            }
+        ]
     }
 }

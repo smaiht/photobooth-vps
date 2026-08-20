@@ -3,16 +3,15 @@
 from __future__ import annotations
 
 import asyncio
-import io
 import json
 import logging
 from contextlib import ExitStack
 from pathlib import Path
 
 import aiohttp
-from PIL import Image, ImageOps
 
 import delivery_retry
+import print_media
 import telegram_api
 
 
@@ -22,31 +21,7 @@ SessionFile = tuple[Path, str]
 
 # Telegram rejects a photo attachment larger than this with a permanent 400,
 # so an oversized camera JPEG must be re-encoded before it is uploaded.
-PHOTO_SIZE_LIMIT = 10 * 1024 * 1024
-# Telegram re-encodes every accepted photo and serves at most a 2560px copy,
-# so full-resolution quality steps are tried first and downscaling last.
-PHOTO_QUALITY_LADDER = (95, 92, 90, 85)
-PHOTO_MAX_EDGE_LADDER = (None, 3200, 2560)
-
-
-def _encode_jpeg(image: Image.Image, quality: int, max_edge: int | None) -> bytes:
-    candidate = image
-    if max_edge is not None and max(image.size) > max_edge:
-        candidate = image.copy()
-        candidate.thumbnail((max_edge, max_edge), Image.Resampling.LANCZOS)
-    try:
-        buffer = io.BytesIO()
-        candidate.save(
-            buffer,
-            "JPEG",
-            quality=quality,
-            optimize=True,
-            progressive=True,
-        )
-        return buffer.getvalue()
-    finally:
-        if candidate is not image:
-            candidate.close()
+PHOTO_SIZE_LIMIT = print_media.MESSENGER_PHOTO_SIZE_LIMIT
 
 
 def _compress_photo(source_path: Path, target_path: Path) -> tuple[int, int, int]:
@@ -55,27 +30,12 @@ def _compress_photo(source_path: Path, target_path: Path) -> tuple[int, int, int
     Returns the encoded size, the JPEG quality and the longest edge actually
     used.  Raises ValueError when even the smallest variant stays too large.
     """
-    with Image.open(source_path) as source:
-        oriented = ImageOps.exif_transpose(source) or source
-        try:
-            image = oriented.convert("RGB")
-        finally:
-            if oriented is not source:
-                oriented.close()
-    try:
-        for max_edge in PHOTO_MAX_EDGE_LADDER:
-            for quality in PHOTO_QUALITY_LADDER:
-                payload = _encode_jpeg(image, quality, max_edge)
-                if len(payload) <= PHOTO_SIZE_LIMIT:
-                    target_path.write_bytes(payload)
-                    return (
-                        len(payload),
-                        quality,
-                        max_edge or max(image.size),
-                    )
-    finally:
-        image.close()
-    raise ValueError("photo stays above the Telegram limit after re-encoding")
+    payload, quality, max_edge = print_media.compress_jpeg(
+        source_path.read_bytes(),
+        max_bytes=PHOTO_SIZE_LIMIT,
+    )
+    target_path.write_bytes(payload)
+    return len(payload), quality, max_edge
 
 
 async def _prepare_files(files: list[SessionFile]) -> list[SessionFile] | None:

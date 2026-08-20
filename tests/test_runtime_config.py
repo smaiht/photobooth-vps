@@ -68,6 +68,35 @@ class RuntimeConfigTests(unittest.TestCase):
         ):
             self.assertEqual(runtime_config.archive_delivery_providers(), ())
 
+    def test_ai_settings_return_every_configured_template(self):
+        templates = [
+            {
+                "id": f"effect_{index}",
+                "button": f"Effect {index}",
+                "prompt": f"Prompt {index}",
+            }
+            for index in range(6)
+        ]
+        with patch.object(
+            runtime_config,
+            "CONFIG",
+            {
+                "ai_image_edit": {
+                    "enabled": True,
+                    "generator": "kie",
+                    "templates": templates,
+                },
+            },
+        ):
+            settings = runtime_config.ai_image_edit_settings()
+
+        self.assertTrue(settings["enabled"])
+        self.assertEqual(settings["generator"], "kie")
+        self.assertEqual(
+            [item["id"] for item in settings["templates"]],
+            [item["id"] for item in templates],
+        )
+
     def test_event_update_is_atomic_and_preserves_other_settings(self):
         with TemporaryDirectory() as tmpdir:
             config_path = Path(tmpdir) / "config_vps.json"

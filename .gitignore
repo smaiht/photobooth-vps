@@ -5,4 +5,5 @@ nginx.conf
 .DS_Store
 vps_yadisk_state.json
 print_pending_jobs/
+ai_pending_jobs/
 venv

@@ -8,6 +8,7 @@ from pathlib import Path
 
 import aiohttp
 
+import ai_flow
 import print_flow
 import print_media
 import telegram_api
@@ -20,6 +21,10 @@ LEGACY_TELEGRAM_PRINT_ALLOWLIST = frozenset({"6634566969", "5683598562"})
 SAFE_SUFFIX_RE = re.compile(r"^\.[a-z0-9]{1,10}$")
 CHOICE_RE = re.compile(r"^print:(fit|fill|cancel):([a-f0-9]{32})$")
 ADMIN_RE = re.compile(r"^print_admin:(approve|reject):([a-f0-9]{32})$")
+AI_TEMPLATE_RE = re.compile(
+    r"^ai:t:([a-z0-9][a-z0-9_-]{0,19}):([a-f0-9]{32})$"
+)
+AI_ACTION_RE = re.compile(r"^ai:(c|p):([a-f0-9]{32})$")
 
 _rejected_media_groups: set[str] = set()
 
@@ -169,6 +174,43 @@ class TelegramPrintUI:
             reply_to,
         )
 
+    async def send_ai_choice(
+        self,
+        upload: ai_flow.AiUpload,
+        preview: bytes,
+        job_id: str,
+        templates: tuple[dict, ...],
+    ) -> int | None:
+        keyboard = {
+            "inline_keyboard": [
+                [{
+                    "text": template["button"],
+                    "callback_data": f"ai:t:{template['id']}:{job_id}",
+                }]
+                for template in templates
+            ] + [[{
+                "text": "❌ ОТМЕНА",
+                "callback_data": f"ai:c:{job_id}",
+            }]],
+        }
+        reply_to = (
+            upload.user.source_message_id
+            if isinstance(upload.user.source_message_id, int)
+            else None
+        )
+        return await telegram_api.send_photo(
+            self.session,
+            self.base,
+            upload.user.conversation_id,
+            preview,
+            "✨ Выберите AI-эффект:",
+            keyboard,
+            reply_to,
+            filename="ai_source.jpg",
+            content_type="image/jpeg",
+            parse_mode=None,
+        )
+
     async def acknowledge(
         self,
         action: print_flow.PrintAction,
@@ -288,7 +330,20 @@ async def handle_message(
         declared_size=declared_size,
         download=download,
     )
-    return await print_flow.handle_upload(upload, TelegramPrintUI(session, base))
+    ui = TelegramPrintUI(session, base)
+    if ai_flow.is_ai_caption(message.get("caption")):
+        handled = await ai_flow.handle_upload(
+            ai_flow.AiUpload(
+                user=user,
+                suffix=suffix,
+                declared_size=declared_size,
+                download=download,
+            ),
+            ui,
+        )
+        if handled:
+            return True
+    return await print_flow.handle_upload(upload, ui)
 
 
 def _action_user(callback: dict) -> print_flow.PrintUser:
@@ -340,6 +395,37 @@ async def handle_callback(
             context=callback,
         )
         return await print_flow.handle_admin_action(
+            action,
+            TelegramPrintUI(session, base),
+        )
+
+    matched = AI_TEMPLATE_RE.fullmatch(data)
+    if matched:
+        template_id, job_id = matched.groups()
+        action = ai_flow.AiAction(
+            user=_action_user(callback),
+            action="template",
+            template_id=template_id,
+            job_id=job_id,
+            action_id=callback.get("id"),
+            context=callback,
+        )
+        return await ai_flow.handle_action(
+            action,
+            TelegramPrintUI(session, base),
+        )
+
+    matched = AI_ACTION_RE.fullmatch(data)
+    if matched:
+        action_code, job_id = matched.groups()
+        action = ai_flow.AiAction(
+            user=_action_user(callback),
+            action="cancel" if action_code == "c" else "print",
+            job_id=job_id,
+            action_id=callback.get("id"),
+            context=callback,
+        )
+        return await ai_flow.handle_action(
             action,
             TelegramPrintUI(session, base),
         )

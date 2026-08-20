@@ -10,6 +10,9 @@ from PIL import Image, ImageOps
 
 MAX_PRINT_FILE_SIZE_MB = 20
 MAX_PRINT_FILE_SIZE = MAX_PRINT_FILE_SIZE_MB * 1024 * 1024
+MESSENGER_PHOTO_SIZE_LIMIT = 10 * 1024 * 1024
+JPEG_QUALITY_LADDER = (95, 92, 90, 85)
+JPEG_MAX_EDGE_LADDER = (None, 3200, 2560)
 PRINT_FORMAT_LABEL = "10×15"
 IMAGE_MIME_SUFFIXES = {
     "image/jpeg": ".jpg",
@@ -95,3 +98,55 @@ def jpeg_preview(payload: bytes) -> bytes:
         return output.getvalue()
     finally:
         image.close()
+
+
+def compress_jpeg(
+    payload: bytes,
+    *,
+    max_bytes: int,
+) -> tuple[bytes, int, int]:
+    """Re-encode an image as JPEG under one transport size limit."""
+    if not isinstance(payload, bytes) or not payload:
+        raise ValueError("пустое изображение")
+    if not isinstance(max_bytes, int) or max_bytes <= 0:
+        raise ValueError("некорректный лимит изображения")
+
+    with Image.open(io.BytesIO(payload)) as source:
+        oriented = ImageOps.exif_transpose(source)
+        try:
+            if oriented.mode in ("RGBA", "LA") or "transparency" in oriented.info:
+                rgba = oriented.convert("RGBA")
+                image = Image.new("RGB", rgba.size, (255, 255, 255))
+                image.paste(rgba, mask=rgba.getchannel("A"))
+                rgba.close()
+            else:
+                image = oriented.convert("RGB")
+        finally:
+            if oriented is not source:
+                oriented.close()
+
+    try:
+        for max_edge in JPEG_MAX_EDGE_LADDER:
+            candidate = image
+            if max_edge is not None and max(image.size) > max_edge:
+                candidate = image.copy()
+                candidate.thumbnail((max_edge, max_edge), Image.Resampling.LANCZOS)
+            try:
+                for quality in JPEG_QUALITY_LADDER:
+                    output = io.BytesIO()
+                    candidate.save(
+                        output,
+                        "JPEG",
+                        quality=quality,
+                        optimize=True,
+                        progressive=True,
+                    )
+                    encoded = output.getvalue()
+                    if len(encoded) <= max_bytes:
+                        return encoded, quality, max(candidate.size)
+            finally:
+                if candidate is not image:
+                    candidate.close()
+    finally:
+        image.close()
+    raise ValueError("изображение не удалось ужать до допустимого размера")

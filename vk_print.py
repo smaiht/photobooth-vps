@@ -12,6 +12,7 @@ from urllib.parse import urlsplit
 
 import aiohttp
 
+import ai_flow
 import print_flow
 import print_media
 import vk_api
@@ -259,6 +260,29 @@ def _choice_keyboard(job_id: str) -> dict:
     }
 
 
+def _ai_choice_keyboard(job_id: str, templates: tuple[dict, ...]) -> dict:
+    buttons = [
+        [{
+            "action": {
+                "type": "callback",
+                "label": template["button"],
+                "payload": _payload("ai_template", template["id"], job_id),
+            },
+            "color": "primary",
+        }]
+        for template in templates
+    ]
+    buttons.append([{
+        "action": {
+            "type": "callback",
+            "label": "❌ ОТМЕНА",
+            "payload": _payload("ai_cancel", "cancel", job_id),
+        },
+        "color": "negative",
+    }])
+    return {"inline": True, "buttons": buttons}
+
+
 class VkPrintUI:
     def __init__(self, session: aiohttp.ClientSession) -> None:
         self.session = session
@@ -286,6 +310,23 @@ class VkPrintUI:
             filename="print_options.jpg",
             content_type="image/jpeg",
             keyboard=_choice_keyboard(job_id),
+        )
+
+    async def send_ai_choice(
+        self,
+        upload: ai_flow.AiUpload,
+        preview: bytes,
+        job_id: str,
+        templates: tuple[dict, ...],
+    ) -> int | None:
+        return await vk_api.send_photo(
+            self.session,
+            int(upload.user.conversation_id),
+            preview,
+            "✨ Выберите AI-эффект:",
+            filename="ai_source.jpg",
+            content_type="image/jpeg",
+            keyboard=_ai_choice_keyboard(job_id, templates),
         )
 
     async def acknowledge(
@@ -409,12 +450,19 @@ def _action_parts(payload: dict) -> tuple[str, str, str] | None:
     kind = payload.get("type")
     action_name = payload.get("action")
     job_id = payload.get("job_id")
-    allowed = (
-        {"fit", "fill", "cancel"}
-        if kind == "print_choice"
-        else {"approve", "reject"} if kind == "print_admin" else set()
-    )
-    if action_name not in allowed or not isinstance(job_id, str):
+    if kind == "print_choice":
+        valid_action = action_name in {"fit", "fill", "cancel"}
+    elif kind == "print_admin":
+        valid_action = action_name in {"approve", "reject"}
+    elif kind == "ai_template":
+        valid_action = ai_flow.valid_template_id(action_name)
+    elif kind == "ai_cancel":
+        valid_action = action_name == "cancel"
+    elif kind == "ai_print":
+        valid_action = action_name == "print"
+    else:
+        valid_action = False
+    if not valid_action or not isinstance(job_id, str):
         return None
     return str(kind), str(action_name), job_id
 
@@ -423,7 +471,7 @@ def parse_action(
     message: dict,
     *,
     profile: dict[str, str | None] | None = None,
-) -> tuple[str, print_flow.PrintAction] | None:
+) -> tuple[str, print_flow.PrintAction | ai_flow.AiAction] | None:
     payload = _action_payload(message.get("payload"))
     if payload is None:
         return None
@@ -432,17 +480,29 @@ def parse_action(
         return None
     kind, action_name, job_id = parts
     try:
-        action = print_flow.PrintAction(
-            user=user_from_message(message, profile=profile),
-            action=action_name,
-            job_id=job_id,
-            action_id=(
-                str(message.get("conversation_message_id"))
-                if message.get("conversation_message_id") is not None
-                else None
-            ),
-            context=message,
+        action_id = (
+            str(message.get("conversation_message_id"))
+            if message.get("conversation_message_id") is not None
+            else None
         )
+        user = user_from_message(message, profile=profile)
+        if kind.startswith("ai_"):
+            action = ai_flow.AiAction(
+                user=user,
+                action="template" if kind == "ai_template" else action_name,
+                template_id=action_name if kind == "ai_template" else None,
+                job_id=job_id,
+                action_id=action_id,
+                context=message,
+            )
+        else:
+            action = print_flow.PrintAction(
+                user=user,
+                action=action_name,
+                job_id=job_id,
+                action_id=action_id,
+                context=message,
+            )
     except ValueError:
         return None
     return str(kind), action
@@ -452,7 +512,7 @@ def parse_event_action(
     event: dict,
     *,
     profile: dict[str, str | None] | None = None,
-) -> tuple[str, print_flow.PrintAction] | None:
+) -> tuple[str, print_flow.PrintAction | ai_flow.AiAction] | None:
     payload = _action_payload(event.get("payload"))
     if payload is None:
         return None
@@ -461,13 +521,24 @@ def parse_event_action(
         return None
     kind, action_name, job_id = parts
     try:
-        action = print_flow.PrintAction(
-            user=user_from_event(event, profile=profile),
-            action=action_name,
-            job_id=job_id,
-            action_id=str(event.get("event_id") or "") or None,
-            context={"vk_message_event": event},
-        )
+        user = user_from_event(event, profile=profile)
+        if kind.startswith("ai_"):
+            action = ai_flow.AiAction(
+                user=user,
+                action="template" if kind == "ai_template" else action_name,
+                template_id=action_name if kind == "ai_template" else None,
+                job_id=job_id,
+                action_id=str(event.get("event_id") or "") or None,
+                context={"vk_message_event": event},
+            )
+        else:
+            action = print_flow.PrintAction(
+                user=user,
+                action=action_name,
+                job_id=job_id,
+                action_id=str(event.get("event_id") or "") or None,
+                context={"vk_message_event": event},
+            )
     except ValueError:
         return None
     return kind, action
@@ -486,7 +557,9 @@ async def handle_action(
     ui = VkPrintUI(session)
     if kind == "print_choice":
         return await print_flow.handle_choice(action, ui)
-    return await print_flow.handle_admin_action(action, ui)
+    if kind == "print_admin":
+        return await print_flow.handle_admin_action(action, ui)
+    return await ai_flow.handle_action(action, ui)
 
 
 async def handle_event(
@@ -502,7 +575,9 @@ async def handle_event(
     ui = VkPrintUI(session)
     if kind == "print_choice":
         return await print_flow.handle_choice(action, ui)
-    return await print_flow.handle_admin_action(action, ui)
+    if kind == "print_admin":
+        return await print_flow.handle_admin_action(action, ui)
+    return await ai_flow.handle_action(action, ui)
 
 
 async def handle_message(
@@ -530,6 +605,19 @@ async def handle_message(
     async def download() -> bytes:
         return await download_image(session, image)
 
+    ui = VkPrintUI(session)
+    if ai_flow.is_ai_caption(message.get("text")):
+        handled = await ai_flow.handle_upload(
+            ai_flow.AiUpload(
+                user=user,
+                suffix=image.suffix,
+                declared_size=image.declared_size,
+                download=download,
+            ),
+            ui,
+        )
+        if handled:
+            return True
     upload = print_flow.PrintUpload(
         user=user,
         suffix=image.suffix,
@@ -537,4 +625,4 @@ async def handle_message(
         download=download,
         metadata=image.metadata,
     )
-    return await print_flow.handle_upload(upload, VkPrintUI(session))
+    return await print_flow.handle_upload(upload, ui)

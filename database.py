@@ -7,6 +7,7 @@ import uuid
 PROVIDERS = frozenset({"telegram", "vk", "max"})
 PRINT_MODES = frozenset({"fit", "fill"})
 PRINT_COOLDOWN_SECONDS = 5 * 60
+AI_COOLDOWN_SECONDS = 10 * 60
 
 
 async def _connect():
@@ -961,4 +962,654 @@ async def _command_transition_fallback(
         "job_id": row[0],
         "status": row[1],
         "command_id": command_id,
+    }
+
+
+async def create_ai_image_job(
+    *,
+    user_id: int,
+    event_name: str,
+    conversation_id: str | int,
+    source_suffix: str,
+    source_message_id: str | int | None = None,
+    job_id: str | uuid.UUID | None = None,
+    bypass_cooldown: bool = False,
+) -> dict:
+    """Create one durable AI image job and close active jobs from old events."""
+    if int(user_id) <= 0:
+        raise ValueError("user_id must be positive")
+    job_id = str(uuid.uuid4()) if job_id is None else _uuid_text(job_id, "job_id")
+    event_name = _required_text(event_name, "event_name")
+    conversation_id = _required_text(conversation_id, "conversation_id")
+    source_suffix = _required_text(source_suffix, "source_suffix")
+    source_message_id = _optional_text(source_message_id)
+
+    connection = await _connect()
+    async with connection:
+        async with connection.transaction():
+            cursor = await connection.execute(
+                """
+                UPDATE ai_image_jobs
+                SET status = 'cancelled', closed_at = now(),
+                    close_reason = 'event_changed'
+                WHERE user_id = %s
+                  AND event_name <> %s
+                  AND status IN (
+                      'receiving',
+                      'awaiting_template',
+                      'queued',
+                      'processing'
+                  )
+                RETURNING id::text
+                """,
+                (int(user_id), event_name),
+            )
+            stale_job_ids = [
+                _uuid_hex(row[0], "job_id") for row in await cursor.fetchall()
+            ]
+            if not bypass_cooldown:
+                cursor = await connection.execute(
+                    """
+                    SELECT GREATEST(
+                        0,
+                        CEIL(EXTRACT(EPOCH FROM (
+                            queued_at + make_interval(secs => %s) - now()
+                        )))::integer
+                    )
+                    FROM ai_image_jobs
+                    WHERE user_id = %s
+                      AND event_name = %s
+                      AND queued_at > now() - make_interval(secs => %s)
+                    ORDER BY queued_at DESC
+                    LIMIT 1
+                    """,
+                    (
+                        AI_COOLDOWN_SECONDS,
+                        int(user_id),
+                        event_name,
+                        AI_COOLDOWN_SECONDS,
+                    ),
+                )
+                cooldown = await cursor.fetchone()
+                if cooldown is not None and int(cooldown[0]) > 0:
+                    return {
+                        "outcome": "cooldown",
+                        "job_id": _uuid_hex(job_id, "job_id"),
+                        "retry_after_seconds": int(cooldown[0]),
+                        "stale_job_ids": stale_job_ids,
+                    }
+            cursor = await connection.execute(
+                """
+                INSERT INTO ai_image_jobs (
+                    id, user_id, event_name, conversation_id,
+                    source_message_id, source_suffix
+                )
+                VALUES (%s, %s, %s, %s, %s, %s)
+                ON CONFLICT DO NOTHING
+                RETURNING id::text, status
+                """,
+                (
+                    job_id,
+                    int(user_id),
+                    event_name,
+                    conversation_id,
+                    source_message_id,
+                    source_suffix,
+                ),
+            )
+            row = await cursor.fetchone()
+            if row is not None:
+                return {
+                    "outcome": "created",
+                    "job_id": _uuid_hex(row[0], "job_id"),
+                    "status": row[1],
+                    "stale_job_ids": stale_job_ids,
+                }
+            cursor = await connection.execute(
+                """
+                SELECT id::text, status
+                FROM ai_image_jobs
+                WHERE user_id = %s
+                  AND status IN (
+                      'receiving',
+                      'awaiting_template',
+                      'queued',
+                      'processing'
+                  )
+                LIMIT 1
+                """,
+                (int(user_id),),
+            )
+            row = await cursor.fetchone()
+            if row is None:
+                raise RuntimeError("AI job conflict has no active job")
+            return {
+                "outcome": "already_open",
+                "job_id": _uuid_hex(row[0], "job_id"),
+                "status": row[1],
+                "stale_job_ids": stale_job_ids,
+            }
+
+
+async def mark_ai_image_job_awaiting_template(
+    *,
+    job_id: str | uuid.UUID,
+    choice_message_id: str | int,
+) -> dict:
+    job_id = _uuid_text(job_id, "job_id")
+    choice_message_id = _required_text(choice_message_id, "choice_message_id")
+    connection = await _connect()
+    async with connection:
+        cursor = await connection.execute(
+            """
+            UPDATE ai_image_jobs
+            SET status = 'awaiting_template', choice_message_id = %s
+            WHERE id = %s AND status = 'receiving'
+            RETURNING id::text
+            """,
+            (choice_message_id, job_id),
+        )
+        row = await cursor.fetchone()
+        if row is not None:
+            return {
+                "outcome": "awaiting_template",
+                "job_id": _uuid_hex(row[0], "job_id"),
+            }
+        return {"outcome": "inactive", "job_id": _uuid_hex(job_id, "job_id")}
+
+
+async def queue_ai_image_job(
+    *,
+    job_id: str | uuid.UUID,
+    user_id: int,
+    current_event_name: str,
+    template_id: str,
+    template_label: str,
+    prompt: str,
+) -> dict:
+    """Select a configured template and atomically place the job in the queue."""
+    job_id = _uuid_text(job_id, "job_id")
+    current_event_name = _required_text(current_event_name, "current_event_name")
+    template_id = _required_text(template_id, "template_id")
+    template_label = _required_text(template_label, "template_label")
+    prompt = _required_text(prompt, "prompt")
+    connection = await _connect()
+    async with connection:
+        async with connection.transaction():
+            cursor = await connection.execute(
+                """
+                SELECT user_id, event_name, status
+                FROM ai_image_jobs
+                WHERE id = %s
+                FOR UPDATE
+                """,
+                (job_id,),
+            )
+            row = await cursor.fetchone()
+            if row is None:
+                return {"outcome": "not_found", "job_id": _uuid_hex(job_id, "job_id")}
+            owner_id, event_name, status = row
+            if int(owner_id) != int(user_id):
+                return {"outcome": "not_owner", "job_id": _uuid_hex(job_id, "job_id")}
+            if event_name != current_event_name:
+                return {"outcome": "event_changed", "job_id": _uuid_hex(job_id, "job_id")}
+            if status != "awaiting_template":
+                return {
+                    "outcome": "inactive",
+                    "job_id": _uuid_hex(job_id, "job_id"),
+                    "status": status,
+                }
+            await connection.execute(
+                """
+                UPDATE ai_image_jobs
+                SET status = 'queued', template_id = %s,
+                    template_label = %s, prompt = %s,
+                    selected_at = now(), queued_at = now()
+                WHERE id = %s
+                """,
+                (template_id, template_label, prompt, job_id),
+            )
+            return {
+                "outcome": "queued",
+                "job_id": _uuid_hex(job_id, "job_id"),
+                "template_id": template_id,
+                "template_label": template_label,
+            }
+
+
+async def cancel_ai_image_job(
+    *,
+    job_id: str | uuid.UUID,
+    user_id: int,
+) -> dict:
+    job_id = _uuid_text(job_id, "job_id")
+    connection = await _connect()
+    async with connection:
+        cursor = await connection.execute(
+            """
+            UPDATE ai_image_jobs
+            SET status = 'cancelled', closed_at = now(),
+                close_reason = 'user_cancelled'
+            WHERE id = %s AND user_id = %s AND status = 'awaiting_template'
+            RETURNING id::text
+            """,
+            (job_id, int(user_id)),
+        )
+        row = await cursor.fetchone()
+        if row is not None:
+            return {
+                "outcome": "cancelled",
+                "job_id": _uuid_hex(row[0], "job_id"),
+            }
+        cursor = await connection.execute(
+            "SELECT user_id, status FROM ai_image_jobs WHERE id = %s",
+            (job_id,),
+        )
+        row = await cursor.fetchone()
+        if row is None:
+            return {"outcome": "not_found", "job_id": _uuid_hex(job_id, "job_id")}
+        return {
+            "outcome": "not_owner" if int(row[0]) != int(user_id) else "inactive",
+            "job_id": _uuid_hex(job_id, "job_id"),
+            "status": row[1],
+        }
+
+
+def _ai_image_job_from_row(row) -> dict:
+    return {
+        "job_id": _uuid_hex(row[0], "job_id"),
+        "user_id": int(row[1]),
+        "event_name": row[2],
+        "conversation_id": row[3],
+        "source_message_id": row[4],
+        "source_suffix": row[5],
+        "result_suffix": row[6],
+        "template_id": row[7],
+        "template_label": row[8],
+        "prompt": row[9],
+        "provider": row[10],
+        "provider_user_id": row[11],
+        "username": row[12],
+        "first_name": row[13],
+        "last_name": row[14],
+        "provider_task_id": row[15],
+        "next_poll_at": row[16],
+        "provider_deadline_at": row[17],
+    }
+
+
+async def claim_next_ai_image_job(*, poll_seconds: int) -> dict | None:
+    """Claim one new or due AI job without blocking another worker."""
+    poll_seconds = int(poll_seconds)
+    if poll_seconds <= 0:
+        raise ValueError("poll_seconds must be positive")
+    connection = await _connect()
+    async with connection:
+        cursor = await connection.execute(
+            """
+            WITH candidate AS (
+                SELECT id
+                FROM ai_image_jobs
+                WHERE status = 'queued'
+                   OR (
+                        status = 'processing'
+                        AND provider_task_id IS NOT NULL
+                        AND next_poll_at <= now()
+                   )
+                ORDER BY COALESCE(next_poll_at, queued_at, created_at), created_at
+                FOR UPDATE SKIP LOCKED
+                LIMIT 1
+            ), claimed AS (
+                UPDATE ai_image_jobs AS jobs
+                SET status = 'processing',
+                    processing_at = COALESCE(jobs.processing_at, now()),
+                    next_poll_at = CASE
+                        WHEN jobs.provider_task_id IS NULL THEN jobs.next_poll_at
+                        ELSE now() + make_interval(secs => %s)
+                    END
+                FROM candidate
+                WHERE jobs.id = candidate.id
+                RETURNING jobs.*
+            )
+            SELECT
+                claimed.id, claimed.user_id, claimed.event_name,
+                claimed.conversation_id, claimed.source_message_id,
+                claimed.source_suffix, claimed.result_suffix,
+                claimed.template_id, claimed.template_label, claimed.prompt,
+                bot_users.provider, bot_users.provider_user_id,
+                bot_users.username, bot_users.first_name, bot_users.last_name,
+                claimed.provider_task_id, claimed.next_poll_at,
+                claimed.provider_deadline_at
+            FROM claimed
+            JOIN bot_users ON bot_users.id = claimed.user_id
+            """,
+            (poll_seconds,),
+        )
+        row = await cursor.fetchone()
+        return _ai_image_job_from_row(row) if row is not None else None
+
+
+async def mark_ai_image_job_submitted(
+    *,
+    job_id: str | uuid.UUID,
+    provider_task_id: str,
+    poll_seconds: int,
+    timeout_seconds: int,
+) -> dict:
+    job_id = _uuid_text(job_id, "job_id")
+    provider_task_id = _required_text(provider_task_id, "provider_task_id")
+    poll_seconds = int(poll_seconds)
+    timeout_seconds = int(timeout_seconds)
+    if poll_seconds <= 0 or timeout_seconds <= 0:
+        raise ValueError("AI task timing must be positive")
+    connection = await _connect()
+    async with connection:
+        cursor = await connection.execute(
+            """
+            UPDATE ai_image_jobs
+            SET provider_task_id = %s,
+                next_poll_at = now() + make_interval(secs => %s),
+                provider_deadline_at = now() + make_interval(secs => %s)
+            WHERE id = %s
+              AND status = 'processing'
+              AND provider_task_id IS NULL
+            RETURNING id::text
+            """,
+            (provider_task_id, poll_seconds, timeout_seconds, job_id),
+        )
+        row = await cursor.fetchone()
+        return {
+            "outcome": "submitted" if row is not None else "inactive",
+            "job_id": _uuid_hex(row[0] if row is not None else job_id, "job_id"),
+        }
+
+
+async def mark_ai_image_job_ready(
+    *,
+    job_id: str | uuid.UUID,
+    result_suffix: str,
+) -> dict:
+    job_id = _uuid_text(job_id, "job_id")
+    result_suffix = _required_text(result_suffix, "result_suffix")
+    connection = await _connect()
+    async with connection:
+        cursor = await connection.execute(
+            """
+            UPDATE ai_image_jobs
+            SET status = 'ready', result_suffix = %s, ready_at = now(),
+                next_poll_at = NULL
+            WHERE id = %s AND status = 'processing'
+            RETURNING id::text
+            """,
+            (result_suffix, job_id),
+        )
+        row = await cursor.fetchone()
+        return {
+            "outcome": "ready" if row is not None else "inactive",
+            "job_id": _uuid_hex(row[0] if row is not None else job_id, "job_id"),
+        }
+
+
+async def next_undelivered_ai_image_job() -> dict | None:
+    connection = await _connect()
+    async with connection:
+        cursor = await connection.execute(
+            """
+            SELECT
+                jobs.id, jobs.user_id, jobs.event_name,
+                jobs.conversation_id, jobs.source_message_id,
+                jobs.source_suffix, jobs.result_suffix,
+                jobs.template_id, jobs.template_label, jobs.prompt,
+                bot_users.provider, bot_users.provider_user_id,
+                bot_users.username, bot_users.first_name, bot_users.last_name,
+                jobs.provider_task_id, jobs.next_poll_at,
+                jobs.provider_deadline_at
+            FROM ai_image_jobs AS jobs
+            JOIN bot_users ON bot_users.id = jobs.user_id
+            WHERE jobs.status = 'ready' AND jobs.delivered_at IS NULL
+            ORDER BY jobs.ready_at, jobs.created_at
+            LIMIT 1
+            """
+        )
+        row = await cursor.fetchone()
+        return _ai_image_job_from_row(row) if row is not None else None
+
+
+async def mark_ai_image_job_delivered(
+    *,
+    job_id: str | uuid.UUID,
+) -> None:
+    job_id = _uuid_text(job_id, "job_id")
+    connection = await _connect()
+    async with connection:
+        await connection.execute(
+            """
+            UPDATE ai_image_jobs
+            SET delivered_at = now()
+            WHERE id = %s AND status = 'ready' AND delivered_at IS NULL
+            """,
+            (job_id,),
+        )
+
+
+async def fail_ai_image_job(
+    *,
+    job_id: str | uuid.UUID,
+    last_error: str,
+) -> None:
+    job_id = _uuid_text(job_id, "job_id")
+    last_error = _required_text(last_error, "last_error")[:1000]
+    connection = await _connect()
+    async with connection:
+        await connection.execute(
+            """
+            UPDATE ai_image_jobs
+            SET status = 'failed', last_error = %s, closed_at = now(),
+                close_reason = 'processing_failed', next_poll_at = NULL
+            WHERE id = %s AND status IN (
+                'receiving',
+                'awaiting_template',
+                'queued',
+                'processing',
+                'ready'
+            )
+            """,
+            (last_error, job_id),
+        )
+
+
+async def user_has_open_print_job(*, user_id: int) -> bool:
+    connection = await _connect()
+    async with connection:
+        cursor = await connection.execute(
+            """
+            SELECT EXISTS (
+                SELECT 1
+                FROM print_jobs
+                WHERE user_id = %s
+                  AND status IN (
+                      'processing',
+                      'awaiting_choice',
+                      'awaiting_authorization',
+                      'authorized',
+                      'dispatching'
+                  )
+            )
+            """,
+            (int(user_id),),
+        )
+        row = await cursor.fetchone()
+        return bool(row[0]) if row is not None else False
+
+
+async def print_cooldown_retry_after(
+    *,
+    user_id: int,
+    event_name: str,
+) -> int:
+    event_name = _required_text(event_name, "event_name")
+    connection = await _connect()
+    async with connection:
+        cursor = await connection.execute(
+            """
+            SELECT GREATEST(
+                0,
+                CEIL(EXTRACT(EPOCH FROM (
+                    queued_at + make_interval(secs => %s) - now()
+                )))::integer
+            )
+            FROM print_jobs
+            WHERE user_id = %s
+              AND event_name = %s
+              AND status = 'queued'
+              AND authorization_kind = 'event'
+              AND queued_at > now() - make_interval(secs => %s)
+            ORDER BY queued_at DESC
+            LIMIT 1
+            """,
+            (
+                PRINT_COOLDOWN_SECONDS,
+                int(user_id),
+                event_name,
+                PRINT_COOLDOWN_SECONDS,
+            ),
+        )
+        row = await cursor.fetchone()
+        return max(0, int(row[0])) if row is not None else 0
+
+
+async def claim_ai_image_job_for_print(
+    *,
+    job_id: str | uuid.UUID,
+    user_id: int,
+    current_event_name: str,
+) -> dict:
+    job_id = _uuid_text(job_id, "job_id")
+    current_event_name = _required_text(current_event_name, "current_event_name")
+    connection = await _connect()
+    async with connection:
+        async with connection.transaction():
+            cursor = await connection.execute(
+                """
+                SELECT user_id, event_name, status, result_suffix,
+                       template_id, template_label
+                FROM ai_image_jobs
+                WHERE id = %s
+                FOR UPDATE
+                """,
+                (job_id,),
+            )
+            row = await cursor.fetchone()
+            if row is None:
+                return {"outcome": "not_found", "job_id": _uuid_hex(job_id, "job_id")}
+            owner_id, event_name, status, suffix, template_id, label = row
+            if int(owner_id) != int(user_id):
+                return {"outcome": "not_owner", "job_id": _uuid_hex(job_id, "job_id")}
+            if event_name != current_event_name:
+                return {"outcome": "event_changed", "job_id": _uuid_hex(job_id, "job_id")}
+            if status != "ready":
+                return {
+                    "outcome": "inactive",
+                    "job_id": _uuid_hex(job_id, "job_id"),
+                    "status": status,
+                }
+            await connection.execute(
+                """
+                UPDATE ai_image_jobs
+                SET status = 'printing', print_requested_at = now()
+                WHERE id = %s
+                """,
+                (job_id,),
+            )
+            return {
+                "outcome": "printing",
+                "job_id": _uuid_hex(job_id, "job_id"),
+                "result_suffix": suffix,
+                "template_id": template_id,
+                "template_label": label,
+            }
+
+
+async def mark_ai_image_job_print_submitted(
+    *,
+    job_id: str | uuid.UUID,
+) -> None:
+    job_id = _uuid_text(job_id, "job_id")
+    connection = await _connect()
+    async with connection:
+        await connection.execute(
+            """
+            UPDATE ai_image_jobs
+            SET status = 'print_submitted', closed_at = now(),
+                close_reason = 'print_submitted'
+            WHERE id = %s AND status = 'printing'
+            """,
+            (job_id,),
+        )
+
+
+async def restore_ai_image_job_ready(
+    *,
+    job_id: str | uuid.UUID,
+    last_error: str,
+) -> None:
+    job_id = _uuid_text(job_id, "job_id")
+    last_error = _required_text(last_error, "last_error")[:1000]
+    connection = await _connect()
+    async with connection:
+        await connection.execute(
+            """
+            UPDATE ai_image_jobs
+            SET status = 'ready', last_error = %s
+            WHERE id = %s AND status = 'printing'
+            """,
+            (last_error, job_id),
+        )
+
+
+async def recover_interrupted_ai_image_jobs() -> dict:
+    """Resume provider polling and recover only work safe to repeat."""
+    connection = await _connect()
+    async with connection:
+        async with connection.transaction():
+            cursor = await connection.execute(
+                """
+                UPDATE ai_image_jobs
+                SET status = 'failed', closed_at = now(),
+                    close_reason = 'vps_restarted',
+                    last_error = 'VPS restarted while receiving the source image'
+                WHERE status = 'receiving'
+                RETURNING id::text
+                """
+            )
+            failed_job_ids = [
+                _uuid_hex(row[0], "job_id") for row in await cursor.fetchall()
+            ]
+            cursor = await connection.execute(
+                """
+                UPDATE ai_image_jobs
+                SET status = 'failed', closed_at = now(),
+                    close_reason = 'vps_restarted',
+                    last_error = 'VPS restarted while submitting the AI task'
+                WHERE status = 'processing'
+                  AND provider_task_id IS NULL
+                RETURNING id::text
+                """
+            )
+            failed_job_ids.extend(
+                _uuid_hex(row[0], "job_id")
+                for row in await cursor.fetchall()
+            )
+            cursor = await connection.execute(
+                """
+                UPDATE ai_image_jobs
+                SET status = 'ready', last_error = 'VPS restarted during print handoff'
+                WHERE status = 'printing'
+                RETURNING id::text
+                """
+            )
+            restored_prints = len(await cursor.fetchall())
+    return {
+        "failed_job_ids": failed_job_ids,
+        "restored_prints": restored_prints,
     }
