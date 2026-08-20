@@ -9,7 +9,7 @@ import logging
 import re
 import uuid
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from pathlib import Path
 from typing import Awaitable, Callable, Protocol
 
@@ -653,8 +653,43 @@ async def _fail_worker_job(job: dict, exc: Exception) -> None:
     await _notify_failed_job(job)
 
 
-async def _finish_job(job: dict, generated: bytes) -> None:
-    result = await asyncio.to_thread(_print_ready_jpeg, generated)
+async def _send_link_fallback(job: dict, url: str, reason: str) -> None:
+    job_id = job["job_id"]
+    log.warning(
+        "AI image job %s sending link as fallback. reason=%s",
+        job_id,
+        reason,
+    )
+    await database.fail_ai_image_job(
+        job_id=job_id,
+        last_error=f"Отправлена ссылка: {reason}",
+    )
+    await asyncio.to_thread(_delete_job_files, job_id)
+    message = (
+        "🤖 Не удалось обработать ваше изображение, но его можно скачать по ссылке:\n"
+        f"{url}"
+    )
+    try:
+        await messenger_delivery.send_text(
+            ReplyTarget(job["provider"], job["conversation_id"]),
+            message,
+        )
+    except Exception:
+        log.exception("Could not send AI fallback link for job=%s", job_id)
+
+
+async def _finish_job(job: dict, generated: bytes, result_url: str) -> None:
+    try:
+        result = await asyncio.to_thread(_print_ready_jpeg, generated)
+    except (OSError, SyntaxError) as exc:
+        is_expiring = job["provider_deadline_at"] - datetime.now(
+            timezone.utc
+        ) < timedelta(minutes=1)
+        raise kie_api.KieApiError(
+            f"Kie result download: изображение повреждено ({len(generated)} bytes)",
+            retryable=not is_expiring,
+            result_url=result_url,
+        ) from exc
     await asyncio.to_thread(_save_result, job["job_id"], result)
     ready = await database.mark_ai_image_job_ready(
         job_id=job["job_id"],
@@ -743,7 +778,7 @@ async def _poll_kie_job(job: dict) -> None:
         result_url,
         max_bytes=print_media.MAX_PRINT_FILE_SIZE,
     )
-    await _finish_job(job, generated)
+    await _finish_job(job, generated, result_url)
 
 
 async def _process_job(job: dict) -> None:
@@ -758,15 +793,18 @@ async def _process_job(job: dict) -> None:
     except asyncio.CancelledError:
         raise
     except kie_api.KieApiError as exc:
-        if job.get("provider_task_id") and exc.retryable:
-            log.warning(
-                "Kie poll will retry job=%s task=%s: %s",
-                job["job_id"],
-                job["provider_task_id"],
-                exc,
-            )
+        if exc.retryable:
+            log_message = "AI image job will be retried job=%s: %s"
+            if job.get("provider_task_id"):
+                log_message = "Kie poll will retry job=%s task=%s: %s"
+                log.warning(log_message, job["job_id"], job["provider_task_id"], exc)
+            else:
+                log.warning(log_message, job["job_id"], exc)
             return
-        await _fail_worker_job(job, exc)
+        if exc.result_url:
+            await _send_link_fallback(job, exc.result_url, str(exc))
+        else:
+            await _fail_worker_job(job, exc)
     except Exception as exc:
         await _fail_worker_job(job, exc)
 

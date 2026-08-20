@@ -23,6 +23,13 @@ def image_bytes(size=(640, 480)) -> bytes:
     return output.getvalue()
 
 
+def truncated_png_bytes(size=(640, 480)) -> bytes:
+    output = io.BytesIO()
+    Image.new("RGB", size, "white").save(output, "PNG")
+    payload = output.getvalue()
+    return payload[: len(payload) // 2]
+
+
 class AiCaptionTests(unittest.TestCase):
     def test_only_explicit_ai_captions_enable_the_flow(self):
         for caption in ("AI", " ai ", "ИИ", "ии", "изменить", "ИЗМЕНИТЬ"):
@@ -263,6 +270,103 @@ class AiWorkerTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(image.size, print_jobs.LANDSCAPE_PRINT_SIZE)
         send_photo.assert_awaited_once()
         failed.assert_not_awaited()
+
+    async def test_truncated_kie_result_is_retried_instead_of_failed(self):
+        job_id = "d" * 32
+        job = {
+            "job_id": job_id,
+            "event_name": "event",
+            "conversation_id": "123",
+            "source_suffix": ".jpg",
+            "result_suffix": None,
+            "template_id": "effect",
+            "template_label": "Effect",
+            "prompt": "Prompt",
+            "provider": "telegram",
+            "provider_user_id": "123",
+            "provider_task_id": "task-123",
+            "provider_deadline_at": datetime.now(timezone.utc)
+            + timedelta(minutes=5),
+        }
+        with TemporaryDirectory() as tmpdir, patch.object(
+            ai_flow,
+            "AI_JOBS_ROOT",
+            Path(tmpdir),
+        ), patch(
+            "ai_flow.event_access.current_event",
+            return_value=("event", "token", False),
+        ), patch(
+            "ai_flow.kie_api.get_task_details",
+            AsyncMock(return_value={
+                "state": "success",
+                "resultJson": json.dumps({
+                    "resultUrls": ["https://files.test/result.png"],
+                }),
+            }),
+        ), patch(
+            "ai_flow.kie_api.download_result",
+            AsyncMock(return_value=truncated_png_bytes()),
+        ), patch(
+            "ai_flow.database.mark_ai_image_job_ready",
+            AsyncMock(),
+        ) as mark_ready, patch(
+            "ai_flow._fail_worker_job",
+            AsyncMock(),
+        ) as failed:
+            await ai_flow._process_job(job)
+
+        mark_ready.assert_not_awaited()
+        failed.assert_not_awaited()
+        self.assertFalse((Path(tmpdir) / job_id / "result.jpg").exists())
+
+    async def test_failed_kie_download_sends_link_near_expiry(self):
+        job_id = "e" * 32
+        job = {
+            "job_id": job_id,
+            "event_name": "event",
+            "conversation_id": "123",
+            "source_suffix": ".jpg",
+            "result_suffix": None,
+            "template_id": "effect",
+            "template_label": "Effect",
+            "prompt": "Prompt",
+            "provider": "telegram",
+            "provider_user_id": "123",
+            "provider_task_id": "task-123",
+            "provider_deadline_at": datetime.now(timezone.utc)
+            + timedelta(seconds=30),
+        }
+        with TemporaryDirectory() as tmpdir, patch.object(
+            ai_flow,
+            "AI_JOBS_ROOT",
+            Path(tmpdir),
+        ), patch(
+            "ai_flow.event_access.current_event",
+            return_value=("event", "token", False),
+        ), patch(
+            "ai_flow.kie_api.get_task_details",
+            AsyncMock(return_value={
+                "state": "success",
+                "resultJson": json.dumps({
+                    "resultUrls": ["https://files.test/result.png"],
+                }),
+            }),
+        ), patch(
+            "ai_flow.kie_api.download_result",
+            AsyncMock(return_value=truncated_png_bytes()),
+        ), patch(
+            "ai_flow.database.fail_ai_image_job",
+            AsyncMock(),
+        ) as mark_failed, patch(
+            "ai_flow.messenger_delivery.send_text",
+            AsyncMock(),
+        ) as send_text:
+            await ai_flow._process_job(job)
+
+        mark_failed.assert_awaited_once()
+        self.assertIn("Отправлена ссылка", mark_failed.await_args.kwargs["last_error"])
+        send_text.assert_awaited_once()
+        self.assertIn("https://files.test/result.png", send_text.await_args.args[1])
 
 
 class AiAdapterRoutingTests(unittest.IsolatedAsyncioTestCase):

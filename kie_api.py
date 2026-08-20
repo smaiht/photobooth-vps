@@ -25,9 +25,16 @@ _PENDING_STATES = frozenset({"waiting", "queuing", "generating"})
 
 
 class KieApiError(RuntimeError):
-    def __init__(self, message: str, *, retryable: bool = False) -> None:
+    def __init__(
+        self,
+        message: str,
+        *,
+        retryable: bool = False,
+        result_url: str | None = None,
+    ) -> None:
         super().__init__(message)
         self.retryable = retryable
+        self.result_url = result_url
 
 
 def _api_key() -> str:
