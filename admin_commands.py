@@ -59,6 +59,7 @@ CAMERA_SETTING_FIELD_NAMES = frozenset(CAMERA_SETTING_FIELDS)
 KNOWN_COMMANDS = {
     "/run": "run",
     "/status": "status",
+    "/printer_info": "printer_info",
     "/print_queue": "print_queue",
     "/clear_print_queue": "clear_print_queue",
     "/clear_photos": "clear_photos",
@@ -211,6 +212,7 @@ def parse(text: str) -> ParsedCommand | None:
     if known_command == "set_template_pack":
         return _parse_template(argument)
     if known_command in (
+        "printer_info",
         "print_queue",
         "clear_print_queue",
         "clear_photos",
@@ -274,6 +276,8 @@ def sent_message(command: str, data: dict | None) -> str:
         )
     if command == "get_config":
         return "⏳ Запрашиваю конфиги фотобудки..."
+    if command == "printer_info":
+        return "⏳ Запрашиваю аппаратный счётчик DNP..."
     if command == "print_queue":
         return (
             "⏳ Запрашиваю состояние очередей Windows-принтеров..."
@@ -295,6 +299,7 @@ def failed_message(command: str, error: Exception) -> str:
         "set_app_config": "Настройка приложения не отправлена",
         "set_camera_preset": "Пресет света не отправлен",
         "set_template_pack": "Template pack не переключён",
+        "printer_info": "Данные DNP не запрошены",
         "print_queue": "Запрос очередей печати не отправлен",
         "clear_print_queue": "Очистка очередей печати не отправлена",
         "clear_photos": "Очистка папки photos не отправлена",

@@ -576,6 +576,10 @@ class CafeUnblockCommandTests(unittest.IsolatedAsyncioTestCase):
 class PrintQueueAdminCommandTests(unittest.IsolatedAsyncioTestCase):
     def test_parses_status_and_clear_without_arguments(self):
         self.assertEqual(
+            admin_commands.parse("/printer_info"),
+            ("printer_info", None),
+        )
+        self.assertEqual(
             admin_commands.parse("/print_queue"),
             ("print_queue", None),
         )
@@ -585,7 +589,11 @@ class PrintQueueAdminCommandTests(unittest.IsolatedAsyncioTestCase):
         )
 
     def test_rejects_arguments_for_both_commands(self):
-        for text in ("/print_queue grid", "/clear_print_queue strips"):
+        for text in (
+            "/printer_info now",
+            "/print_queue grid",
+            "/clear_print_queue strips",
+        ):
             with self.subTest(text=text), self.assertRaisesRegex(
                 ValueError,
                 "Использование",
@@ -593,6 +601,7 @@ class PrintQueueAdminCommandTests(unittest.IsolatedAsyncioTestCase):
                 admin_commands.parse(text)
 
     def test_commands_are_listed_in_admin_help(self):
+        self.assertIn("/printer_info", admin_commands.HELP_MESSAGE)
         self.assertIn("/print_queue", admin_commands.HELP_MESSAGE)
         self.assertIn("/clear_print_queue", admin_commands.HELP_MESSAGE)
 
