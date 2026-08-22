@@ -26,6 +26,13 @@ class EventUpdate:
     telegram_caption: str
 
 
+def _with_vps_event(text: str) -> str:
+    return (
+        f"{text.rstrip()}\n"
+        f"Event (VPS config_vps.json): {runtime_config.yadisk_folder()}"
+    )
+
+
 async def _persist_print_result(response: dict) -> bool:
     try:
         if response.get("status") == "ok":
@@ -213,6 +220,8 @@ async def handle_notice(notice: dict) -> bool:
     """
     title = str(notice.get("title") or "").strip()
     text = str(notice.get("text") or "").strip()
+    if notice.get("kind") in ("booth_status", "camera_config"):
+        text = _with_vps_event(text)
     caption = f"ℹ️ {title}\n\n{text}" if title else f"ℹ️ {text}"
     delivery = await admin_notifications.send_admin_text(caption)
     if not delivery.delivered_targets:
@@ -279,5 +288,7 @@ async def handle(response: dict) -> bool:
         )
         return delivery.primary_delivered
     response_message = response["message"]
+    if response["status"] == "ok" and response["command"] == "status":
+        response_message = _with_vps_event(response_message)
     caption = f"{prefix} {response_message}"
     return await messenger_delivery.send_text(target, caption)

@@ -152,8 +152,8 @@ class BoothNoticeDeliveryTests(unittest.IsolatedAsyncioTestCase):
     def _notice(self, **overrides) -> dict:
         notice = {
             "notice_id": "a" * 32,
-            "kind": "camera_config",
-            "title": "Конфигурация камеры",
+            "kind": "booth_status",
+            "title": "Фотобудка готова",
             "text": "ISO=100",
         }
         notice.update(overrides)
@@ -165,14 +165,17 @@ class BoothNoticeDeliveryTests(unittest.IsolatedAsyncioTestCase):
                 ReplyTarget("telegram", "1"), ReplyTarget("vk", "2")),
             failed_targets=(),
         )
-        with patch("control_response_service.admin_notifications.send_admin_text",
+        with patch("control_response_service.runtime_config.yadisk_folder",
+                   return_value="VPS event"), \
+             patch("control_response_service.admin_notifications.send_admin_text",
                    AsyncMock(return_value=delivery)) as send:
             handled = await control_response_service.handle_notice(self._notice())
 
         self.assertTrue(handled)
         text = send.await_args.args[0]
-        self.assertIn("Конфигурация камеры", text)
+        self.assertIn("Фотобудка готова", text)
         self.assertIn("ISO=100", text)
+        self.assertIn("Event (VPS config_vps.json): VPS event", text)
 
     async def test_notice_without_title_still_delivers_its_text(self):
         delivery = admin_notifications.AdminBroadcastDelivery(
@@ -574,35 +577,17 @@ class CafeUnblockCommandTests(unittest.IsolatedAsyncioTestCase):
 
 
 class PrintQueueAdminCommandTests(unittest.IsolatedAsyncioTestCase):
-    def test_parses_status_and_clear_without_arguments(self):
-        self.assertEqual(
-            admin_commands.parse("/printer_info"),
-            ("printer_info", None),
-        )
-        self.assertEqual(
-            admin_commands.parse("/print_queue"),
-            ("print_queue", None),
-        )
+    def test_parses_clear_without_arguments(self):
         self.assertEqual(
             admin_commands.parse("/clear_print_queue@photobooth_bot"),
             ("clear_print_queue", None),
         )
 
-    def test_rejects_arguments_for_both_commands(self):
-        for text in (
-            "/printer_info now",
-            "/print_queue grid",
-            "/clear_print_queue strips",
-        ):
-            with self.subTest(text=text), self.assertRaisesRegex(
-                ValueError,
-                "Использование",
-            ):
-                admin_commands.parse(text)
+    def test_rejects_clear_arguments(self):
+        with self.assertRaisesRegex(ValueError, "Использование"):
+            admin_commands.parse("/clear_print_queue strips")
 
-    def test_commands_are_listed_in_admin_help(self):
-        self.assertIn("/printer_info", admin_commands.HELP_MESSAGE)
-        self.assertIn("/print_queue", admin_commands.HELP_MESSAGE)
+    def test_clear_command_is_listed_in_admin_help(self):
         self.assertIn("/clear_print_queue", admin_commands.HELP_MESSAGE)
 
     async def test_clear_command_is_forwarded_to_the_booth(self):
@@ -1068,6 +1053,29 @@ class ProviderNeutralAdminCommandTests(unittest.IsolatedAsyncioTestCase):
         send.assert_awaited_once_with("status", target, None)
         reply.assert_awaited_once()
         warning.assert_called_once()
+
+    async def test_status_response_includes_the_vps_event(self):
+        response = {
+            "status": "ok",
+            "command": "status",
+            "message": "Event (booth): Booth event",
+            "reply_target": {
+                "provider": "telegram",
+                "conversation_id": "123",
+            },
+        }
+        with patch(
+            "control_response_service.runtime_config.yadisk_folder",
+            return_value="VPS event",
+        ), patch(
+            "control_response_service.messenger_delivery.send_text",
+            AsyncMock(return_value=True),
+        ) as send:
+            self.assertTrue(await control_response_service.handle(response))
+
+        text = send.await_args.args[1]
+        self.assertIn("Event (booth): Booth event", text)
+        self.assertIn("Event (VPS config_vps.json): VPS event", text)
 
 
 class LogDeliveryTests(unittest.IsolatedAsyncioTestCase):

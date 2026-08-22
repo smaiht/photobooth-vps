@@ -59,8 +59,6 @@ CAMERA_SETTING_FIELD_NAMES = frozenset(CAMERA_SETTING_FIELDS)
 KNOWN_COMMANDS = {
     "/run": "run",
     "/status": "status",
-    "/printer_info": "printer_info",
-    "/print_queue": "print_queue",
     "/clear_print_queue": "clear_print_queue",
     "/clear_photos": "clear_photos",
     "/clear_print_jobs": "clear_print_jobs",
@@ -180,11 +178,11 @@ def _parse_template(argument: str | None) -> ParsedCommand:
     return "set_template_pack", {"name": name}
 
 
-def _parse_print_queue(
+def _parse_without_arguments(
     command: str,
     argument: str | None,
 ) -> ParsedCommand:
-    """Reject arguments: print administration always covers both queues."""
+    """Reject arguments for fixed administration commands."""
     if argument is not None:
         command_name = "/" + command
         raise ValueError(f"Использование: {command_name}")
@@ -212,13 +210,11 @@ def parse(text: str) -> ParsedCommand | None:
     if known_command == "set_template_pack":
         return _parse_template(argument)
     if known_command in (
-        "printer_info",
-        "print_queue",
         "clear_print_queue",
         "clear_photos",
         "clear_print_jobs",
     ):
-        return _parse_print_queue(known_command, argument)
+        return _parse_without_arguments(known_command, argument)
     if known_command:
         return known_command, None
 
@@ -276,12 +272,6 @@ def sent_message(command: str, data: dict | None) -> str:
         )
     if command == "get_config":
         return "⏳ Запрашиваю конфиги фотобудки..."
-    if command == "printer_info":
-        return "⏳ Запрашиваю аппаратный счётчик DNP..."
-    if command == "print_queue":
-        return (
-            "⏳ Запрашиваю состояние очередей Windows-принтеров..."
-        )
     if command == "clear_print_queue":
         return "⏳ Очищаю очереди Windows-принтеров..."
     if command == "clear_photos":
@@ -299,8 +289,6 @@ def failed_message(command: str, error: Exception) -> str:
         "set_app_config": "Настройка приложения не отправлена",
         "set_camera_preset": "Пресет света не отправлен",
         "set_template_pack": "Template pack не переключён",
-        "printer_info": "Данные DNP не запрошены",
-        "print_queue": "Запрос очередей печати не отправлен",
         "clear_print_queue": "Очистка очередей печати не отправлена",
         "clear_photos": "Очистка папки photos не отправлена",
         "clear_print_jobs": "Очистка папки photos_print_jobs не отправлена",
