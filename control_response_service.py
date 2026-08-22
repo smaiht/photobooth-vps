@@ -27,10 +27,26 @@ class EventUpdate:
 
 
 def _with_vps_event(text: str) -> str:
-    return (
-        f"{text.rstrip()}\n"
-        f"Event (VPS config_vps.json): {runtime_config.yadisk_folder()}"
-    )
+    lines = text.rstrip().splitlines()
+    vps_event = runtime_config.yadisk_folder()
+    for index, line in enumerate(lines):
+        for prefix in ("• Будка: ", "Event (booth): "):
+            if not line.startswith(prefix):
+                continue
+            booth_event = line.removeprefix(prefix).strip()
+            sync = (
+                "✅ совпадает"
+                if booth_event == vps_event
+                else "⚠️ НЕ СОВПАДАЕТ"
+            )
+            lines[index] = f"• Будка: {booth_event} · VPS: {vps_event}"
+            if index > 0 and lines[index - 1] == "🎪 СОБЫТИЕ":
+                lines[index - 1] = f"🎪 СОБЫТИЕ: {sync}"
+            else:
+                lines.insert(index + 1, sync)
+            return "\n".join(lines)
+    lines.extend(("", f"• VPS (config_vps.json): {vps_event}"))
+    return "\n".join(lines)
 
 
 async def _persist_print_result(response: dict) -> bool:

@@ -13,18 +13,6 @@ EVENT_NAME_RE = re.compile(r"^(\d{4}-\d{2}-\d{2}) (.+)$")
 CONFIG_FIELD_RE = re.compile(r"^[a-z][a-z0-9_]{0,63}$")
 TEMPLATE_PACK_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,63}$")
 
-# Operator-facing command names are intentionally duplicated from the booth's
-# config_camera.json.  The help must be complete even when the booth is offline;
-# keep these tuples in sync when a preset or a public camera field is added.
-LIGHT_PRESETS = (
-    ("sun", "Яркое солнце"),
-    ("cloudy", "Улица, пасмурно"),
-    ("evening", "Улица, тёмный вечер"),
-    ("indoor", "Помещение со светом"),
-    ("indoor_dark", "Помещение, темно"),
-)
-LIGHT_PRESET_NAMES = frozenset(name for name, _label in LIGHT_PRESETS)
-
 CAMERA_SETTING_FIELDS = (
     "image_quality",
     "ae_mode",
@@ -75,30 +63,26 @@ KNOWN_COMMANDS = {
 
 PRESET_NAME_RE = re.compile(r"^[a-z][a-z0-9_]{0,39}$")
 
+_HELP_USAGE = {
+    "/unblock": "/unblock [N]",
+    "/light": "/light <имя>",
+    "/event": "/event <название>",
+    "/template": "/template <pack>",
+}
 _GENERAL_HELP_COMMANDS = tuple(
-    "/template <pack>" if name == "/template" else name
-    for name in KNOWN_COMMANDS if name != "/light"
+    _HELP_USAGE.get(name, name) for name in KNOWN_COMMANDS
 )
-_PRESET_HELP_COMMANDS = tuple(
-    f"/light {name} — {label}" for name, label in LIGHT_PRESETS
-)
-_CAMERA_HELP_COMMANDS = tuple(
-    f"/{field} <значение>" for field in CAMERA_SETTING_FIELDS
-)
-_APP_HELP_COMMAND = (
-    "/<поле config_app> <значение> — только из "
-    "_admin_editable_fields"
+_SETTING_HELP_COMMANDS = (
+    "/iso 200 — пример настройки камеры",
+    "/photo_choice_default_with_frame true — пример настройки config_app; "
+    "только поля из _admin_editable_fields",
 )
 
 HELP_MESSAGE = (
     "Не понял команду. Доступные команды:\n\n"
     + "\n".join(_GENERAL_HELP_COMMANDS)
-    + "\n\nПресеты света:\n"
-    + "\n".join(_PRESET_HELP_COMMANDS)
-    + "\n\nНастройки камеры:\n"
-    + "\n".join(_CAMERA_HELP_COMMANDS)
-    + "\n\nНастройки приложения:\n"
-    + _APP_HELP_COMMAND
+    + "\n"
+    + "\n".join(_SETTING_HELP_COMMANDS)
 )
 
 
@@ -151,17 +135,12 @@ def _parse_block(argument: str | None) -> ParsedCommand:
 
 
 def _parse_light(argument: str | None) -> ParsedCommand:
-    available = "\n".join(
-        f"/light {name} — {label}" for name, label in LIGHT_PRESETS
-    )
     if not argument:
-        raise ValueError(
-            "Выберите пресет света:\n" + available
-        )
+        raise ValueError("Использование: /light <имя>")
     name = argument.strip().lower()
-    if not PRESET_NAME_RE.fullmatch(name) or name not in LIGHT_PRESET_NAMES:
+    if not PRESET_NAME_RE.fullmatch(name):
         raise ValueError(
-            "Неизвестный пресет света. Доступно:\n" + available
+            "Имя пресета может содержать только a-z, 0-9 и подчёркивание"
         )
     return "set_camera_preset", {"name": name}
 

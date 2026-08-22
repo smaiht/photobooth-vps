@@ -154,7 +154,11 @@ class BoothNoticeDeliveryTests(unittest.IsolatedAsyncioTestCase):
             "notice_id": "a" * 32,
             "kind": "booth_status",
             "title": "Фотобудка готова",
-            "text": "ISO=100",
+            "text": (
+                "🎪 СОБЫТИЕ\n• Будка: VPS event\n\n"
+                "🖼 ШАБЛОН И СЕССИИ\n• Набор: birthday\n"
+                "• Допуск: ♾ без ограничений"
+            ),
         }
         notice.update(overrides)
         return notice
@@ -174,8 +178,9 @@ class BoothNoticeDeliveryTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(handled)
         text = send.await_args.args[0]
         self.assertIn("Фотобудка готова", text)
-        self.assertIn("ISO=100", text)
-        self.assertIn("Event (VPS config_vps.json): VPS event", text)
+        self.assertIn("🎪 СОБЫТИЕ: ✅ совпадает", text)
+        self.assertIn("• Будка: VPS event · VPS: VPS event", text)
+        self.assertIn("VPS: VPS event\n\n🖼 ШАБЛОН И СЕССИИ", text)
 
     async def test_notice_without_title_still_delivers_its_text(self):
         delivery = admin_notifications.AdminBroadcastDelivery(
@@ -187,7 +192,7 @@ class BoothNoticeDeliveryTests(unittest.IsolatedAsyncioTestCase):
             self.assertTrue(
                 await control_response_service.handle_notice(
                     self._notice(title="")))
-        self.assertIn("ISO=100", send.await_args.args[0])
+        self.assertIn("• Будка: VPS event", send.await_args.args[0])
 
     async def test_total_failure_keeps_the_message_for_a_retry(self):
         delivery = admin_notifications.AdminBroadcastDelivery(
@@ -675,23 +680,13 @@ class CameraSettingCommandTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaisesRegex(ValueError, "Использование"):
             admin_commands.parse("/continuous_af")
 
-    def test_help_lists_every_supported_camera_setting(self):
-        expected = {
-            "image_quality", "ae_mode", "shutter_type", "av", "tv", "iso",
-            "white_balance", "color_temperature", "picture_style",
-            "evf_af_mode", "af_mode", "subject_tracking", "evf_view_type",
-            "continuous_af", "eye_detection_af", "focus_before_capture",
-            "focus_delay", "disable_auto_power_off", "min_free_disk_gib",
-            "evf_keep_camera_screen", "drive_mode", "color_space",
-            "lock_camera_ui", "lock_mode_dial",
-        }
-        self.assertEqual(set(admin_commands.CAMERA_SETTING_FIELDS), expected)
-        for field in admin_commands.CAMERA_SETTING_FIELDS:
-            with self.subTest(field=field):
-                self.assertIn(
-                    f"/{field} <значение>",
-                    admin_commands.HELP_MESSAGE,
-                )
+    def test_help_uses_one_camera_setting_example(self):
+        self.assertIn(
+            "/iso 200 — пример настройки камеры",
+            admin_commands.HELP_MESSAGE,
+        )
+        self.assertNotIn("/white_balance <значение>",
+                         admin_commands.HELP_MESSAGE)
 
     def test_non_camera_field_is_forwarded_for_booth_allowlist_check(self):
         self.assertEqual(
@@ -922,6 +917,10 @@ class CameraPresetCommandTests(unittest.IsolatedAsyncioTestCase):
             admin_commands.parse("/light@photobooth_bot INDOOR_DARK"),
             ("set_camera_preset", {"name": "indoor_dark"}),
         )
+        self.assertEqual(
+            admin_commands.parse("/light new_preset"),
+            ("set_camera_preset", {"name": "new_preset"}),
+        )
 
     def test_rejects_missing_or_malformed_preset_name(self):
         for text in (
@@ -930,29 +929,13 @@ class CameraPresetCommandTests(unittest.IsolatedAsyncioTestCase):
             "/light bad-name",
             "/light _hidden",
             "/light солнце",
-            "/light missing",
         ):
             with self.subTest(text=text), self.assertRaises(ValueError):
                 admin_commands.parse(text)
 
-    def test_help_lists_every_preset_as_a_ready_command(self):
-        self.assertEqual(
-            dict(admin_commands.LIGHT_PRESETS),
-            {
-                "sun": "Яркое солнце",
-                "cloudy": "Улица, пасмурно",
-                "evening": "Улица, тёмный вечер",
-                "indoor": "Помещение со светом",
-                "indoor_dark": "Помещение, темно",
-            },
-        )
-        for name, label in admin_commands.LIGHT_PRESETS:
-            with self.subTest(name=name):
-                self.assertIn(
-                    f"/light {name} — {label}",
-                    admin_commands.HELP_MESSAGE,
-                )
-        self.assertNotIn("/light <имя>", admin_commands.HELP_MESSAGE)
+    def test_help_keeps_light_command_generic(self):
+        self.assertIn("/light <имя>", admin_commands.HELP_MESSAGE)
+        self.assertNotIn("Пресеты света:", admin_commands.HELP_MESSAGE)
         self.assertLessEqual(len(admin_commands.HELP_MESSAGE), 4096)
 
     async def test_forwards_preset_name_to_booth(self):
@@ -991,8 +974,10 @@ class CameraPresetCommandTests(unittest.IsolatedAsyncioTestCase):
             )
 
         send.assert_not_awaited()
-        for name, _label in admin_commands.LIGHT_PRESETS:
-            self.assertIn(f"/light {name}", send_text.await_args.args[1])
+        self.assertIn(
+            "Использование: /light <имя>",
+            send_text.await_args.args[1],
+        )
 
 
 class RemovedUpdateCommandTests(unittest.IsolatedAsyncioTestCase):
@@ -1058,7 +1043,11 @@ class ProviderNeutralAdminCommandTests(unittest.IsolatedAsyncioTestCase):
         response = {
             "status": "ok",
             "command": "status",
-            "message": "Event (booth): Booth event",
+            "message": (
+                "🎪 СОБЫТИЕ\n• Будка: Booth event\n\n"
+                "🖼 ШАБЛОН И СЕССИИ\n• Набор: birthday\n"
+                "• Допуск: ♾ без ограничений"
+            ),
             "reply_target": {
                 "provider": "telegram",
                 "conversation_id": "123",
@@ -1074,8 +1063,8 @@ class ProviderNeutralAdminCommandTests(unittest.IsolatedAsyncioTestCase):
             self.assertTrue(await control_response_service.handle(response))
 
         text = send.await_args.args[1]
-        self.assertIn("Event (booth): Booth event", text)
-        self.assertIn("Event (VPS config_vps.json): VPS event", text)
+        self.assertIn("🎪 СОБЫТИЕ: ⚠️ НЕ СОВПАДАЕТ", text)
+        self.assertIn("• Будка: Booth event · VPS: VPS event", text)
 
 
 class LogDeliveryTests(unittest.IsolatedAsyncioTestCase):
