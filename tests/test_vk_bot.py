@@ -993,6 +993,47 @@ class AdminNotificationTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result.delivered_targets, (primary,))
         self.assertEqual(result.failed_targets, (vk_admin,))
 
+    async def test_event_history_is_sent_to_telegram_and_vk_admins(self):
+        telegram_admin = ReplyTarget("telegram", 123)
+        vk_admin = ReplyTarget("vk", 556972284)
+        with patch(
+            "admin_notifications.configured_admin_targets",
+            return_value=(telegram_admin, vk_admin),
+        ), patch(
+            "admin_notifications.messenger_delivery.send_document",
+            AsyncMock(return_value=True),
+        ) as send:
+            result = await admin_notifications.send_event_history(
+                telegram_admin,
+                b'{"event":"old"}\n',
+                "📊 ИТОГ ИВЕНТА: old",
+            )
+
+        self.assertEqual(
+            result.delivered_targets,
+            (telegram_admin, vk_admin),
+        )
+        self.assertEqual(result.failed_targets, ())
+        self.assertEqual(
+            send.await_args_list,
+            [
+                call(
+                    telegram_admin,
+                    b'{"event":"old"}\n',
+                    "event_history_previous.json",
+                    "application/json; charset=utf-8",
+                    caption="📊 ИТОГ ИВЕНТА: old",
+                ),
+                call(
+                    vk_admin,
+                    b'{"event":"old"}\n',
+                    "event_history_previous.json",
+                    "application/json; charset=utf-8",
+                    caption="📊 ИТОГ ИВЕНТА: old",
+                ),
+            ],
+        )
+
     async def test_event_without_qr_is_also_sent_to_both_admins(self):
         telegram_admin = ReplyTarget("telegram", 123)
         vk_admin = ReplyTarget("vk", 556972284)

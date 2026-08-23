@@ -99,6 +99,31 @@ async def _send_text(
         return False
 
 
+async def _send_document(
+    target: ReplyTarget,
+    payload: bytes,
+    filename: str,
+    content_type: str,
+    caption: str,
+) -> bool:
+    try:
+        return await messenger_delivery.send_document(
+            target,
+            payload,
+            filename,
+            content_type,
+            caption=caption,
+        )
+    except Exception as exc:
+        log.warning(
+            "Admin document delivery failed provider=%s conversation=%s: %s",
+            target.provider,
+            target.conversation_id,
+            exc,
+        )
+        return False
+
+
 def _targets_with_primary(primary_target: ReplyTarget) -> tuple[ReplyTarget, ...]:
     targets = [ReplyTarget.from_value(primary_target)]
     seen = {(targets[0].provider, targets[0].conversation_id)}
@@ -155,6 +180,37 @@ async def send_event_update(
         primary_delivered=primary_target in delivered,
         delivered_targets=delivered,
         failed_targets=failed,
+    )
+
+
+async def send_event_history(
+    primary_target: ReplyTarget,
+    payload: bytes,
+    caption: str,
+) -> AdminBroadcastDelivery:
+    """Send the previous event journal to every administrator."""
+    targets = _targets_with_primary(primary_target)
+    results = await asyncio.gather(*(
+        _send_document(
+            target,
+            payload,
+            "event_history_previous.json",
+            "application/json; charset=utf-8",
+            caption,
+        )
+        for target in targets
+    ))
+    return AdminBroadcastDelivery(
+        delivered_targets=tuple(
+            target
+            for target, success in zip(targets, results, strict=True)
+            if success
+        ),
+        failed_targets=tuple(
+            target
+            for target, success in zip(targets, results, strict=True)
+            if not success
+        ),
     )
 
 

@@ -1100,7 +1100,10 @@ class ProviderNeutralAdminCommandTests(unittest.IsolatedAsyncioTestCase):
         ) as send, patch(
             "control_response_service.messenger_delivery.send_document",
             AsyncMock(return_value=True),
-        ) as send_document:
+        ) as send_document, patch(
+            "control_response_service.admin_notifications.send_event_history",
+            new_callable=AsyncMock,
+        ) as fan_out:
             self.assertTrue(await control_response_service.handle(response))
 
         text = send.await_args.args[1]
@@ -1113,6 +1116,68 @@ class ProviderNeutralAdminCommandTests(unittest.IsolatedAsyncioTestCase):
             "event_history.json",
             "application/json; charset=utf-8",
             caption="📊 ИТОГ ИВЕНТА: Booth event",
+        )
+        fan_out.assert_not_awaited()
+
+    async def test_status_without_history_sends_only_the_status_text(self):
+        response = {
+            "status": "ok",
+            "command": "status",
+            "message": "🎪 СОБЫТИЕ\n• Будка: event",
+            "reply_target": {
+                "provider": "telegram",
+                "conversation_id": "123",
+            },
+        }
+        with patch(
+            "control_response_service.runtime_config.yadisk_folder",
+            return_value="event",
+        ), patch(
+            "control_response_service.messenger_delivery.send_text",
+            AsyncMock(return_value=True),
+        ) as send_text, patch(
+            "control_response_service.messenger_delivery.send_document",
+            new_callable=AsyncMock,
+        ) as send_document:
+            self.assertTrue(await control_response_service.handle(response))
+
+        send_document.assert_not_awaited()
+        send_text.assert_awaited_once()
+
+    async def test_status_history_is_best_effort_after_the_status_text(self):
+        target = ReplyTarget("telegram", 123)
+        response = {
+            "status": "ok",
+            "command": "status",
+            "message": "status",
+            "document": "{}\n",
+            "document_caption": "summary",
+            "reply_target": target.to_dict(),
+        }
+        send_text = AsyncMock(return_value=True)
+
+        async def send_history(*_args, **_kwargs):
+            self.assertEqual(send_text.await_count, 1)
+            return False
+
+        with patch(
+            "control_response_service.runtime_config.yadisk_folder",
+            return_value="event",
+        ), patch(
+            "control_response_service.messenger_delivery.send_text",
+            send_text,
+        ), patch(
+            "control_response_service.messenger_delivery.send_document",
+            side_effect=send_history,
+        ) as send_document:
+            self.assertTrue(await control_response_service.handle(response))
+
+        send_document.assert_awaited_once_with(
+            target,
+            b"{}\n",
+            "event_history.json",
+            "application/json; charset=utf-8",
+            caption="summary",
         )
 
 

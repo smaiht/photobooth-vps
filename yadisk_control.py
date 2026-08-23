@@ -33,6 +33,7 @@ MAX_RESPONSE_DOCUMENT_CAPTION_SIZE = 1000
 DOCUMENT_COMMANDS = frozenset({
     "send_logs", "get_config", "status", "set_event",
 })
+HISTORY_DOCUMENT_COMMANDS = frozenset({"status", "set_event"})
 
 _session: aiohttp.ClientSession | None = None
 _transfer_session: aiohttp.ClientSession | None = None
@@ -75,14 +76,14 @@ def validate_response(data: dict, filename: str = "") -> dict:
         raise ValueError("invalid response document")
     document_caption = data.get("document_caption")
     if document_caption is not None and (
-        command not in {"set_event", "status"}
+        command not in HISTORY_DOCUMENT_COMMANDS
         or document is None
         or not isinstance(document_caption, str)
         or not document_caption
         or len(document_caption) > MAX_RESPONSE_DOCUMENT_CAPTION_SIZE
     ):
         raise ValueError("invalid response document caption")
-    if command in {"set_event", "status"} and document is not None \
+    if command in HISTORY_DOCUMENT_COMMANDS and document is not None \
             and document_caption is None:
         raise ValueError("missing response document caption")
     event_folder = data.get("event_folder")

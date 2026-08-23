@@ -114,14 +114,18 @@ async def _deliver_document(
     payload = response["document"].encode("utf-8")
     try:
         if response["command"] == "set_event":
-            delivered = await messenger_delivery.send_document(
+            delivery = await admin_notifications.send_event_history(
                 target,
                 payload,
-                "event_history_previous.json",
-                "application/json; charset=utf-8",
-                caption=response["document_caption"],
+                response["document_caption"],
             )
-            artifact_label = "previous event history"
+            log.info(
+                "Control: previous event history fan-out completed; "
+                "delivered=%d failed=%d",
+                len(delivery.delivered_targets),
+                len(delivery.failed_targets),
+            )
+            return True
         elif response["command"] == "status":
             delivered = await messenger_delivery.send_document(
                 target,
@@ -130,13 +134,7 @@ async def _deliver_document(
                 "application/json; charset=utf-8",
                 caption=response["document_caption"],
             )
-            if not delivered:
-                return False
-            delivered = await messenger_delivery.send_text(
-                target,
-                _with_vps_event(response["message"]),
-            )
-            artifact_label = "status and event history"
+            artifact_label = "event history"
         elif response["command"] == "get_config":
             vps_config = await asyncio.to_thread(runtime_config.read_bytes)
             delivered = await messenger_delivery.send_documents(
@@ -309,9 +307,6 @@ async def handle(response: dict) -> bool:
         if activation is None:
             return False
         event_public_url, event_publish_error = activation
-        if response.get("document") is not None:
-            if not await _deliver_document(response, target):
-                return False
         event_update = await _event_update(
             response,
             event_public_url,
@@ -323,9 +318,14 @@ async def handle(response: dict) -> bool:
             event_update.caption,
             telegram_caption=event_update.telegram_caption,
         )
-        return delivery.primary_delivered
+        if not delivery.primary_delivered:
+            return False
+        if response.get("document") is not None:
+            await _deliver_document(response, target)
+        return True
 
-    if response.get("document") is not None:
+    if (response.get("document") is not None
+            and response["command"] != "status"):
         return await _deliver_document(response, target)
 
     prefix = "✅" if response["status"] == "ok" else "❌"
@@ -334,4 +334,8 @@ async def handle(response: dict) -> bool:
         caption = _with_vps_event(response_message)
     else:
         caption = f"{prefix} {response_message}"
-    return await messenger_delivery.send_text(target, caption)
+    if not await messenger_delivery.send_text(target, caption):
+        return False
+    if response.get("document") is not None:
+        await _deliver_document(response, target)
+    return True
