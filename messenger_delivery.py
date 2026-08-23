@@ -95,23 +95,29 @@ async def send_document(
     payload: bytes,
     filename: str,
     content_type: str = "application/octet-stream",
+    *,
+    caption: str = "",
 ) -> bool:
     target = ReplyTarget.from_value(target)
     if target.provider == "telegram":
+        options = {"caption": caption} if caption else {}
         return await telegram_api.send_document(
             target.conversation_id,
             payload,
             filename,
             content_type,
+            **options,
         )
     if target.provider == "vk":
         async with aiohttp.ClientSession() as session:
+            options = {"caption": caption} if caption else {}
             message_id = await vk_api.send_document(
                 session,
                 _vk_peer_id(target),
                 payload,
                 filename,
                 content_type,
+                **options,
             )
         return message_id is not None
     raise ValueError(f"unsupported reply provider: {target.provider}")

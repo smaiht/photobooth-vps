@@ -39,13 +39,15 @@ def _with_vps_event(text: str) -> str:
                 if booth_event == vps_event
                 else "⚠️ НЕ СОВПАДАЕТ"
             )
-            lines[index] = f"• Будка: {booth_event} · VPS: {vps_event}"
+            lines[index] = f"• Будка: {booth_event}"
             if index > 0 and lines[index - 1] == "🎪 СОБЫТИЕ":
                 lines[index - 1] = f"🎪 СОБЫТИЕ: {sync}"
             else:
                 lines.insert(index + 1, sync)
+                index += 1
+            lines.insert(index + 1, f"• VPS: {vps_event}")
             return "\n".join(lines)
-    lines.extend(("", f"• VPS (config_vps.json): {vps_event}"))
+    lines.extend(("", f"• VPS: {vps_event}"))
     return "\n".join(lines)
 
 
@@ -111,7 +113,31 @@ async def _deliver_document(
 ) -> bool:
     payload = response["document"].encode("utf-8")
     try:
-        if response["command"] == "get_config":
+        if response["command"] == "set_event":
+            delivered = await messenger_delivery.send_document(
+                target,
+                payload,
+                "event_history_previous.json",
+                "application/json; charset=utf-8",
+                caption=response["document_caption"],
+            )
+            artifact_label = "previous event history"
+        elif response["command"] == "status":
+            delivered = await messenger_delivery.send_document(
+                target,
+                payload,
+                "event_history.json",
+                "application/json; charset=utf-8",
+                caption=response["document_caption"],
+            )
+            if not delivered:
+                return False
+            delivered = await messenger_delivery.send_text(
+                target,
+                _with_vps_event(response["message"]),
+            )
+            artifact_label = "status and event history"
+        elif response["command"] == "get_config":
             vps_config = await asyncio.to_thread(runtime_config.read_bytes)
             delivered = await messenger_delivery.send_documents(
                 target,
@@ -278,19 +304,14 @@ async def handle(response: dict) -> bool:
             # The print flow acknowledged submission before the booth response.
             return True
 
-    event_public_url: str | None = None
-    event_publish_error: str | None = None
     if response["status"] == "ok" and response["command"] == "set_event":
         activation = await _activate_event(response)
         if activation is None:
             return False
         event_public_url, event_publish_error = activation
-
-    if response.get("document") is not None:
-        return await _deliver_document(response, target)
-
-    prefix = "✅" if response["status"] == "ok" else "❌"
-    if response["status"] == "ok" and response["command"] == "set_event":
+        if response.get("document") is not None:
+            if not await _deliver_document(response, target):
+                return False
         event_update = await _event_update(
             response,
             event_public_url,
@@ -303,8 +324,14 @@ async def handle(response: dict) -> bool:
             telegram_caption=event_update.telegram_caption,
         )
         return delivery.primary_delivered
+
+    if response.get("document") is not None:
+        return await _deliver_document(response, target)
+
+    prefix = "✅" if response["status"] == "ok" else "❌"
     response_message = response["message"]
     if response["status"] == "ok" and response["command"] == "status":
-        response_message = _with_vps_event(response_message)
-    caption = f"{prefix} {response_message}"
+        caption = _with_vps_event(response_message)
+    else:
+        caption = f"{prefix} {response_message}"
     return await messenger_delivery.send_text(target, caption)

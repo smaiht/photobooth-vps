@@ -29,7 +29,10 @@ NOTICE_NAME_RE = re.compile(
     r"^notice_[0-9]{8}T[0-9]{6}Z_[a-f0-9]{32}\.json$")
 MAX_NOTICE_TEXT = 3500
 MAX_RESPONSE_DOCUMENT_SIZE = 512 * 1024
-DOCUMENT_COMMANDS = frozenset({"send_logs", "get_config"})
+MAX_RESPONSE_DOCUMENT_CAPTION_SIZE = 1000
+DOCUMENT_COMMANDS = frozenset({
+    "send_logs", "get_config", "status", "set_event",
+})
 
 _session: aiohttp.ClientSession | None = None
 _transfer_session: aiohttp.ClientSession | None = None
@@ -62,12 +65,26 @@ def validate_response(data: dict, filename: str = "") -> dict:
     if status not in ("ok", "error"):
         raise ValueError("invalid response status")
     document = data.get("document")
-    if command in DOCUMENT_COMMANDS and status == "ok":
+    if document is not None:
+        if command not in DOCUMENT_COMMANDS or status != "ok":
+            raise ValueError("unexpected response document")
         if (not isinstance(document, str) or not document
                 or len(document.encode("utf-8")) > MAX_RESPONSE_DOCUMENT_SIZE):
             raise ValueError("invalid response document")
-    elif document is not None:
-        raise ValueError("unexpected response document")
+    elif command in {"send_logs", "get_config"} and status == "ok":
+        raise ValueError("invalid response document")
+    document_caption = data.get("document_caption")
+    if document_caption is not None and (
+        command not in {"set_event", "status"}
+        or document is None
+        or not isinstance(document_caption, str)
+        or not document_caption
+        or len(document_caption) > MAX_RESPONSE_DOCUMENT_CAPTION_SIZE
+    ):
+        raise ValueError("invalid response document caption")
+    if command in {"set_event", "status"} and document is not None \
+            and document_caption is None:
+        raise ValueError("missing response document caption")
     event_folder = data.get("event_folder")
     if event_folder is not None and not isinstance(event_folder, str):
         raise ValueError("invalid event folder")
@@ -95,6 +112,7 @@ def validate_response(data: dict, filename: str = "") -> dict:
         "status": status,
         "message": str(data.get("message", ""))[:4000],
         "document": document,
+        "document_caption": document_caption,
         "event_folder": event_folder,
         "start_locked": start_locked,
         "unlock_sessions_remaining": unlock_sessions_remaining,

@@ -215,7 +215,7 @@ class MessengerDeliveryTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertFalse(delivered)
 
-    async def test_routes_single_document_to_telegram(self):
+    async def test_routes_captioned_document_to_telegram(self):
         with patch(
             "messenger_delivery.telegram_api.send_document",
             AsyncMock(return_value=True),
@@ -225,6 +225,7 @@ class MessengerDeliveryTests(unittest.IsolatedAsyncioTestCase):
                 b"log",
                 "photobooth.log",
                 "text/plain",
+                caption="event summary",
             )
 
         self.assertTrue(delivered)
@@ -233,6 +234,34 @@ class MessengerDeliveryTests(unittest.IsolatedAsyncioTestCase):
             b"log",
             "photobooth.log",
             "text/plain",
+            caption="event summary",
+        )
+
+    async def test_routes_captioned_document_to_vk(self):
+        session, context = session_context()
+        with patch(
+            "messenger_delivery.aiohttp.ClientSession",
+            return_value=context,
+        ), patch(
+            "messenger_delivery.vk_api.send_document",
+            AsyncMock(return_value=1),
+        ) as send:
+            delivered = await messenger_delivery.send_document(
+                ReplyTarget("vk", 556972284),
+                b"{}",
+                "event_history.json",
+                "application/json",
+                caption="event summary",
+            )
+
+        self.assertTrue(delivered)
+        send.assert_awaited_once_with(
+            session,
+            556972284,
+            b"{}",
+            "event_history.json",
+            "application/json",
+            caption="event summary",
         )
 
     async def test_rejects_non_positive_vk_peer_id(self):

@@ -340,6 +340,8 @@ async def send_document(
     payload: bytes,
     filename: str,
     content_type: str,
+    *,
+    caption: str = "",
 ) -> bool:
     if not BOT_TOKEN:
         return False
@@ -349,6 +351,8 @@ async def send_document(
         # Multipart fields accept text/bytes, unlike Telegram JSON where an
         # integer chat_id is valid.
         form.add_field("chat_id", str(chat_id))
+        if caption:
+            form.add_field("caption", caption)
         form.add_field(
             "document",
             payload,

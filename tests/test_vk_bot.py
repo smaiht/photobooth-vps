@@ -1120,6 +1120,27 @@ class AdminNotificationTests(unittest.IsolatedAsyncioTestCase):
             "doc-1_10,doc-1_11",
         )
 
+    async def test_vk_send_document_includes_its_caption(self):
+        with patch(
+            "vk_api.upload_message_document",
+            AsyncMock(return_value="doc-1_10"),
+        ), patch(
+            "vk_api.api_call",
+            AsyncMock(return_value=1),
+        ) as call:
+            await vk_api.send_document(
+                object(),
+                123,
+                b"{}",
+                "event_history.json",
+                "application/json",
+                caption="event summary",
+            )
+
+        self.assertEqual(call.await_args.args[1], "messages.send")
+        self.assertEqual(call.await_args.kwargs["attachment"], "doc-1_10")
+        self.assertEqual(call.await_args.kwargs["message"], "event summary")
+
     async def test_vk_document_upload_uses_messages_server_and_docs_save(self):
         class UploadResponse:
             status = 200

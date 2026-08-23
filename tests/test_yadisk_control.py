@@ -46,8 +46,25 @@ class ResponseValidationTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "unexpected response document"):
             yadisk_control.validate_response({
                 **response,
-                "command": "status",
+                "command": "restart",
             })
+
+        status = yadisk_control.validate_response({
+            **response,
+            "command": "status",
+            "document": "{}",
+            "document_caption": "📊 ИТОГ ИВЕНТА: current-event",
+        })
+        self.assertEqual(status["document"], "{}")
+
+        event = yadisk_control.validate_response({
+            **response,
+            "command": "set_event",
+            "document": "{}",
+            "document_caption": "📊 ИТОГ ИВЕНТА: old-event",
+        })
+        self.assertEqual(
+            event["document_caption"], "📊 ИТОГ ИВЕНТА: old-event")
 
     def test_rejects_response_without_reply_target(self):
         command_id = "b" * 32
@@ -156,7 +173,8 @@ class BoothNoticeDeliveryTests(unittest.IsolatedAsyncioTestCase):
             "title": "Фотобудка готова",
             "text": (
                 "🎪 СОБЫТИЕ\n• Будка: VPS event\n\n"
-                "🖼 ШАБЛОН И СЕССИИ\n• Набор: birthday\n"
+                "🖼 ШАБЛОН: birthday\n\n"
+                "🎟 СЕССИИ\n• Технический ивент: нет\n"
                 "• Допуск: ♾ без ограничений"
             ),
         }
@@ -179,8 +197,8 @@ class BoothNoticeDeliveryTests(unittest.IsolatedAsyncioTestCase):
         text = send.await_args.args[0]
         self.assertIn("Фотобудка готова", text)
         self.assertIn("🎪 СОБЫТИЕ: ✅ совпадает", text)
-        self.assertIn("• Будка: VPS event · VPS: VPS event", text)
-        self.assertIn("VPS: VPS event\n\n🖼 ШАБЛОН И СЕССИИ", text)
+        self.assertIn("• Будка: VPS event\n• VPS: VPS event", text)
+        self.assertIn("• VPS: VPS event\n\n🖼 ШАБЛОН: birthday", text)
 
     async def test_notice_without_title_still_delivers_its_text(self):
         delivery = admin_notifications.AdminBroadcastDelivery(
@@ -296,6 +314,13 @@ class EventSwitchTests(unittest.IsolatedAsyncioTestCase):
             "command": "set_event",
             "message": "Event активирован: <b>legacy markup</b>",
             "event_folder": "2026-08-17 Свадьба Ивановых",
+            "document": '{"event":"old-event"}\n',
+            "document_caption": (
+                "📊 ИТОГ ИВЕНТА: old-event\n"
+                "• Сессии: 10 · ретейки: 2 · с несколькими копиями: 3\n"
+                "• Отпечатки: 15 · Grid: 6 · Strips: 4 · Single: 3 · "
+                "Print jobs: 2"
+            ),
             "reply_target": {
                 "provider": "telegram",
                 "conversation_id": "123",
@@ -327,7 +352,10 @@ class EventSwitchTests(unittest.IsolatedAsyncioTestCase):
         ), patch(
             "control_response_service.admin_notifications.send_event_update",
             AsyncMock(return_value=delivery),
-        ) as send:
+        ) as send, patch(
+            "control_response_service.messenger_delivery.send_document",
+            AsyncMock(return_value=True),
+        ) as send_history:
             handled = await control_response_service.handle(response)
 
         self.assertTrue(handled)
@@ -347,6 +375,13 @@ class EventSwitchTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn(
             "<b>2026-08-17 Свадьба Ивановых</b>",
             telegram_caption,
+        )
+        send_history.assert_awaited_once_with(
+            ReplyTarget("telegram", 123),
+            b'{"event":"old-event"}\n',
+            "event_history_previous.json",
+            "application/json; charset=utf-8",
+            caption=response["document_caption"],
         )
 
     async def test_cafe_event_text_is_delivered_to_both_admin_channels(self):
@@ -1039,15 +1074,18 @@ class ProviderNeutralAdminCommandTests(unittest.IsolatedAsyncioTestCase):
         reply.assert_awaited_once()
         warning.assert_called_once()
 
-    async def test_status_response_includes_the_vps_event(self):
+    async def test_status_response_delivers_history_and_includes_the_vps_event(self):
         response = {
             "status": "ok",
             "command": "status",
             "message": (
                 "🎪 СОБЫТИЕ\n• Будка: Booth event\n\n"
-                "🖼 ШАБЛОН И СЕССИИ\n• Набор: birthday\n"
+                "🖼 ШАБЛОН: birthday\n\n"
+                "🎟 СЕССИИ\n• Технический ивент: нет\n"
                 "• Допуск: ♾ без ограничений"
             ),
+            "document": "{\"event\":\"Booth event\"}\n",
+            "document_caption": "📊 ИТОГ ИВЕНТА: Booth event",
             "reply_target": {
                 "provider": "telegram",
                 "conversation_id": "123",
@@ -1059,12 +1097,23 @@ class ProviderNeutralAdminCommandTests(unittest.IsolatedAsyncioTestCase):
         ), patch(
             "control_response_service.messenger_delivery.send_text",
             AsyncMock(return_value=True),
-        ) as send:
+        ) as send, patch(
+            "control_response_service.messenger_delivery.send_document",
+            AsyncMock(return_value=True),
+        ) as send_document:
             self.assertTrue(await control_response_service.handle(response))
 
         text = send.await_args.args[1]
         self.assertIn("🎪 СОБЫТИЕ: ⚠️ НЕ СОВПАДАЕТ", text)
-        self.assertIn("• Будка: Booth event · VPS: VPS event", text)
+        self.assertIn("• Будка: Booth event\n• VPS: VPS event", text)
+        self.assertIn("\n\n🖼 ШАБЛОН: birthday", text)
+        send_document.assert_awaited_once_with(
+            ReplyTarget("telegram", 123),
+            b'{"event":"Booth event"}\n',
+            "event_history.json",
+            "application/json; charset=utf-8",
+            caption="📊 ИТОГ ИВЕНТА: Booth event",
+        )
 
 
 class LogDeliveryTests(unittest.IsolatedAsyncioTestCase):
@@ -1102,9 +1151,11 @@ class LogDeliveryTests(unittest.IsolatedAsyncioTestCase):
                 b"log",
                 "photobooth.log",
                 "text/plain",
+                caption="event summary",
             ))
 
         form.add_field.assert_any_call("chat_id", "5683598562")
+        form.add_field.assert_any_call("caption", "event summary")
 
     async def test_embedded_document_is_delivered_without_extra_text(self):
         response = {

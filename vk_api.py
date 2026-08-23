@@ -840,6 +840,8 @@ async def send_documents(
     session: aiohttp.ClientSession,
     peer_id: int,
     documents: list[tuple[bytes, str, str]],
+    *,
+    text: str = "",
 ) -> int | None:
     if not 1 <= len(documents) <= 10:
         raise ValueError("VK message must contain 1-10 documents")
@@ -854,14 +856,14 @@ async def send_documents(
                 content_type=content_type,
             )
         )
-    return await _send_message(
-        session,
-        {
-            "peer_id": peer_id,
-            "random_id": secrets.randbelow(2_147_483_647) + 1,
-            "attachment": ",".join(attachments),
-        },
-    )
+    params: dict[str, Any] = {
+        "peer_id": peer_id,
+        "random_id": secrets.randbelow(2_147_483_647) + 1,
+        "attachment": ",".join(attachments),
+    }
+    if text:
+        params["message"] = text
+    return await _send_message(session, params)
 
 
 async def send_attachments(
@@ -894,9 +896,13 @@ async def send_document(
     payload: bytes,
     filename: str,
     content_type: str = "application/octet-stream",
+    *,
+    caption: str = "",
 ) -> int | None:
+    options = {"text": caption} if caption else {}
     return await send_documents(
         session,
         peer_id,
         [(payload, filename, content_type)],
+        **options,
     )
