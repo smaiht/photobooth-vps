@@ -293,10 +293,34 @@ async def send_print_approval(
     )
 
 
-async def send_admin_text(text: str) -> AdminBroadcastDelivery:
-    """Send one final status to every configured administrator."""
+async def send_admin_text(
+    text: str,
+    *,
+    history: bytes | None = None,
+    history_caption: str = "",
+) -> AdminBroadcastDelivery:
+    """Send one status and its optional event history to every administrator."""
     targets = configured_admin_targets()
-    results = await asyncio.gather(*(_send_text(target, text) for target in targets))
+
+    async def deliver(target: ReplyTarget) -> bool:
+        if not await _send_text(target, text):
+            return False
+        if history is not None and not await _send_document(
+            target,
+            history,
+            "event_history.json",
+            "application/json; charset=utf-8",
+            history_caption,
+        ):
+            log.warning(
+                "Admin status history was not delivered provider=%s "
+                "conversation=%s",
+                target.provider,
+                target.conversation_id,
+            )
+        return True
+
+    results = await asyncio.gather(*(deliver(target) for target in targets))
     return AdminBroadcastDelivery(
         delivered_targets=tuple(
             target

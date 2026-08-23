@@ -1034,6 +1034,38 @@ class AdminNotificationTests(unittest.IsolatedAsyncioTestCase):
             ],
         )
 
+    async def test_periodic_status_and_history_are_sent_to_both_admins(self):
+        telegram_admin = ReplyTarget("telegram", 123)
+        vk_admin = ReplyTarget("vk", 556972284)
+        with patch(
+            "admin_notifications.configured_admin_targets",
+            return_value=(telegram_admin, vk_admin),
+        ), patch(
+            "admin_notifications.messenger_delivery.send_text",
+            AsyncMock(return_value=True),
+        ) as send_text, patch(
+            "admin_notifications.messenger_delivery.send_document",
+            AsyncMock(return_value=True),
+        ) as send_document:
+            result = await admin_notifications.send_admin_text(
+                "status",
+                history=b"{}\n",
+                history_caption="summary",
+            )
+
+        self.assertEqual(
+            result.delivered_targets,
+            (telegram_admin, vk_admin),
+        )
+        self.assertEqual(
+            [item.args[0] for item in send_text.await_args_list],
+            [telegram_admin, vk_admin],
+        )
+        self.assertEqual(
+            [item.args[0] for item in send_document.await_args_list],
+            [telegram_admin, vk_admin],
+        )
+
     async def test_event_without_qr_is_also_sent_to_both_admins(self):
         telegram_admin = ReplyTarget("telegram", 123)
         vk_admin = ReplyTarget("vk", 556972284)

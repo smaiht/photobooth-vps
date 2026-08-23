@@ -127,6 +127,29 @@ class BoothNoticeValidationTests(unittest.TestCase):
             self._valid(title=None), self._filename())
         self.assertEqual(notice["title"], "")
 
+    def test_status_notice_accepts_history_with_its_summary(self):
+        notice = yadisk_control.validate_notice(
+            self._valid(
+                kind="booth_status",
+                document="{}\n",
+                document_caption="summary",
+            ),
+            self._filename(),
+        )
+        self.assertEqual(notice["document"], "{}\n")
+        self.assertEqual(notice["document_caption"], "summary")
+
+    def test_notice_rejects_an_unpaired_history_document(self):
+        for overrides in (
+            {"kind": "booth_status", "document": "{}\n"},
+            {"kind": "booth_status", "document_caption": "summary"},
+            {"document": "{}\n", "document_caption": "summary"},
+        ):
+            with self.subTest(overrides=overrides), \
+                    self.assertRaisesRegex(ValueError, "document|caption"):
+                yadisk_control.validate_notice(
+                    self._valid(**overrides), self._filename())
+
     def test_rejects_wrong_schema_and_message_type(self):
         with self.assertRaisesRegex(ValueError, "schema"):
             yadisk_control.validate_notice(self._valid(schema_version=2))
@@ -211,6 +234,32 @@ class BoothNoticeDeliveryTests(unittest.IsolatedAsyncioTestCase):
                 await control_response_service.handle_notice(
                     self._notice(title="")))
         self.assertIn("• Будка: VPS event", send.await_args.args[0])
+
+    async def test_status_notice_delivers_its_history_with_the_text(self):
+        delivery = admin_notifications.AdminBroadcastDelivery(
+            delivered_targets=(ReplyTarget("telegram", "1"),),
+            failed_targets=(),
+        )
+        notice = self._notice(
+            document="{}\n",
+            document_caption="summary",
+        )
+        with patch(
+            "control_response_service.runtime_config.yadisk_folder",
+            return_value="VPS event",
+        ), patch(
+            "control_response_service.admin_notifications.send_admin_text",
+            AsyncMock(return_value=delivery),
+        ) as send:
+            self.assertTrue(
+                await control_response_service.handle_notice(notice))
+
+        send.assert_awaited_once()
+        self.assertIn("🎪 СОБЫТИЕ: ✅ совпадает", send.await_args.args[0])
+        self.assertEqual(send.await_args.kwargs, {
+            "history": b"{}\n",
+            "history_caption": "summary",
+        })
 
     async def test_total_failure_keeps_the_message_for_a_retry(self):
         delivery = admin_notifications.AdminBroadcastDelivery(

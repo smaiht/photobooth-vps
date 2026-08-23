@@ -263,7 +263,14 @@ async def handle_notice(notice: dict) -> bool:
     if notice.get("kind") in ("booth_status", "camera_config"):
         text = _with_vps_event(text)
     caption = f"ℹ️ {title}\n\n{text}" if title else f"ℹ️ {text}"
-    delivery = await admin_notifications.send_admin_text(caption)
+    delivery_options = {}
+    if notice.get("document") is not None:
+        delivery_options = {
+            "history": notice["document"].encode("utf-8"),
+            "history_caption": notice["document_caption"],
+        }
+    delivery = await admin_notifications.send_admin_text(
+        caption, **delivery_options)
     if not delivery.delivered_targets:
         log.warning(
             "Control: notice %s (%s) not delivered to any administrator",

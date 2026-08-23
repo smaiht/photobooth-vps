@@ -149,6 +149,20 @@ def validate_notice(data: dict, filename: str = "") -> dict:
     title = data.get("title")
     if title is not None and not isinstance(title, str):
         raise ValueError("invalid notice title")
+    document = data.get("document")
+    document_caption = data.get("document_caption")
+    if document is not None and (
+        kind != "booth_status"
+        or not isinstance(document, str)
+        or not document
+        or len(document.encode("utf-8")) > MAX_RESPONSE_DOCUMENT_SIZE
+        or not isinstance(document_caption, str)
+        or not document_caption
+        or len(document_caption) > MAX_RESPONSE_DOCUMENT_CAPTION_SIZE
+    ):
+        raise ValueError("invalid notice document")
+    if document is None and document_caption is not None:
+        raise ValueError("notice caption without document")
     return {
         "schema_version": SCHEMA_VERSION,
         "message_type": "booth_notice",
@@ -156,6 +170,8 @@ def validate_notice(data: dict, filename: str = "") -> dict:
         "kind": kind,
         "title": str(title or "")[:200],
         "text": text[:MAX_NOTICE_TEXT],
+        "document": document,
+        "document_caption": document_caption,
         "created_at": str(data.get("created_at", "")),
     }
 
