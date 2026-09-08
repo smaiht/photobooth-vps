@@ -545,6 +545,16 @@ class CafeUnblockCommandTests(unittest.IsolatedAsyncioTestCase):
             ("unblock", {"sessions": 1000}),
         )
 
+    def test_parses_negative_session_count_as_write_off(self):
+        self.assertEqual(
+            admin_commands.parse("/unblock -1"),
+            ("unblock", {"sessions": -1}),
+        )
+        self.assertEqual(
+            admin_commands.parse("/unblock -1000"),
+            ("unblock", {"sessions": -1000}),
+        )
+
     def test_block_and_unblock_zero_parse_to_same_booth_command(self):
         expected = ("unblock", {"sessions": 0})
         self.assertEqual(admin_commands.parse("/block"), expected)
@@ -555,7 +565,7 @@ class CafeUnblockCommandTests(unittest.IsolatedAsyncioTestCase):
     def test_rejects_invalid_session_count(self):
         for command in (
             "/unblock 1001",
-            "/unblock -1",
+            "/unblock -1001",
             "/unblock 1.5",
             "/unblock many",
             "/unblock 2 extra",
@@ -662,7 +672,7 @@ class CafeUnblockCommandTests(unittest.IsolatedAsyncioTestCase):
             )
 
         send.assert_not_awaited()
-        self.assertIn("от 0 до 1000", send_text.await_args.args[1])
+        self.assertIn("от -1000 до 1000", send_text.await_args.args[1])
 
 
 class PrintQueueAdminCommandTests(unittest.IsolatedAsyncioTestCase):

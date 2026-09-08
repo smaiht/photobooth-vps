@@ -114,16 +114,16 @@ def _parse_event(
 def _parse_unblock(argument: str | None) -> ParsedCommand:
     if argument is None:
         sessions = DEFAULT_UNBLOCK_SESSIONS
-    elif not re.fullmatch(r"[0-9]+", argument):
+    elif not re.fullmatch(r"-?[0-9]+", argument):
         raise ValueError(
-            "Использование: /unblock [0 или число от 1 до 1000]"
+            "Использование: /unblock [0 или число от -1000 до 1000]"
         )
     else:
         sessions = int(argument)
-    if not 0 <= sessions <= MAX_UNBLOCK_SESSIONS:
+    if not -MAX_UNBLOCK_SESSIONS <= sessions <= MAX_UNBLOCK_SESSIONS:
         raise ValueError(
-            "Количество сессий должно быть от 0 до 1000; "
-            "0 сразу блокирует запуск"
+            "Количество сессий должно быть от -1000 до 1000; "
+            "отрицательное списывает, 0 сразу блокирует запуск"
         )
     return "unblock", {"sessions": sessions}
 
@@ -225,8 +225,13 @@ def sent_message(command: str, data: dict | None) -> str:
                 "⏳ Кафе: блокирую запуск новых сессий; "
                 "ожидаю подтверждение будки"
             )
+        if data["sessions"] < 0:
+            return (
+                "⏳ Кафе: списываю разрешённые сессии — "
+                f"{-data['sessions']}; ожидаю подтверждение будки"
+            )
         return (
-            "⏳ Кафе: задаю остаток разрешённых сессий — "
+            "⏳ Кафе: добавляю разрешённые сессии — "
             f"{data['sessions']}; ожидаю подтверждение будки"
         )
     if command == "set_camera_config":
