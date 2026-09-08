@@ -584,7 +584,10 @@ async def _finish_message(
     if not await _delete_inbox_message(message_name):
         return False
     state_changed = False
-    if message_name in handled:
+    # A sender can re-upload a stable notice after an ambiguous upload result.
+    # Retain its completion ID; no message text or per-channel state is needed.
+    if (message_name in handled
+            and not yadisk_control.STABLE_NOTICE_NAME_RE.fullmatch(message_name)):
         handled.remove(message_name)
         state_changed = True
     deliveries = _state.setdefault("session_deliveries", {})

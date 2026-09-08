@@ -26,7 +26,8 @@ COMMAND_ID_RE = re.compile(r"^[a-f0-9]{32}$")
 NOTICE_ID_RE = re.compile(r"^[a-f0-9]{32}$")
 NOTICE_KIND_RE = re.compile(r"^[a-z][a-z0-9_]{0,39}$")
 NOTICE_NAME_RE = re.compile(
-    r"^notice_[0-9]{8}T[0-9]{6}Z_[a-f0-9]{32}\.json$")
+    r"^notice_(?:[0-9]{8}T[0-9]{6}Z_)?[a-f0-9]{32}\.json$")
+STABLE_NOTICE_NAME_RE = re.compile(r"^notice_[a-f0-9]{32}\.json$")
 MAX_NOTICE_TEXT = 3500
 MAX_RESPONSE_DOCUMENT_SIZE = 512 * 1024
 MAX_RESPONSE_DOCUMENT_CAPTION_SIZE = 1000

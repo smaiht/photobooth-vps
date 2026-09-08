@@ -257,6 +257,10 @@ async def handle_notice(notice: dict) -> bool:
     The booth cannot address a messenger itself, so the notice has no
     ``reply_target`` and is broadcast to the administrators this VPS knows.
     Returning False keeps the message on Disk for a later retry.
+
+    Every notice kind, including SMS, uses the same rule: one successful
+    administrator channel is sufficient. Only session archives track and
+    retry the individual channels that failed.
     """
     title = str(notice.get("title") or "").strip()
     text = str(notice.get("text") or "").strip()
