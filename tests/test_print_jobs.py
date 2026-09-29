@@ -28,9 +28,46 @@ class PrintPreviewTests(unittest.TestCase):
         self.assertTrue(landscape.exact_ratio)
         self.assertIsNone(landscape.payload)
         self.assertEqual(landscape.target_size, (3688, 2480))
+        self.assertEqual(landscape.auto_mode, "fit")
         self.assertTrue(portrait.exact_ratio)
         self.assertIsNone(portrait.payload)
         self.assertEqual(portrait.target_size, (2480, 3688))
+        self.assertEqual(portrait.auto_mode, "fit")
+
+    def test_camera_3_2_ratio_is_filled_without_choice(self):
+        # 3:2 scaled to a 2480 px side is 3720 px long: only 32 px are cut.
+        landscape = print_jobs.build_choice_preview(image_payload((600, 400)))
+        portrait = print_jobs.build_choice_preview(image_payload((400, 600)))
+
+        for preview, axis in ((landscape, "horizontal"), (portrait, "vertical")):
+            self.assertFalse(preview.exact_ratio)
+            self.assertIsNone(preview.payload)
+            self.assertEqual(preview.auto_mode, "fill")
+            self.assertEqual(preview.overflow_axis, axis)
+
+    def test_auto_fill_requires_crop_below_one_hundred_sheet_pixels(self):
+        landscape = print_jobs.LANDSCAPE_PRINT_SIZE
+        self.assertEqual(print_jobs.fill_crop_pixels((3688, 2480), landscape), 0)
+        self.assertAlmostEqual(
+            print_jobs.fill_crop_pixels((3787, 2480), landscape),
+            99,
+        )
+        self.assertAlmostEqual(
+            print_jobs.fill_crop_pixels((3788, 2480), landscape),
+            100,
+        )
+        self.assertAlmostEqual(
+            print_jobs.fill_crop_pixels((3688, 2579), landscape),
+            99,
+        )
+        self.assertEqual(print_jobs.AUTO_FILL_MAX_CROP_PX, 100)
+
+    def test_phone_4_3_ratio_still_asks_for_choice(self):
+        preview = print_jobs.build_choice_preview(image_payload((400, 300)))
+
+        self.assertFalse(preview.exact_ratio)
+        self.assertIsNone(preview.auto_mode)
+        self.assertIsNotNone(preview.payload)
 
     def test_horizontal_crop_overflow_stacks_tiles(self):
         preview = print_jobs.build_choice_preview(image_payload((1200, 300)))

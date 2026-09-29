@@ -7,6 +7,8 @@ import json
 import logging
 from dataclasses import dataclass
 
+import aiohttp
+
 import messenger_delivery
 from messaging import ReplyTarget
 import telegram_api
@@ -291,6 +293,27 @@ async def send_print_approval(
             if not success
         ),
     )
+
+
+async def send_telegram_admin_text(text: str) -> bool:
+    """Best-effort send one plain-text notice only to the Telegram admin."""
+    if not telegram_api.BOT_TOKEN or not telegram_api.ADMIN_ID:
+        log.warning("Telegram admin notice skipped: bot or admin is not configured")
+        return False
+    try:
+        async with aiohttp.ClientSession() as session:
+            # Links point to VK profiles and dialogs; previews would only
+            # make every notice several times taller.
+            return await telegram_api.send_text(
+                session,
+                telegram_api.BOT_API_BASE,
+                telegram_api.ADMIN_ID,
+                text,
+                disable_link_preview=True,
+            )
+    except Exception as exc:
+        log.warning("Telegram admin notice failed: %s", exc)
+        return False
 
 
 async def send_admin_text(

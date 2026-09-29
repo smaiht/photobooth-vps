@@ -25,6 +25,9 @@ except Exception as exc:
 
 LANDSCAPE_PRINT_SIZE = (3688, 2480)
 PORTRAIT_PRINT_SIZE = (2480, 3688)
+# ``fill`` is chosen without asking when it would cut off less than this many
+# sheet pixels in total along the cropped side.
+AUTO_FILL_MAX_CROP_PX = 100
 MAX_PRINT_PIXELS = 100_000_000
 PENDING_ROOT = Path(__file__).resolve().parent / "print_pending_jobs"
 JOB_ID_RE = re.compile(r"^[a-f0-9]{32}$")
@@ -58,6 +61,18 @@ class PrintPreview:
     orientation: str
     exact_ratio: bool
     overflow_axis: str | None
+    auto_mode: str | None = None
+
+
+def fill_crop_pixels(
+    source_size: tuple[int, int],
+    target_size: tuple[int, int],
+) -> float:
+    """Return how many sheet pixels ``fill`` cuts off along the cropped side."""
+    width, height = source_size
+    target_w, target_h = target_size
+    scale = max(target_w / width, target_h / height)
+    return max(width * scale - target_w, height * scale - target_h, 0.0)
 
 
 def _load_rgb(payload: bytes) -> Image.Image:
@@ -304,13 +319,19 @@ def _font_bbox_height(
 
 
 def build_choice_preview(payload: bytes) -> PrintPreview:
-    """Return no image for an exact ratio, otherwise one two-option collage."""
+    """Return no image when the mode is obvious, otherwise a two-option collage.
+
+    An exact ratio prints as ``fit``; a nearly exact one prints as ``fill``
+    when that cuts off less than ``AUTO_FILL_MAX_CROP_PX`` sheet pixels.
+    """
     image = _load_rgb(payload)
     try:
         source_size = image.size
         landscape = image.width > image.height
         target_size = LANDSCAPE_PRINT_SIZE if landscape else PORTRAIT_PRINT_SIZE
-        exact_ratio = image.width * target_size[1] == image.height * target_size[0]
+        width_product = image.width * target_size[1]
+        height_product = image.height * target_size[0]
+        exact_ratio = width_product == height_product
         if exact_ratio:
             return PrintPreview(
                 payload=None,
@@ -319,6 +340,19 @@ def build_choice_preview(payload: bytes) -> PrintPreview:
                 orientation="landscape" if landscape else "portrait",
                 exact_ratio=True,
                 overflow_axis=None,
+                auto_mode="fit",
+            )
+        if fill_crop_pixels(source_size, target_size) < AUTO_FILL_MAX_CROP_PX:
+            return PrintPreview(
+                payload=None,
+                source_size=source_size,
+                target_size=target_size,
+                orientation="landscape" if landscape else "portrait",
+                exact_ratio=False,
+                overflow_axis=(
+                    "horizontal" if width_product > height_product else "vertical"
+                ),
+                auto_mode="fill",
             )
 
         # The messenger comparison never needs the full source raster.

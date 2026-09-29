@@ -10,6 +10,7 @@ from collections import OrderedDict
 import aiohttp
 
 import admin_command_service
+import admin_notifications
 import database
 import event_access
 import print_flow
@@ -26,6 +27,26 @@ EVENT_ACCESS_REQUIRED_MESSAGE = (
 )
 USER_PROFILE_CACHE_TTL_SECONDS = 60 * 60
 USER_PROFILE_CACHE_MAX_SIZE = 4096
+ADMIN_NOTICE_TEXT_LIMIT = 3000
+ADMIN_NOTICE_TIMEOUT_SECONDS = 20
+ATTACHMENT_LABELS = {
+    "photo": "фото",
+    "video": "видео",
+    "audio": "аудио",
+    "audio_message": "голосовое",
+    "doc": "документ",
+    "sticker": "стикер",
+    "graffiti": "граффити",
+    "wall": "репост записи",
+    "wall_reply": "комментарий",
+    "link": "ссылка",
+    "poll": "опрос",
+    "gift": "подарок",
+    "story": "история",
+    "market": "товар",
+    "article": "статья",
+    "call": "звонок",
+}
 _user_profile_cache: OrderedDict[
     int,
     tuple[float, dict[str, str | None]],
@@ -226,6 +247,122 @@ async def reply_for_current_event(
     await vk_api.send_text(session, peer_id, text)
 
 
+async def current_event_guest(user_id: int) -> str | None:
+    """Return the current event name if this user joined it by its QR."""
+    event_name, event_token, cafe_mode = event_access.current_event()
+    if cafe_mode or event_token is None:
+        return None
+    joined = await database.user_has_current_start_parameter(
+        provider="vk",
+        provider_user_id=user_id,
+        start_parameter=event_token,
+    )
+    return event_name if joined else None
+
+
+def content_labels(message: dict) -> list[str]:
+    """Describe non-text message content for a plain-text admin notice."""
+    counts: dict[str, int] = {}
+    attachments = message.get("attachments")
+    for attachment in attachments if isinstance(attachments, list) else ():
+        kind = attachment.get("type") if isinstance(attachment, dict) else None
+        if isinstance(kind, str) and kind:
+            label = ATTACHMENT_LABELS.get(kind, kind)
+            counts[label] = counts.get(label, 0) + 1
+    if message.get("fwd_messages"):
+        counts["пересланные сообщения"] = 1
+    if message.get("geo"):
+        counts["геолокация"] = 1
+    return [
+        label if count == 1 else f"{label} ×{count}"
+        for label, count in counts.items()
+    ]
+
+
+def admin_message_notice(
+    message: dict,
+    profile: dict[str, str | None],
+    *,
+    group_id,
+    guest_event: str | None,
+) -> str:
+    """Build a plain-text notice about a message written to the community."""
+    user_id = message["from_id"]
+    name = " ".join(
+        part.strip()
+        for part in (profile.get("first_name"), profile.get("last_name"))
+        if isinstance(part, str) and part.strip()
+    )
+    sender = f"vk.com/id{user_id}"
+    lines = [f"💬 VK: {name} ({sender})" if name else f"💬 VK: {sender}"]
+    if guest_event:
+        lines.append(f"Гость мероприятия «{guest_event}»")
+    lines.append("")
+
+    text = str(message.get("text") or "").strip()
+    if len(text) > ADMIN_NOTICE_TEXT_LIMIT:
+        text = f"{text[:ADMIN_NOTICE_TEXT_LIMIT - 1]}…"
+    labels = content_labels(message)
+    if text:
+        lines.append(text)
+    if labels:
+        lines.append(f"📎 {', '.join(labels)}")
+    if not text and not labels:
+        lines.append("(пустое сообщение)")
+
+    if isinstance(group_id, int) and not isinstance(group_id, bool) and group_id > 0:
+        lines.extend(("", f"Ответить: https://vk.com/gim{group_id}?sel={user_id}"))
+    return "\n".join(lines)
+
+
+async def notify_admin(
+    update: dict,
+    message: dict,
+    profile: dict[str, str | None],
+    *,
+    print_upload: bool = False,
+) -> None:
+    """Report a community message to the Telegram admin without ever raising.
+
+    A raised error would make Long Poll replay the batch and, for a photo,
+    process the print upload a second time.
+    """
+    user_id = message["from_id"]
+    try:
+        try:
+            guest_event = await current_event_guest(user_id)
+        except Exception as exc:
+            log.warning(
+                "VK guest lookup for admin notice failed user=%s: %s",
+                user_id,
+                exc,
+            )
+            guest_event = None
+        if print_upload and guest_event is not None:
+            # Photos from guests of the current event are ordinary print traffic.
+            return
+        notice = admin_message_notice(
+            message,
+            profile,
+            group_id=update.get("group_id"),
+            guest_event=guest_event,
+        )
+        delivered = await asyncio.wait_for(
+            admin_notifications.send_telegram_admin_text(notice),
+            timeout=ADMIN_NOTICE_TIMEOUT_SECONDS,
+        )
+    except asyncio.CancelledError:
+        raise
+    except asyncio.TimeoutError:
+        log.warning("VK message admin notice timed out user=%s", user_id)
+        return
+    except Exception as exc:
+        log.warning("VK message admin notice failed user=%s: %s", user_id, exc)
+        return
+    if not delivered:
+        log.warning("VK message from user=%s was not reported to the admin", user_id)
+
+
 async def route_message_update(
     session: aiohttp.ClientSession,
     update: dict,
@@ -239,11 +376,14 @@ async def route_message_update(
     # Keep routing old text-button cards until all pre-deployment cards expire.
     if await vk_print.handle_action(session, message, profile=profile):
         return
+    admin = vk_api.is_admin(message["from_id"])
     if await vk_print.handle_message(session, message, profile=profile):
+        if not started and not admin:
+            await notify_admin(update, message, profile, print_upload=True)
         return
 
     text = str(message.get("text") or "")
-    if vk_api.is_admin(message["from_id"]) and (text.strip() or not started):
+    if admin and (text.strip() or not started):
         await admin_command_service.handle_message(
             ReplyTarget("vk", message["peer_id"]),
             text,
@@ -258,7 +398,9 @@ async def route_message_update(
         first_name=profile.get("first_name"),
         last_name=profile.get("last_name"),
     )
-    await reply_for_current_event(session, message)
+    # The community is also a regular inbox: people who write anything other
+    # than a photo get no scripted reply; the admin answers them in person.
+    await notify_admin(update, message, profile)
 
 
 async def route_message_event(

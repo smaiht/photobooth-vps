@@ -1,3 +1,4 @@
+import asyncio
 import io
 import json
 import traceback
@@ -580,11 +581,15 @@ class VkPrintAdapterTests(unittest.IsolatedAsyncioTestCase):
         ), patch(
             "vk_bot.admin_command_service.handle_message",
             new_callable=AsyncMock,
-        ) as admin:
+        ) as admin, patch(
+            "vk_bot.notify_admin",
+            new_callable=AsyncMock,
+        ) as notify:
             await vk_bot.route_message_update(object(), update, message)
 
         photo.assert_awaited_once_with(ANY, message, profile={})
         admin.assert_not_awaited()
+        notify.assert_not_awaited()
 
     async def test_vk_api_serializes_keyboard_and_returns_message_id(self):
         keyboard = {"inline": True, "buttons": []}
@@ -752,11 +757,15 @@ class VkStartTests(unittest.IsolatedAsyncioTestCase):
         ), patch(
             "vk_bot.vk_api.send_text",
             AsyncMock(),
-        ) as send:
+        ) as send, patch(
+            "vk_bot.admin_notifications.send_telegram_admin_text",
+            AsyncMock(return_value=True),
+        ) as notify:
             await vk_bot.route_message_update(object(), update, message)
 
         self.assertIn("подключены", send.await_args.args[2])
         self.assertIn("2026-08-17 Свадьба", send.await_args.args[2])
+        notify.assert_not_awaited()
 
     async def test_ref_does_not_swallow_photo_from_the_same_message(self):
         update = {"event_id": "event-photo-ref", "type": "message_new"}
@@ -824,9 +833,13 @@ class VkStartTests(unittest.IsolatedAsyncioTestCase):
             "/status",
         )
 
-    async def test_plain_message_is_saved_and_receives_qr_prompt(self):
-        update = {"event_id": "event-456", "type": "message_new"}
-        message = {"from_id": 321, "peer_id": 321, "text": "hello"}
+    async def test_plain_message_is_saved_and_reported_without_reply(self):
+        update = {
+            "event_id": "event-456",
+            "type": "message_new",
+            "group_id": 777,
+        }
+        message = {"from_id": 321, "peer_id": 321, "text": "Сколько стоит аренда?"}
         with patch(
             "vk_bot.cached_user_profile",
             AsyncMock(return_value={
@@ -849,7 +862,10 @@ class VkStartTests(unittest.IsolatedAsyncioTestCase):
         ), patch(
             "vk_bot.vk_api.send_text",
             AsyncMock(),
-        ) as send:
+        ) as send, patch(
+            "vk_bot.admin_notifications.send_telegram_admin_text",
+            AsyncMock(return_value=True),
+        ) as notify:
             await vk_bot.route_message_update(object(), update, message)
 
         ensure.assert_awaited_once_with(
@@ -859,7 +875,14 @@ class VkStartTests(unittest.IsolatedAsyncioTestCase):
             first_name="Алёна",
             last_name="Ёлкина",
         )
-        self.assertIn("QR-код", send.await_args.args[2])
+        send.assert_not_awaited()
+        notify.assert_awaited_once_with(
+            "💬 VK: Алёна Ёлкина (vk.com/id321)\n"
+            "\n"
+            "Сколько стоит аренда?\n"
+            "\n"
+            "Ответить: https://vk.com/gim777?sel=321"
+        )
 
     async def test_admin_message_uses_shared_command_service(self):
         update = {"event_id": "event-admin", "type": "message_new"}
@@ -886,7 +909,10 @@ class VkStartTests(unittest.IsolatedAsyncioTestCase):
         ) as handle, patch(
             "vk_bot.reply_for_current_event",
             new_callable=AsyncMock,
-        ) as reply:
+        ) as reply, patch(
+            "vk_bot.notify_admin",
+            new_callable=AsyncMock,
+        ) as notify:
             await vk_bot.route_message_update(
                 object(),
                 update,
@@ -899,9 +925,273 @@ class VkStartTests(unittest.IsolatedAsyncioTestCase):
             "/status",
         )
         reply.assert_not_awaited()
+        notify.assert_not_awaited()
+
+
+class VkCommunityInboxTests(unittest.IsolatedAsyncioTestCase):
+    async def route(
+        self,
+        message: dict,
+        *,
+        current_event=("2026-08-17 Свадьба", "current-token", False),
+        guest: bool = False,
+        started: bool = False,
+        printed: bool = False,
+        notify: AsyncMock | None = None,
+    ) -> AsyncMock:
+        notify = notify or AsyncMock(return_value=True)
+        update = {
+            "event_id": "event-inbox",
+            "type": "message_new",
+            "group_id": 777,
+        }
+        with patch(
+            "vk_bot.cached_user_profile",
+            AsyncMock(return_value={}),
+        ), patch(
+            "vk_bot.record_start",
+            AsyncMock(return_value=started),
+        ), patch(
+            "vk_bot.reply_for_current_event",
+            new_callable=AsyncMock,
+        ), patch(
+            "vk_bot.vk_print.handle_action",
+            AsyncMock(return_value=False),
+        ), patch(
+            "vk_bot.vk_print.handle_message",
+            AsyncMock(return_value=printed),
+        ), patch(
+            "vk_bot.vk_api.is_admin",
+            return_value=False,
+        ), patch(
+            "vk_bot.database.ensure_bot_user",
+            AsyncMock(return_value=1),
+        ), patch(
+            "vk_bot.event_access.current_event",
+            return_value=current_event,
+        ), patch(
+            "vk_bot.database.user_has_current_start_parameter",
+            AsyncMock(return_value=guest),
+        ), patch(
+            "vk_bot.vk_api.send_text",
+            AsyncMock(),
+        ) as send, patch(
+            "vk_bot.admin_notifications.send_telegram_admin_text",
+            notify,
+        ):
+            await vk_bot.route_message_update(object(), update, message)
+        send.assert_not_awaited()
+        return notify
+
+    async def test_current_event_guest_text_is_labeled(self):
+        notify = await self.route(
+            {"from_id": 321, "peer_id": 321, "text": "Фото не печатается"},
+            guest=True,
+        )
+
+        notify.assert_awaited_once_with(
+            "💬 VK: vk.com/id321\n"
+            "Гость мероприятия «2026-08-17 Свадьба»\n"
+            "\n"
+            "Фото не печатается\n"
+            "\n"
+            "Ответить: https://vk.com/gim777?sel=321"
+        )
+
+    async def test_sticker_without_text_is_reported(self):
+        notify = await self.route({
+            "from_id": 321,
+            "peer_id": 321,
+            "text": "",
+            "attachments": [{"type": "sticker", "sticker": {}}],
+        })
+
+        self.assertIn("\n📎 стикер\n", notify.await_args.args[0])
+
+    async def test_cafe_photo_is_printed_and_reported(self):
+        notify = await self.route(
+            {
+                "from_id": 321,
+                "peer_id": 321,
+                "attachments": [{"type": "photo", "photo": {}}],
+            },
+            current_event=("Кафе", None, True),
+            printed=True,
+        )
+
+        notify.assert_awaited_once_with(
+            "💬 VK: vk.com/id321\n"
+            "\n"
+            "📎 фото\n"
+            "\n"
+            "Ответить: https://vk.com/gim777?sel=321"
+        )
+
+    async def test_event_photo_from_non_guest_is_reported(self):
+        notify = await self.route(
+            {
+                "from_id": 321,
+                "peer_id": 321,
+                "text": "Вот наш зал",
+                "attachments": [{"type": "photo", "photo": {}}],
+            },
+            printed=True,
+        )
+
+        self.assertIn("Вот наш зал\n📎 фото", notify.await_args.args[0])
+
+    async def test_event_photo_from_current_guest_is_not_reported(self):
+        notify = await self.route(
+            {
+                "from_id": 321,
+                "peer_id": 321,
+                "attachments": [{"type": "photo", "photo": {}}],
+            },
+            guest=True,
+            printed=True,
+        )
+
+        notify.assert_not_awaited()
+
+    async def test_qr_entry_message_is_not_reported(self):
+        for printed in (False, True):
+            with self.subTest(printed=printed):
+                notify = await self.route(
+                    {"from_id": 321, "peer_id": 321, "ref": "current-token"},
+                    started=True,
+                    printed=printed,
+                )
+
+                notify.assert_not_awaited()
+
+    async def test_notice_failures_do_not_break_message_processing(self):
+        with patch(
+            "vk_bot.event_access.current_event",
+            side_effect=RuntimeError("EVENT_KEY не настроен"),
+        ), patch(
+            "vk_bot.admin_notifications.send_telegram_admin_text",
+            AsyncMock(side_effect=RuntimeError("telegram is down")),
+        ) as notify, self.assertLogs(vk_bot.log, level="WARNING") as logs:
+            await vk_bot.notify_admin(
+                {"group_id": 777},
+                {"from_id": 321, "peer_id": 321, "text": "hello"},
+                {},
+            )
+
+        notify.assert_awaited_once()
+        self.assertNotIn("Гость", notify.await_args.args[0])
+        self.assertTrue(any("guest lookup" in line for line in logs.output))
+        self.assertTrue(any("telegram is down" in line for line in logs.output))
+
+    async def test_slow_telegram_notice_times_out(self):
+        async def slow_delivery(_text):
+            await asyncio.sleep(1)
+            return True
+
+        with patch("vk_bot.ADMIN_NOTICE_TIMEOUT_SECONDS", 0.01), patch(
+            "vk_bot.current_event_guest",
+            AsyncMock(return_value=None),
+        ), patch(
+            "vk_bot.admin_notifications.send_telegram_admin_text",
+            side_effect=slow_delivery,
+        ), self.assertLogs(vk_bot.log, level="WARNING") as logs:
+            await vk_bot.notify_admin(
+                {},
+                {"from_id": 321, "peer_id": 321, "text": "hello"},
+                {},
+            )
+
+        self.assertTrue(any("timed out" in line for line in logs.output))
+
+    def test_notice_summarizes_content_and_truncates_long_text(self):
+        notice = vk_bot.admin_message_notice(
+            {
+                "from_id": 5,
+                "text": "я" * 5000,
+                "attachments": [
+                    {"type": "photo"},
+                    {"type": "photo"},
+                    {"type": "audio_message"},
+                    {"type": "wall"},
+                    {"type": "new_kind"},
+                ],
+                "fwd_messages": [{"text": "old"}],
+            },
+            {"first_name": "Иван", "last_name": " "},
+            group_id=None,
+            guest_event=None,
+        )
+
+        header, _blank, text, labels = notice.split("\n")
+        self.assertEqual(header, "💬 VK: Иван (vk.com/id5)")
+        self.assertEqual(len(text), vk_bot.ADMIN_NOTICE_TEXT_LIMIT)
+        self.assertTrue(text.endswith("…"))
+        self.assertEqual(
+            labels,
+            "📎 фото ×2, голосовое, репост записи, new_kind, "
+            "пересланные сообщения",
+        )
 
 
 class AdminNotificationTests(unittest.IsolatedAsyncioTestCase):
+    async def test_telegram_admin_text_is_sent_only_to_telegram_admin(self):
+        with patch.object(
+            admin_notifications.telegram_api,
+            "BOT_TOKEN",
+            "telegram-token",
+        ), patch.object(
+            admin_notifications.telegram_api,
+            "ADMIN_ID",
+            "123",
+        ), patch(
+            "admin_notifications.telegram_api.send_text",
+            AsyncMock(return_value=True),
+        ) as send, patch(
+            "admin_notifications.messenger_delivery.send_text",
+            AsyncMock(return_value=True),
+        ) as routed:
+            delivered = await admin_notifications.send_telegram_admin_text(
+                "💬 VK: vk.com/id321",
+            )
+
+        self.assertTrue(delivered)
+        send.assert_awaited_once_with(
+            ANY,
+            admin_notifications.telegram_api.BOT_API_BASE,
+            "123",
+            "💬 VK: vk.com/id321",
+            disable_link_preview=True,
+        )
+        routed.assert_not_awaited()
+
+    async def test_telegram_admin_text_without_configuration_or_transport(self):
+        for token, admin_id, error in (
+            ("", "123", None),
+            ("telegram-token", "", None),
+            ("telegram-token", "123", RuntimeError("network down")),
+        ):
+            with self.subTest(token=token, admin_id=admin_id), patch.object(
+                admin_notifications.telegram_api,
+                "BOT_TOKEN",
+                token,
+            ), patch.object(
+                admin_notifications.telegram_api,
+                "ADMIN_ID",
+                admin_id,
+            ), patch(
+                "admin_notifications.telegram_api.send_text",
+                AsyncMock(side_effect=error, return_value=True),
+            ) as send, self.assertLogs(
+                admin_notifications.log,
+                level="WARNING",
+            ):
+                delivered = await admin_notifications.send_telegram_admin_text(
+                    "notice",
+                )
+
+            self.assertFalse(delivered)
+            self.assertEqual(send.await_count, 1 if error else 0)
+
     def test_configured_admin_targets_use_symmetric_provider_settings(self):
         with patch.object(
             admin_notifications.telegram_api,

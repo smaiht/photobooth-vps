@@ -521,10 +521,15 @@ async def handle_upload(upload: PrintUpload, ui: PrintUI) -> bool:
             preview=preview,
         )
 
-        if preview.exact_ratio:
+        if preview.auto_mode is not None:
+            mode = preview.auto_mode
             metadata.update({
-                "print_mode": "fit",
-                "print_choice": "automatic_exact_ratio",
+                "print_mode": mode,
+                "print_choice": (
+                    "automatic_exact_ratio"
+                    if preview.exact_ratio
+                    else "automatic_near_ratio"
+                ),
                 "print_selected_at": time.time(),
             })
             if cafe_mode and not user.allowlisted:
@@ -541,7 +546,7 @@ async def handle_upload(upload: PrintUpload, ui: PrintUI) -> bool:
                 job_id=job_id,
                 user_id=database_user_id,
                 current_event_name=current_name,
-                print_mode="fit",
+                print_mode=mode,
                 current_event_token=current_token,
                 cafe_mode=current_cafe,
                 allowlisted=user.allowlisted,
@@ -565,7 +570,7 @@ async def handle_upload(upload: PrintUpload, ui: PrintUI) -> bool:
                         job_id=job_id,
                         payload=payload,
                         metadata=metadata,
-                        mode="fit",
+                        mode=mode,
                     )
                 except Exception as exc:
                     await _fail_before_dispatch(job_id, exc)
@@ -597,10 +602,11 @@ async def handle_upload(upload: PrintUpload, ui: PrintUI) -> bool:
                 "✅ Ваше фото добавлено в очередь и скоро будет распечатано.",
             )
             log.info(
-                "%s print job sent without choice job=%s user=%s command=%s",
+                "%s print job sent without choice job=%s user=%s mode=%s command=%s",
                 user.provider.upper(),
                 job_id,
                 user.provider_user_id,
+                mode,
                 command_id,
             )
             return True

@@ -284,6 +284,54 @@ class SharedPrintFlowTests(unittest.IsolatedAsyncioTestCase):
             ],
         )
 
+    async def test_near_ratio_image_is_filled_without_choice(self):
+        owner = user("telegram", 322)
+        incoming, _download = upload(owner, (600, 400))
+        ui = FakeUI()
+        with patch.object(print_flow.uuid, "uuid4") as uuid4, patch.object(
+            print_flow,
+            "submit_print_job",
+            AsyncMock(return_value="e" * 32),
+        ) as submit:
+            uuid4.return_value.hex = "f" * 32
+            self.assertTrue(await print_flow.handle_upload(incoming, ui))
+
+        ui.send_choice.assert_not_awaited()
+        self.assertEqual(self.claim_choice.await_args.kwargs["print_mode"], "fill")
+        metadata = submit.await_args.kwargs["metadata"]
+        self.assertEqual(metadata["print_mode"], "fill")
+        self.assertEqual(metadata["print_choice"], "automatic_near_ratio")
+        self.assertEqual(
+            ui.send_text.await_args_list[-1],
+            call(owner, "✅ Ваше фото добавлено в очередь и скоро будет распечатано."),
+        )
+
+    async def test_near_ratio_cafe_request_shows_fill_to_admins(self):
+        print_flow.event_access.current_event.return_value = ("Кафе", None, True)
+        self.claim_choice.return_value = {
+            "outcome": "awaiting_authorization",
+            "status": "awaiting_authorization",
+        }
+        owner = user("vk", 335, allowlisted=False)
+        incoming, _download = upload(owner, (400, 600))
+        ui = FakeUI()
+        with TemporaryDirectory() as tmpdir, patch.object(
+            print_jobs,
+            "PENDING_ROOT",
+            Path(tmpdir),
+        ), patch.object(print_flow.uuid, "uuid4") as uuid4:
+            uuid4.return_value.hex = "9" * 32
+            self.assertTrue(await print_flow.handle_upload(incoming, ui))
+            _payload, metadata = print_jobs.load_pending("9" * 32)
+
+        ui.send_choice.assert_not_awaited()
+        self.assertEqual(self.claim_choice.await_args.kwargs["print_mode"], "fill")
+        self.assertEqual(metadata["print_mode"], "fill")
+        self.assertIn(
+            print_flow.mode_text("fill"),
+            self.send_approval.await_args.kwargs["caption"],
+        )
+
     async def test_vk_guest_access_uses_vk_identity_and_event_token(self):
         owner = user("vk", 456, allowlisted=False)
         incoming, _download = upload(owner)

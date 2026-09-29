@@ -123,6 +123,27 @@ class RetryPolicyTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(delivered)
         self.assertEqual(session.calls[0][1]["json"]["parse_mode"], "HTML")
 
+    async def test_telegram_text_can_disable_link_previews(self):
+        session = FakeSession([
+            FakeResponse(200, {"ok": True, "result": {"message_id": 1}}),
+            FakeResponse(200, {"ok": True, "result": {"message_id": 2}}),
+        ])
+
+        for disable_link_preview in (True, False):
+            self.assertTrue(await telegram_api.send_text(
+                session,
+                "https://telegram.test",
+                123,
+                "https://vk.com/gim1?sel=2",
+                disable_link_preview=disable_link_preview,
+            ))
+
+        self.assertEqual(
+            session.calls[0][1]["json"]["link_preview_options"],
+            {"is_disabled": True},
+        )
+        self.assertNotIn("link_preview_options", session.calls[1][1]["json"])
+
     async def test_telegram_edit_not_modified_counts_as_success(self):
         session = FakeSession([
             FakeResponse(400, {
