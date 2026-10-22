@@ -10,9 +10,8 @@
         "vk": true
     },
     "ai_image_edit": {
-        "_comment": "Outside cafe mode, a photo enters this flow only when its caption is exactly AI, ИИ or изменить. In cafe mode AI is available only to admins and allowlisted users. KIE_API_KEY stays in .env. Output is always 1K; source orientation automatically selects 3:2 or 2:3.",
+        "_comment": "Outside cafe mode, a photo enters this flow only when its caption is exactly AI, ИИ or изменить. In cafe mode AI is available only to admins and allowlisted users. IMAGE_API_KEY stays in .env. Source orientation automatically selects 1536x1024 or 1024x1536.",
         "enabled": true,
-        "generator": "kie",
         "templates": [
             {
                 "id": "event_hero",

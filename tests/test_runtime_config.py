@@ -83,7 +83,6 @@ class RuntimeConfigTests(unittest.TestCase):
             {
                 "ai_image_edit": {
                     "enabled": True,
-                    "generator": "kie",
                     "templates": templates,
                 },
             },
@@ -91,7 +90,6 @@ class RuntimeConfigTests(unittest.TestCase):
             settings = runtime_config.ai_image_edit_settings()
 
         self.assertTrue(settings["enabled"])
-        self.assertEqual(settings["generator"], "kie")
         self.assertEqual(
             [item["id"] for item in settings["templates"]],
             [item["id"] for item in templates],

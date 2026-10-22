@@ -44,8 +44,7 @@ async def main() -> None:
                 recovered_ai["restored_prints"],
             )
         log.info(
-            "AI image edit: generator=%s templates=%d",
-            ai_settings["generator"],
+            "AI image edit: templates=%d",
             len(ai_settings["templates"]),
         )
     else:

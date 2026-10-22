@@ -1,7 +1,5 @@
 import io
-import json
 import unittest
-from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from types import SimpleNamespace
@@ -10,7 +8,6 @@ from unittest.mock import AsyncMock, patch
 from PIL import Image
 
 import ai_flow
-import kie_api
 import print_flow
 import print_jobs
 import telegram_print
@@ -43,21 +40,21 @@ class AiCaptionTests(unittest.TestCase):
         with Image.open(io.BytesIO(ai_flow._print_ready_jpeg(image_bytes()))) as result:
             self.assertEqual(result.size, print_jobs.LANDSCAPE_PRINT_SIZE)
 
-    def test_kie_aspect_uses_portrait_only_for_vertical_sources(self):
+    def test_output_size_uses_portrait_only_for_vertical_sources(self):
         for size, expected in (
-            ((640, 480), "3:2"),
-            ((640, 640), "3:2"),
-            ((480, 640), "2:3"),
+            ((640, 480), "1536x1024"),
+            ((640, 640), "1536x1024"),
+            ((480, 640), "1024x1536"),
         ):
             with self.subTest(size=size):
                 source = image_bytes(size)
-                prepared, suffix, aspect = ai_flow._prepare_kie_input(
+                prepared, suffix, output_size = ai_flow._prepare_input(
                     source,
                     ".jpg",
                 )
                 self.assertEqual(prepared, source)
                 self.assertEqual(suffix, ".jpg")
-                self.assertEqual(aspect, expected)
+                self.assertEqual(output_size, expected)
 
 
 class AiUploadTests(unittest.IsolatedAsyncioTestCase):
@@ -142,7 +139,6 @@ class AiUploadTests(unittest.IsolatedAsyncioTestCase):
             "ai_flow.runtime_config.ai_image_edit_settings",
             return_value={
                 "enabled": True,
-                "generator": "kie",
                 "templates": templates,
             },
         ), patch(
@@ -170,54 +166,8 @@ class AiUploadTests(unittest.IsolatedAsyncioTestCase):
 
 
 class AiWorkerTests(unittest.IsolatedAsyncioTestCase):
-    async def test_kie_job_is_submitted_once_and_task_id_is_persisted(self):
-        job_id = "b" * 32
-        job = {
-            "job_id": job_id,
-            "event_name": "event",
-            "source_suffix": ".jpg",
-            "prompt": "Prompt",
-            "provider_task_id": None,
-        }
-        with TemporaryDirectory() as tmpdir, patch.object(
-            ai_flow,
-            "AI_JOBS_ROOT",
-            Path(tmpdir),
-        ), patch(
-            "ai_flow.event_access.current_event",
-            return_value=("event", "token", False),
-        ), patch(
-            "ai_flow.kie_api.upload_image",
-            AsyncMock(return_value="https://files.test/source.jpg"),
-        ), patch(
-            "ai_flow.kie_api.create_image_task",
-            AsyncMock(return_value="task-123"),
-        ) as create_task, patch(
-            "ai_flow.database.mark_ai_image_job_submitted",
-            AsyncMock(return_value={"outcome": "submitted"}),
-        ) as submitted, patch(
-            "ai_flow._fail_worker_job",
-            AsyncMock(),
-        ) as failed:
-            ai_flow._save_source(job_id, ".jpg", image_bytes())
-            await ai_flow._process_job(job)
-
-        create_task.assert_awaited_once_with(
-            prompt="Prompt",
-            input_url="https://files.test/source.jpg",
-            aspect_ratio="3:2",
-        )
-        submitted.assert_awaited_once_with(
-            job_id=job_id,
-            provider_task_id="task-123",
-            poll_seconds=kie_api.KIE_TASK_POLL_SECONDS,
-            timeout_seconds=kie_api.KIE_TASK_TIMEOUT_SECONDS,
-        )
-        failed.assert_not_awaited()
-
-    async def test_successful_kie_poll_delivers_print_ready_result(self):
-        job_id = "c" * 32
-        job = {
+    def job(self, job_id: str) -> dict:
+        return {
             "job_id": job_id,
             "event_name": "event",
             "conversation_id": "123",
@@ -228,10 +178,10 @@ class AiWorkerTests(unittest.IsolatedAsyncioTestCase):
             "prompt": "Prompt",
             "provider": "telegram",
             "provider_user_id": "123",
-            "provider_task_id": "task-123",
-            "provider_deadline_at": datetime.now(timezone.utc)
-            + timedelta(minutes=5),
         }
+
+    async def test_generated_image_is_delivered_print_ready(self):
+        job_id = "c" * 32
         with TemporaryDirectory() as tmpdir, patch.object(
             ai_flow,
             "AI_JOBS_ROOT",
@@ -240,17 +190,9 @@ class AiWorkerTests(unittest.IsolatedAsyncioTestCase):
             "ai_flow.event_access.current_event",
             return_value=("event", "token", False),
         ), patch(
-            "ai_flow.kie_api.get_task_details",
-            AsyncMock(return_value={
-                "state": "success",
-                "resultJson": json.dumps({
-                    "resultUrls": ["https://files.test/result.png"],
-                }),
-            }),
-        ), patch(
-            "ai_flow.kie_api.download_result",
-            AsyncMock(return_value=image_bytes()),
-        ), patch(
+            "ai_flow.image_api.edit_image",
+            AsyncMock(return_value=image_bytes((1536, 1024))),
+        ) as edit_image, patch(
             "ai_flow.database.mark_ai_image_job_ready",
             AsyncMock(return_value={"outcome": "ready"}),
         ), patch(
@@ -263,31 +205,19 @@ class AiWorkerTests(unittest.IsolatedAsyncioTestCase):
             "ai_flow._fail_worker_job",
             AsyncMock(),
         ) as failed:
-            await ai_flow._process_job(job)
+            ai_flow._save_source(job_id, ".jpg", image_bytes())
+            await ai_flow._process_job(self.job(job_id))
             result = ai_flow._load_result(job_id, ".jpg")
 
+        self.assertEqual(edit_image.await_args.kwargs["prompt"], "Prompt")
+        self.assertEqual(edit_image.await_args.kwargs["size"], "1536x1024")
         with Image.open(io.BytesIO(result)) as image:
             self.assertEqual(image.size, print_jobs.LANDSCAPE_PRINT_SIZE)
         send_photo.assert_awaited_once()
         failed.assert_not_awaited()
 
-    async def test_truncated_kie_result_is_retried_instead_of_failed(self):
+    async def test_broken_generated_image_fails_the_job(self):
         job_id = "d" * 32
-        job = {
-            "job_id": job_id,
-            "event_name": "event",
-            "conversation_id": "123",
-            "source_suffix": ".jpg",
-            "result_suffix": None,
-            "template_id": "effect",
-            "template_label": "Effect",
-            "prompt": "Prompt",
-            "provider": "telegram",
-            "provider_user_id": "123",
-            "provider_task_id": "task-123",
-            "provider_deadline_at": datetime.now(timezone.utc)
-            + timedelta(minutes=5),
-        }
         with TemporaryDirectory() as tmpdir, patch.object(
             ai_flow,
             "AI_JOBS_ROOT",
@@ -296,15 +226,7 @@ class AiWorkerTests(unittest.IsolatedAsyncioTestCase):
             "ai_flow.event_access.current_event",
             return_value=("event", "token", False),
         ), patch(
-            "ai_flow.kie_api.get_task_details",
-            AsyncMock(return_value={
-                "state": "success",
-                "resultJson": json.dumps({
-                    "resultUrls": ["https://files.test/result.png"],
-                }),
-            }),
-        ), patch(
-            "ai_flow.kie_api.download_result",
+            "ai_flow.image_api.edit_image",
             AsyncMock(return_value=truncated_png_bytes()),
         ), patch(
             "ai_flow.database.mark_ai_image_job_ready",
@@ -313,60 +235,11 @@ class AiWorkerTests(unittest.IsolatedAsyncioTestCase):
             "ai_flow._fail_worker_job",
             AsyncMock(),
         ) as failed:
-            await ai_flow._process_job(job)
+            ai_flow._save_source(job_id, ".jpg", image_bytes())
+            await ai_flow._process_job(self.job(job_id))
 
         mark_ready.assert_not_awaited()
-        failed.assert_not_awaited()
-        self.assertFalse((Path(tmpdir) / job_id / "result.jpg").exists())
-
-    async def test_failed_kie_download_sends_link_near_expiry(self):
-        job_id = "e" * 32
-        job = {
-            "job_id": job_id,
-            "event_name": "event",
-            "conversation_id": "123",
-            "source_suffix": ".jpg",
-            "result_suffix": None,
-            "template_id": "effect",
-            "template_label": "Effect",
-            "prompt": "Prompt",
-            "provider": "telegram",
-            "provider_user_id": "123",
-            "provider_task_id": "task-123",
-            "provider_deadline_at": datetime.now(timezone.utc)
-            + timedelta(seconds=30),
-        }
-        with TemporaryDirectory() as tmpdir, patch.object(
-            ai_flow,
-            "AI_JOBS_ROOT",
-            Path(tmpdir),
-        ), patch(
-            "ai_flow.event_access.current_event",
-            return_value=("event", "token", False),
-        ), patch(
-            "ai_flow.kie_api.get_task_details",
-            AsyncMock(return_value={
-                "state": "success",
-                "resultJson": json.dumps({
-                    "resultUrls": ["https://files.test/result.png"],
-                }),
-            }),
-        ), patch(
-            "ai_flow.kie_api.download_result",
-            AsyncMock(return_value=truncated_png_bytes()),
-        ), patch(
-            "ai_flow.database.fail_ai_image_job",
-            AsyncMock(),
-        ) as mark_failed, patch(
-            "ai_flow.messenger_delivery.send_text",
-            AsyncMock(),
-        ) as send_text:
-            await ai_flow._process_job(job)
-
-        mark_failed.assert_awaited_once()
-        self.assertIn("Отправлена ссылка", mark_failed.await_args.kwargs["last_error"])
-        send_text.assert_awaited_once()
-        self.assertIn("https://files.test/result.png", send_text.await_args.args[1])
+        failed.assert_awaited_once()
 
 
 class AiAdapterRoutingTests(unittest.IsolatedAsyncioTestCase):

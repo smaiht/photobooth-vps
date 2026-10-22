@@ -9,7 +9,6 @@ import logging
 import re
 import uuid
 from dataclasses import dataclass, field
-from datetime import datetime, timezone, timedelta
 from pathlib import Path
 from typing import Awaitable, Callable, Protocol
 
@@ -17,7 +16,7 @@ from PIL import Image, ImageOps
 
 import database
 import event_access
-import kie_api
+import image_api
 import messenger_delivery
 import print_flow
 import print_jobs
@@ -164,8 +163,8 @@ def _delete_job_files(job_id: str) -> None:
     job_dir.rmdir()
 
 
-def _prepare_kie_input(payload: bytes, suffix: str) -> tuple[bytes, str, str]:
-    """Return an upload under 10 MB and its print-oriented aspect ratio."""
+def _prepare_input(payload: bytes, suffix: str) -> tuple[bytes, str, str]:
+    """Return an upload under 10 MB and its print-oriented output size."""
     if not isinstance(payload, bytes) or not payload:
         raise ValueError("AI source is empty")
     if not SUFFIX_RE.fullmatch(str(suffix or "")):
@@ -175,18 +174,21 @@ def _prepare_kie_input(payload: bytes, suffix: str) -> tuple[bytes, str, str]:
             raise ValueError("изображение слишком большое")
         oriented = ImageOps.exif_transpose(source)
         try:
-            aspect_ratio = "3:2" if oriented.width >= oriented.height else "2:3"
-            if len(payload) <= kie_api.KIE_INPUT_MAX_BYTES:
-                return payload, suffix, aspect_ratio
+            size = "1536x1024" if oriented.width >= oriented.height else "1024x1536"
+            if (
+                suffix.lower() in image_api.IMAGE_INPUT_SUFFIXES
+                and len(payload) <= image_api.IMAGE_INPUT_MAX_BYTES
+            ):
+                return payload, suffix, size
         finally:
             if oriented is not source:
                 oriented.close()
 
     encoded, _quality, _max_edge = print_media.compress_jpeg(
         payload,
-        max_bytes=kie_api.KIE_INPUT_MAX_BYTES,
+        max_bytes=image_api.IMAGE_INPUT_MAX_BYTES,
     )
-    return encoded, ".jpg", aspect_ratio
+    return encoded, ".jpg", size
 
 
 def _print_ready_jpeg(payload: bytes) -> bytes:
@@ -653,43 +655,8 @@ async def _fail_worker_job(job: dict, exc: Exception) -> None:
     await _notify_failed_job(job)
 
 
-async def _send_link_fallback(job: dict, url: str, reason: str) -> None:
-    job_id = job["job_id"]
-    log.warning(
-        "AI image job %s sending link as fallback. reason=%s",
-        job_id,
-        reason,
-    )
-    await database.fail_ai_image_job(
-        job_id=job_id,
-        last_error=f"Отправлена ссылка: {reason}",
-    )
-    await asyncio.to_thread(_delete_job_files, job_id)
-    message = (
-        "🤖 Не удалось обработать ваше изображение, но его можно скачать по ссылке:\n"
-        f"{url}"
-    )
-    try:
-        await messenger_delivery.send_text(
-            ReplyTarget(job["provider"], job["conversation_id"]),
-            message,
-        )
-    except Exception:
-        log.exception("Could not send AI fallback link for job=%s", job_id)
-
-
-async def _finish_job(job: dict, generated: bytes, result_url: str) -> None:
-    try:
-        result = await asyncio.to_thread(_print_ready_jpeg, generated)
-    except (OSError, SyntaxError) as exc:
-        is_expiring = job["provider_deadline_at"] - datetime.now(
-            timezone.utc
-        ) < timedelta(minutes=1)
-        raise kie_api.KieApiError(
-            f"Kie result download: изображение повреждено ({len(generated)} bytes)",
-            retryable=not is_expiring,
-            result_url=result_url,
-        ) from exc
+async def _finish_job(job: dict, generated: bytes) -> None:
+    result = await asyncio.to_thread(_print_ready_jpeg, generated)
     await asyncio.to_thread(_save_result, job["job_id"], result)
     ready = await database.mark_ai_image_job_ready(
         job_id=job["job_id"],
@@ -713,72 +680,30 @@ async def _finish_job(job: dict, generated: bytes, result_url: str) -> None:
     )
 
 
-async def _submit_kie_job(job: dict) -> None:
+async def _generate_job(job: dict) -> None:
     source = await asyncio.to_thread(
         _load_source,
         job["job_id"],
         job["source_suffix"],
     )
-    upload_payload, upload_suffix, aspect_ratio = await asyncio.to_thread(
-        _prepare_kie_input,
+    upload_payload, upload_suffix, size = await asyncio.to_thread(
+        _prepare_input,
         source,
         job["source_suffix"],
     )
-    if len(upload_payload) != len(source):
-        log.info(
-            "Kie input compressed job=%s %.1f -> %.1f MB",
-            job["job_id"],
-            len(source) / 1048576,
-            len(upload_payload) / 1048576,
-        )
-    source_url = await kie_api.upload_image(
+    log.info(
+        "AI image generation started job=%s size=%s input=%.1f MB",
+        job["job_id"],
+        size,
+        len(upload_payload) / 1048576,
+    )
+    generated = await image_api.edit_image(
         upload_payload,
         filename=f"{job['job_id']}{upload_suffix}",
-    )
-    task_id = await kie_api.create_image_task(
         prompt=job["prompt"],
-        input_url=source_url,
-        aspect_ratio=aspect_ratio,
+        size=size,
     )
-    submitted = await database.mark_ai_image_job_submitted(
-        job_id=job["job_id"],
-        provider_task_id=task_id,
-        poll_seconds=kie_api.KIE_TASK_POLL_SECONDS,
-        timeout_seconds=kie_api.KIE_TASK_TIMEOUT_SECONDS,
-    )
-    if submitted.get("outcome") != "submitted":
-        await asyncio.to_thread(_delete_job_files, job["job_id"])
-        return
-    await asyncio.to_thread(
-        _delete_source,
-        job["job_id"],
-        job["source_suffix"],
-    )
-    log.info(
-        "Kie image task submitted job=%s task=%s",
-        job["job_id"],
-        task_id,
-    )
-
-
-async def _poll_kie_job(job: dict) -> None:
-    deadline = job.get("provider_deadline_at")
-    if not isinstance(deadline, datetime):
-        raise RuntimeError("Kie task has no deadline")
-    if deadline <= datetime.now(timezone.utc):
-        raise RuntimeError("Kie generation timed out")
-    task_id = str(job.get("provider_task_id") or "").strip()
-    if not task_id:
-        raise RuntimeError("Kie task id is missing")
-    details = await kie_api.get_task_details(task_id)
-    result_url = kie_api.task_result_url(details)
-    if result_url is None:
-        return
-    generated = await kie_api.download_result(
-        result_url,
-        max_bytes=print_media.MAX_PRINT_FILE_SIZE,
-    )
-    await _finish_job(job, generated, result_url)
+    await _finish_job(job, generated)
 
 
 async def _process_job(job: dict) -> None:
@@ -786,25 +711,9 @@ async def _process_job(job: dict) -> None:
         current_event_name, _token, _cafe = event_access.current_event()
         if job["event_name"] != current_event_name:
             raise RuntimeError("мероприятие изменилось до начала AI-обработки")
-        if job.get("provider_task_id"):
-            await _poll_kie_job(job)
-        else:
-            await _submit_kie_job(job)
+        await _generate_job(job)
     except asyncio.CancelledError:
         raise
-    except kie_api.KieApiError as exc:
-        if exc.retryable:
-            log_message = "AI image job will be retried job=%s: %s"
-            if job.get("provider_task_id"):
-                log_message = "Kie poll will retry job=%s task=%s: %s"
-                log.warning(log_message, job["job_id"], job["provider_task_id"], exc)
-            else:
-                log.warning(log_message, job["job_id"], exc)
-            return
-        if exc.result_url:
-            await _send_link_fallback(job, exc.result_url, str(exc))
-        else:
-            await _fail_worker_job(job, exc)
     except Exception as exc:
         await _fail_worker_job(job, exc)
 
@@ -826,7 +735,7 @@ async def recover_interrupted_jobs() -> dict:
 
 
 async def worker_loop() -> None:
-    """Process local work and poll only provider tasks that are due."""
+    """Generate queued jobs one by one and deliver finished results."""
     while True:
         _worker_wakeup.clear()
         try:
@@ -834,9 +743,7 @@ async def worker_loop() -> None:
             if undelivered is not None:
                 await _deliver_recovered_result(undelivered)
                 continue
-            job = await database.claim_next_ai_image_job(
-                poll_seconds=kie_api.KIE_TASK_POLL_SECONDS,
-            )
+            job = await database.claim_next_ai_image_job()
             if job is not None:
                 await _process_job(job)
                 continue

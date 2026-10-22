@@ -1232,17 +1232,11 @@ def _ai_image_job_from_row(row) -> dict:
         "username": row[12],
         "first_name": row[13],
         "last_name": row[14],
-        "provider_task_id": row[15],
-        "next_poll_at": row[16],
-        "provider_deadline_at": row[17],
     }
 
 
-async def claim_next_ai_image_job(*, poll_seconds: int) -> dict | None:
-    """Claim one new or due AI job without blocking another worker."""
-    poll_seconds = int(poll_seconds)
-    if poll_seconds <= 0:
-        raise ValueError("poll_seconds must be positive")
+async def claim_next_ai_image_job() -> dict | None:
+    """Claim one queued AI job without blocking another worker."""
     connection = await _connect()
     async with connection:
         cursor = await connection.execute(
@@ -1251,22 +1245,12 @@ async def claim_next_ai_image_job(*, poll_seconds: int) -> dict | None:
                 SELECT id
                 FROM ai_image_jobs
                 WHERE status = 'queued'
-                   OR (
-                        status = 'processing'
-                        AND provider_task_id IS NOT NULL
-                        AND next_poll_at <= now()
-                   )
-                ORDER BY COALESCE(next_poll_at, queued_at, created_at), created_at
+                ORDER BY COALESCE(queued_at, created_at), created_at
                 FOR UPDATE SKIP LOCKED
                 LIMIT 1
             ), claimed AS (
                 UPDATE ai_image_jobs AS jobs
-                SET status = 'processing',
-                    processing_at = COALESCE(jobs.processing_at, now()),
-                    next_poll_at = CASE
-                        WHEN jobs.provider_task_id IS NULL THEN jobs.next_poll_at
-                        ELSE now() + make_interval(secs => %s)
-                    END
+                SET status = 'processing', processing_at = now()
                 FROM candidate
                 WHERE jobs.id = candidate.id
                 RETURNING jobs.*
@@ -1277,51 +1261,13 @@ async def claim_next_ai_image_job(*, poll_seconds: int) -> dict | None:
                 claimed.source_suffix, claimed.result_suffix,
                 claimed.template_id, claimed.template_label, claimed.prompt,
                 bot_users.provider, bot_users.provider_user_id,
-                bot_users.username, bot_users.first_name, bot_users.last_name,
-                claimed.provider_task_id, claimed.next_poll_at,
-                claimed.provider_deadline_at
+                bot_users.username, bot_users.first_name, bot_users.last_name
             FROM claimed
             JOIN bot_users ON bot_users.id = claimed.user_id
-            """,
-            (poll_seconds,),
+            """
         )
         row = await cursor.fetchone()
         return _ai_image_job_from_row(row) if row is not None else None
-
-
-async def mark_ai_image_job_submitted(
-    *,
-    job_id: str | uuid.UUID,
-    provider_task_id: str,
-    poll_seconds: int,
-    timeout_seconds: int,
-) -> dict:
-    job_id = _uuid_text(job_id, "job_id")
-    provider_task_id = _required_text(provider_task_id, "provider_task_id")
-    poll_seconds = int(poll_seconds)
-    timeout_seconds = int(timeout_seconds)
-    if poll_seconds <= 0 or timeout_seconds <= 0:
-        raise ValueError("AI task timing must be positive")
-    connection = await _connect()
-    async with connection:
-        cursor = await connection.execute(
-            """
-            UPDATE ai_image_jobs
-            SET provider_task_id = %s,
-                next_poll_at = now() + make_interval(secs => %s),
-                provider_deadline_at = now() + make_interval(secs => %s)
-            WHERE id = %s
-              AND status = 'processing'
-              AND provider_task_id IS NULL
-            RETURNING id::text
-            """,
-            (provider_task_id, poll_seconds, timeout_seconds, job_id),
-        )
-        row = await cursor.fetchone()
-        return {
-            "outcome": "submitted" if row is not None else "inactive",
-            "job_id": _uuid_hex(row[0] if row is not None else job_id, "job_id"),
-        }
 
 
 async def mark_ai_image_job_ready(
@@ -1336,8 +1282,7 @@ async def mark_ai_image_job_ready(
         cursor = await connection.execute(
             """
             UPDATE ai_image_jobs
-            SET status = 'ready', result_suffix = %s, ready_at = now(),
-                next_poll_at = NULL
+            SET status = 'ready', result_suffix = %s, ready_at = now()
             WHERE id = %s AND status = 'processing'
             RETURNING id::text
             """,
@@ -1361,9 +1306,7 @@ async def next_undelivered_ai_image_job() -> dict | None:
                 jobs.source_suffix, jobs.result_suffix,
                 jobs.template_id, jobs.template_label, jobs.prompt,
                 bot_users.provider, bot_users.provider_user_id,
-                bot_users.username, bot_users.first_name, bot_users.last_name,
-                jobs.provider_task_id, jobs.next_poll_at,
-                jobs.provider_deadline_at
+                bot_users.username, bot_users.first_name, bot_users.last_name
             FROM ai_image_jobs AS jobs
             JOIN bot_users ON bot_users.id = jobs.user_id
             WHERE jobs.status = 'ready' AND jobs.delivered_at IS NULL
@@ -1405,7 +1348,7 @@ async def fail_ai_image_job(
             """
             UPDATE ai_image_jobs
             SET status = 'failed', last_error = %s, closed_at = now(),
-                close_reason = 'processing_failed', next_poll_at = NULL
+                close_reason = 'processing_failed'
             WHERE id = %s AND status IN (
                 'receiving',
                 'awaiting_template',
@@ -1568,7 +1511,7 @@ async def restore_ai_image_job_ready(
 
 
 async def recover_interrupted_ai_image_jobs() -> dict:
-    """Resume provider polling and recover only work safe to repeat."""
+    """Fail interrupted generation and recover only work safe to repeat."""
     connection = await _connect()
     async with connection:
         async with connection.transaction():
@@ -1590,9 +1533,8 @@ async def recover_interrupted_ai_image_jobs() -> dict:
                 UPDATE ai_image_jobs
                 SET status = 'failed', closed_at = now(),
                     close_reason = 'vps_restarted',
-                    last_error = 'VPS restarted while submitting the AI task'
+                    last_error = 'VPS restarted while generating the AI image'
                 WHERE status = 'processing'
-                  AND provider_task_id IS NULL
                 RETURNING id::text
                 """
             )

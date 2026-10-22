@@ -76,12 +76,6 @@ def ai_image_edit_settings() -> dict:
             "config_vps.json: ai_image_edit.enabled must be true or false"
         )
 
-    generator = settings.get("generator")
-    if generator != "kie":
-        raise RuntimeError(
-            "config_vps.json: ai_image_edit.generator must be 'kie'"
-        )
-
     raw_templates = settings.get("templates")
     if not isinstance(raw_templates, list):
         raise RuntimeError(
@@ -127,7 +121,6 @@ def ai_image_edit_settings() -> dict:
         )
     return {
         "enabled": enabled,
-        "generator": generator,
         "templates": tuple(templates),
     }
 
