@@ -165,8 +165,14 @@ def print_choice_message(*, telegram_html: bool) -> str:
     )
 
 
+RETRY_HINT = "Попробуйте ещё раз. Если ошибка повторяется, напишите администратору."
+
+
 def rejected_photo_message(error: Exception | str) -> str:
-    return f"❌ Фото не принято: {error}"
+    """ValueError is a problem with the photo itself; anything else is technical."""
+    if isinstance(error, ValueError):
+        return f"❌ Фото не принято: {error}"
+    return f"❌ Фото не принято: {error}\n{RETRY_HINT}"
 
 
 def admin_request_text(

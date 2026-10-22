@@ -290,7 +290,39 @@ async def get_updates(
         ) from None
 
 
+class TransportError(RuntimeError):
+    pass
+
+
 async def download_file(
+    session: aiohttp.ClientSession,
+    base: str,
+    file_id: str,
+    *,
+    max_size: int,
+) -> bytes:
+    """Download one Telegram file, retrying only network failures."""
+    for attempt in range(1, delivery_retry.MAX_ATTEMPTS + 1):
+        try:
+            return await _download_file_once(
+                session,
+                base,
+                file_id,
+                max_size=max_size,
+            )
+        except TransportError as exc:
+            if attempt >= delivery_retry.MAX_ATTEMPTS:
+                raise
+            log.warning(
+                "TG download retry attempt=%d/%d error=%s",
+                attempt,
+                delivery_retry.MAX_ATTEMPTS,
+                exc,
+            )
+            await delivery_retry.wait_before_retry(attempt)
+
+
+async def _download_file_once(
     session: aiohttp.ClientSession,
     base: str,
     file_id: str,
@@ -307,7 +339,7 @@ async def download_file(
             if response.status != 200 or not body.get("ok"):
                 raise RuntimeError("Telegram не отдал файл")
     except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
-        raise RuntimeError(
+        raise TransportError(
             f"Telegram getFile transport error ({type(exc).__name__})"
         ) from None
     file_path = (body.get("result") or {}).get("file_path")
@@ -330,7 +362,7 @@ async def download_file(
                         f"файл больше {max_size // 1048576} МБ"
                     )
     except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
-        raise RuntimeError(
+        raise TransportError(
             f"Telegram file download transport error ({type(exc).__name__})"
         ) from None
     if not payload:

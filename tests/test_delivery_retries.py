@@ -235,17 +235,22 @@ class RetryPolicyTests(unittest.IsolatedAsyncioTestCase):
         )
 
         try:
-            await telegram_api.download_file(
-                session,
-                "https://api.telegram.org/botTEST_SECRET",
-                "file-id",
-                max_size=1024,
-            )
+            with patch(
+                "delivery_retry.wait_before_retry",
+                new_callable=AsyncMock,
+            ):
+                await telegram_api.download_file(
+                    session,
+                    "https://api.telegram.org/botTEST_SECRET",
+                    "file-id",
+                    max_size=1024,
+                )
         except RuntimeError as exc:
             rendered = "".join(traceback.format_exception(exc))
         else:
             self.fail("download_file should fail")
 
+        self.assertEqual(session.post.call_count, delivery_retry.MAX_ATTEMPTS)
         self.assertNotIn("TEST_SECRET", rendered)
 
     async def test_telegram_photo_rebuilds_multipart_for_retry(self):

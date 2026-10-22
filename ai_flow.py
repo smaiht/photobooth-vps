@@ -690,7 +690,7 @@ async def _notify_failed_job(job: dict) -> None:
     try:
         await messenger_delivery.send_text(
             ReplyTarget(job["provider"], job["conversation_id"]),
-            "❌ Не удалось обработать AI-фото. Пришлите его ещё раз.",
+            "❌ Не удалось обработать AI-фото.\n" + print_flow.RETRY_HINT,
         )
     except Exception:
         log.exception("Could not notify about failed AI job=%s", job["job_id"])
