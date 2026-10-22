@@ -382,6 +382,12 @@ async def route_message_update(
             await notify_admin(update, message, profile, print_upload=True)
         return
 
+    if not started and await vk_print.handle_ai_text(
+        session,
+        message,
+        profile=profile,
+    ):
+        return
     text = str(message.get("text") or "")
     if admin and (text.strip() or not started):
         await admin_command_service.handle_message(

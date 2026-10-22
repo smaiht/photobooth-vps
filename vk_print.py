@@ -275,6 +275,18 @@ def _ai_choice_keyboard(job_id: str, templates: tuple[dict, ...]) -> dict:
     buttons.append([{
         "action": {
             "type": "callback",
+            "label": ai_flow.CUSTOM_BUTTON,
+            "payload": _payload(
+                "ai_template",
+                ai_flow.CUSTOM_TEMPLATE_ID,
+                job_id,
+            ),
+        },
+        "color": "primary",
+    }])
+    buttons.append([{
+        "action": {
+            "type": "callback",
             "label": "❌ ОТМЕНА",
             "payload": _payload("ai_cancel", "cancel", job_id),
         },
@@ -626,3 +638,19 @@ async def handle_message(
         metadata=image.metadata,
     )
     return await print_flow.handle_upload(upload, ui)
+
+
+async def handle_ai_text(
+    session: aiohttp.ClientSession,
+    message: dict,
+    *,
+    profile: dict[str, str | None] | None = None,
+) -> bool:
+    text = str(message.get("text") or "").strip()
+    if not text or text.startswith("/"):
+        return False
+    return await ai_flow.handle_text(
+        user_from_message(message, profile=profile),
+        text,
+        VkPrintUI(session),
+    )

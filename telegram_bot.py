@@ -151,6 +151,8 @@ async def route_message_update(
         return
     if await telegram_print.handle_message(session, base, message):
         return
+    if await telegram_print.handle_ai_text(session, base, message):
+        return
 
     user_id = (message.get("from") or {}).get("id")
     if telegram_api.is_admin(user_id):

@@ -165,6 +165,58 @@ class AiUploadTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(ui.send_ai_choice.await_args.args[3], templates)
 
 
+class AiOwnPromptTests(unittest.IsolatedAsyncioTestCase):
+    async def test_text_becomes_prompt_only_after_own_prompt_button(self):
+        user = print_flow.PrintUser(
+            provider="telegram",
+            provider_user_id=123,
+            conversation_id=123,
+        )
+        job_id = "f" * 32
+        ui = SimpleNamespace(
+            send_text=AsyncMock(return_value=True),
+            acknowledge=AsyncMock(),
+        )
+        with patch(
+            "ai_flow.runtime_config.ai_image_edit_settings",
+            return_value={"enabled": True, "templates": ()},
+        ), patch(
+            "ai_flow.event_access.current_event",
+            return_value=("event", "token", False),
+        ), patch(
+            "ai_flow.print_flow.user_has_access",
+            AsyncMock(return_value=True),
+        ), patch(
+            "ai_flow.print_flow.ensure_user",
+            AsyncMock(return_value=1),
+        ), patch(
+            "ai_flow.database.queue_ai_image_job",
+            AsyncMock(return_value={"outcome": "queued"}),
+        ) as queue:
+            self.assertFalse(await ai_flow.handle_text(user, "спасибо", ui))
+            await ai_flow.handle_action(
+                ai_flow.AiAction(
+                    user=user,
+                    action="template",
+                    template_id=ai_flow.CUSTOM_TEMPLATE_ID,
+                    job_id=job_id,
+                ),
+                ui,
+            )
+            queue.assert_not_awaited()
+            self.assertTrue(
+                await ai_flow.handle_text(user, "сделай нас космонавтами", ui)
+            )
+            self.assertFalse(await ai_flow.handle_text(user, "ещё текст", ui))
+
+        queue.assert_awaited_once()
+        self.assertEqual(queue.await_args.kwargs["job_id"], job_id)
+        self.assertEqual(
+            queue.await_args.kwargs["prompt"],
+            "сделай нас космонавтами",
+        )
+
+
 class AiWorkerTests(unittest.IsolatedAsyncioTestCase):
     def job(self, job_id: str) -> dict:
         return {

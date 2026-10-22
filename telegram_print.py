@@ -189,6 +189,9 @@ class TelegramPrintUI:
                 }]
                 for template in templates
             ] + [[{
+                "text": ai_flow.CUSTOM_BUTTON,
+                "callback_data": f"ai:t:{ai_flow.CUSTOM_TEMPLATE_ID}:{job_id}",
+            }], [{
                 "text": "❌ ОТМЕНА",
                 "callback_data": f"ai:c:{job_id}",
             }]],
@@ -344,6 +347,21 @@ async def handle_message(
         if handled:
             return True
     return await print_flow.handle_upload(upload, ui)
+
+
+async def handle_ai_text(
+    session: aiohttp.ClientSession,
+    base: str,
+    message: dict,
+) -> bool:
+    text = str(message.get("text") or "").strip()
+    if not text or text.startswith("/"):
+        return False
+    return await ai_flow.handle_text(
+        user_from_message(message),
+        text,
+        TelegramPrintUI(session, base),
+    )
 
 
 def _action_user(callback: dict) -> print_flow.PrintUser:

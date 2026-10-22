@@ -95,7 +95,7 @@ def ai_image_edit_settings() -> dict:
             raise RuntimeError(
                 f"{prefix}.id must match {AI_TEMPLATE_ID_RE.pattern}"
             )
-        if template_id in {"cancel", "print"}:
+        if template_id in {"cancel", "print", "custom"}:
             raise RuntimeError(f"{prefix}.id is reserved")
         if template_id in seen_ids:
             raise RuntimeError(f"{prefix}.id is duplicated")

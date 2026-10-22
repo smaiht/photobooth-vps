@@ -34,8 +34,13 @@ SUFFIX_RE = re.compile(r"^\.[a-z0-9]{1,10}$")
 RESULT_SUFFIX = ".jpg"
 WORKER_FALLBACK_SECONDS = 5
 
+CUSTOM_TEMPLATE_ID = "custom"
+CUSTOM_BUTTON = "✏️ СВОЁ"
+
 _worker_wakeup = asyncio.Event()
 _actions_in_progress: set[str] = set()
+# (provider, user id) -> job waiting for the user's own prompt text.
+_custom_prompt_jobs: dict[tuple[str, str], str] = {}
 
 
 @dataclass(frozen=True)
@@ -408,56 +413,109 @@ async def _handle_cancel(action: AiAction, ui: AiUI) -> bool:
     return True
 
 
+def _user_key(user: print_flow.PrintUser) -> tuple[str, str]:
+    return user.provider, str(user.provider_user_id)
+
+
+async def _queue_job(
+    user: print_flow.PrintUser,
+    job_id: str,
+    *,
+    template_id: str,
+    template_label: str,
+    prompt: str,
+) -> str | None:
+    """Queue the job and return None, or the reason it was not queued."""
+    settings = runtime_config.ai_image_edit_settings()
+    if not settings["enabled"]:
+        return "AI-обработка сейчас отключена"
+    event_name, event_token, cafe_mode = event_access.current_event()
+    if not await print_flow.user_has_access(
+        user,
+        event_token=event_token,
+        cafe_mode=cafe_mode,
+    ):
+        return print_flow.EVENT_ACCESS_REQUIRED_MESSAGE
+    database_user_id = await print_flow.ensure_user(user)
+    result = await database.queue_ai_image_job(
+        job_id=job_id,
+        user_id=database_user_id,
+        current_event_name=event_name,
+        template_id=template_id,
+        template_label=template_label,
+        prompt=prompt,
+    )
+    outcome = result.get("outcome")
+    if outcome == "not_owner":
+        return "Выбрать может только отправитель"
+    if outcome == "event_changed":
+        return "Мероприятие уже изменилось"
+    if outcome != "queued":
+        return "Это AI-задание уже неактивно"
+    _worker_wakeup.set()
+    return None
+
+
 async def _handle_template(action: AiAction, ui: AiUI) -> bool:
+    if action.template_id == CUSTOM_TEMPLATE_ID:
+        _custom_prompt_jobs[_user_key(action.user)] = action.job_id
+        await _safe_ack(ui, action, "Напишите, что сделать с фото")
+        await _safe_send_text(
+            ui,
+            action.user,
+            "✏️ Напишите одним сообщением, что сделать с фото.",
+        )
+        return True
     template = _template_by_id(str(action.template_id or ""))
     if template is None:
         await _safe_ack(ui, action, "Этот эффект больше недоступен", alert=True)
         return True
-    settings = runtime_config.ai_image_edit_settings()
-    if not settings["enabled"]:
-        await _safe_ack(ui, action, "AI-обработка сейчас отключена", alert=True)
-        return True
-
-    event_name, event_token, cafe_mode = event_access.current_event()
-    if not await print_flow.user_has_access(
+    error = await _queue_job(
         action.user,
-        event_token=event_token,
-        cafe_mode=cafe_mode,
-    ):
-        await _safe_ack(
-            ui,
-            action,
-            print_flow.EVENT_ACCESS_REQUIRED_MESSAGE,
-            alert=True,
-        )
-        return True
-    database_user_id = await print_flow.ensure_user(action.user)
-    result = await database.queue_ai_image_job(
-        job_id=action.job_id,
-        user_id=database_user_id,
-        current_event_name=event_name,
+        action.job_id,
         template_id=template["id"],
         template_label=template["button"],
         prompt=template["prompt"],
     )
-    outcome = result.get("outcome")
-    if outcome == "not_owner":
-        await _safe_ack(ui, action, "Выбрать может только отправитель", alert=True)
+    if error:
+        await _safe_ack(ui, action, error, alert=True)
         return True
-    if outcome == "event_changed":
-        await _safe_ack(ui, action, "Мероприятие уже изменилось", alert=True)
-        return True
-    if outcome != "queued":
-        await _safe_ack(ui, action, "Это AI-задание уже неактивно", alert=True)
-        return True
-
-    _worker_wakeup.set()
+    _custom_prompt_jobs.pop(_user_key(action.user), None)
     await _safe_ack(ui, action, "AI-эффект выбран")
     await _safe_update(
         ui,
         action,
         f"⏳ Выбран эффект «{template['button']}». Обрабатываем фото…",
     )
+    return True
+
+
+async def handle_text(user: print_flow.PrintUser, text: str, ui: AiUI) -> bool:
+    """Use a text message as the prompt after the user pressed the own-prompt button."""
+    job_id = _custom_prompt_jobs.pop(_user_key(user), None)
+    if job_id is None:
+        return False
+    try:
+        error = await _queue_job(
+            user,
+            job_id,
+            template_id=CUSTOM_TEMPLATE_ID,
+            template_label=CUSTOM_BUTTON,
+            prompt=text,
+        )
+    except Exception as exc:
+        log.exception("AI own prompt failed job=%s", job_id)
+        error = f"AI временно недоступен: {exc}"
+    if error:
+        await _safe_send_text(ui, user, f"❌ {error}")
+        return True
+    log.info(
+        "%s AI own prompt queued job=%s user=%s",
+        user.provider.upper(),
+        job_id,
+        user.provider_user_id,
+    )
+    await _safe_send_text(ui, user, "⏳ Обрабатываем фото по вашему описанию…")
     return True
 
 
