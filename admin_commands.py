@@ -108,7 +108,10 @@ def _parse_event(
     except ValueError as exc:
         raise ValueError("В начале названия указана неверная дата") from exc
     event_access.validate_configuration()
-    return "set_event", {"name": name}
+    return "set_event", {
+        "name": name,
+        "guest_links": event_access.guest_links(name),
+    }
 
 
 def _parse_unblock(argument: str | None) -> ParsedCommand:

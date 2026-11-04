@@ -498,12 +498,13 @@ class EventSwitchTests(unittest.IsolatedAsyncioTestCase):
             "GROUP_USERNAME",
             "photobooth_vk",
         ):
-            self.assertEqual(
-                admin_commands.parse(
-                    "/event   2026-08-17   Свадьба   Ивановых  "
-                ),
-                ("set_event", {"name": "2026-08-17 Свадьба Ивановых"}),
+            command, data = admin_commands.parse(
+                "/event   2026-08-17   Свадьба   Ивановых  "
             )
+            self.assertEqual(command, "set_event")
+            self.assertEqual(data["name"], "2026-08-17 Свадьба Ивановых")
+            self.assertEqual(
+                data["guest_links"], event_access.guest_links(data["name"]))
         self.assertEqual(
             admin_commands.parse("/event Кафе"),
             ("set_event", {"name": "Кафе"}),
