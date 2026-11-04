@@ -334,8 +334,9 @@ async def handle_message(
         download=download,
     )
     ui = TelegramPrintUI(session, base)
-    if ai_flow.is_ai_caption(message.get("caption")):
-        handled = await ai_flow.handle_upload(
+    caption = str(message.get("caption") or "").strip()
+    if caption:
+        return await ai_flow.handle_upload(
             ai_flow.AiUpload(
                 user=user,
                 suffix=suffix,
@@ -343,9 +344,8 @@ async def handle_message(
                 download=download,
             ),
             ui,
+            caption=caption,
         )
-        if handled:
-            return True
     return await print_flow.handle_upload(upload, ui)
 
 

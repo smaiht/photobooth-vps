@@ -238,7 +238,7 @@ async def reply_for_current_event(
 
     if has_access:
         text = (
-            "✅ VK-бот подключён. Отправьте фотографию, чтобы напечатать её."
+            f"✅ VK-бот подключён.\n\n{print_flow.PHOTO_INSTRUCTIONS}"
             if cafe_mode
             else print_flow.connected_event_message(event_name)
         )

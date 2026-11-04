@@ -618,8 +618,9 @@ async def handle_message(
         return await download_image(session, image)
 
     ui = VkPrintUI(session)
-    if ai_flow.is_ai_caption(message.get("text")):
-        handled = await ai_flow.handle_upload(
+    caption = str(message.get("text") or "").strip()
+    if caption:
+        return await ai_flow.handle_upload(
             ai_flow.AiUpload(
                 user=user,
                 suffix=image.suffix,
@@ -627,9 +628,8 @@ async def handle_message(
                 download=download,
             ),
             ui,
+            caption=caption,
         )
-        if handled:
-            return True
     upload = print_flow.PrintUpload(
         user=user,
         suffix=image.suffix,

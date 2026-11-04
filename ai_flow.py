@@ -27,7 +27,6 @@ from messaging import ReplyTarget
 
 log = logging.getLogger(__name__)
 
-AI_CAPTIONS = frozenset({"ai", "ии", "изменить"})
 AI_JOBS_ROOT = Path(__file__).resolve().parent / "ai_pending_jobs"
 JOB_ID_RE = re.compile(r"^[a-f0-9]{32}$")
 SUFFIX_RE = re.compile(r"^\.[a-z0-9]{1,10}$")
@@ -85,11 +84,6 @@ class AiUI(Protocol):
     ) -> None: ...
 
     async def update_choice(self, action: AiAction, text: str) -> None: ...
-
-
-def is_ai_caption(value: object) -> bool:
-    """Recognize only the three explicit captions that opt into AI editing."""
-    return isinstance(value, str) and value.strip().casefold() in AI_CAPTIONS
 
 
 def valid_template_id(value: object) -> bool:
@@ -179,7 +173,7 @@ def _prepare_input(payload: bytes, suffix: str) -> tuple[bytes, str, str]:
             raise ValueError("изображение слишком большое")
         oriented = ImageOps.exif_transpose(source)
         try:
-            size = "1536x1024" if oriented.width >= oriented.height else "1024x1536"
+            size = "1536x1024" if oriented.width > oriented.height else "1024x1536"
             if (
                 suffix.lower() in image_api.IMAGE_INPUT_SUFFIXES
                 and len(payload) <= image_api.IMAGE_INPUT_MAX_BYTES
@@ -196,7 +190,7 @@ def _prepare_input(payload: bytes, suffix: str) -> tuple[bytes, str, str]:
     return encoded, ".jpg", size
 
 
-def _print_ready_jpeg(payload: bytes) -> bytes:
+def _print_ready_jpeg(payload: bytes, target_size: tuple[int, int]) -> bytes:
     """Turn any generated raster into one exact 10x15 print image."""
     with Image.open(io.BytesIO(payload)) as source:
         if source.width * source.height > print_jobs.MAX_PRINT_PIXELS:
@@ -216,11 +210,6 @@ def _print_ready_jpeg(payload: bytes) -> bytes:
                 oriented.close()
 
     try:
-        target_size = (
-            print_jobs.LANDSCAPE_PRINT_SIZE
-            if rgb.width > rgb.height
-            else print_jobs.PORTRAIT_PRINT_SIZE
-        )
         fitted = ImageOps.fit(
             rgb,
             target_size,
@@ -280,16 +269,14 @@ async def _safe_update(ui: AiUI, action: AiAction, text: str) -> None:
         log.exception("Could not update AI choice job=%s", action.job_id)
 
 
-async def handle_upload(upload: AiUpload, ui: AiUI) -> bool:
-    """Store one explicitly requested source and show every configured preset."""
+async def handle_upload(upload: AiUpload, ui: AiUI, *, caption: str) -> bool:
+    """Use a photo caption as a prompt, or show presets for a bare «ИИ»."""
     user = upload.user
     job_id = uuid.uuid4().hex
     job_created = False
     try:
         event_name, event_token, cafe_mode = event_access.current_event()
         privileged = user.is_admin or user.allowlisted
-        if cafe_mode and not privileged:
-            return False
 
         settings = runtime_config.ai_image_edit_settings()
         if not settings["enabled"]:
@@ -356,6 +343,19 @@ async def handle_upload(upload: AiUpload, ui: AiUI) -> bool:
             )
         preview = await asyncio.to_thread(print_media.jpeg_preview, payload)
         await asyncio.to_thread(_save_source, job_id, upload.suffix, payload)
+        if caption.strip().casefold() != "ии":
+            error = await _queue_job(
+                user,
+                job_id,
+                template_id=CUSTOM_TEMPLATE_ID,
+                template_label=CUSTOM_BUTTON,
+                prompt=caption.strip(),
+                expected_status="receiving",
+            )
+            if error:
+                raise ValueError(error)
+            await _safe_send_text(ui, user, "⏳ Фото в очереди на AI-обработку…")
+            return True
         choice_message_id = await ui.send_ai_choice(
             upload,
             preview,
@@ -424,6 +424,7 @@ async def _queue_job(
     template_id: str,
     template_label: str,
     prompt: str,
+    expected_status: str = "awaiting_template",
 ) -> str | None:
     """Queue the job and return None, or the reason it was not queued."""
     settings = runtime_config.ai_image_edit_settings()
@@ -444,6 +445,7 @@ async def _queue_job(
         template_id=template_id,
         template_label=template_label,
         prompt=prompt,
+        expected_status=expected_status,
     )
     outcome = result.get("outcome")
     if outcome == "not_owner":
@@ -672,7 +674,10 @@ async def _deliver_result(job: dict) -> None:
     )
     preview = await asyncio.to_thread(print_media.jpeg_preview, payload)
     target = ReplyTarget(job["provider"], job["conversation_id"])
-    caption = f"✅ Готово: {job['template_label']}"
+    caption = (
+        "✅ Готово!" if job["template_id"] == CUSTOM_TEMPLATE_ID
+        else f"✅ Готово: {job['template_label']}"
+    )
     delivered = await messenger_delivery.send_photo(
         target,
         preview,
@@ -713,8 +718,10 @@ async def _fail_worker_job(job: dict, exc: Exception) -> None:
     await _notify_failed_job(job)
 
 
-async def _finish_job(job: dict, generated: bytes) -> None:
-    result = await asyncio.to_thread(_print_ready_jpeg, generated)
+async def _finish_job(
+    job: dict, generated: bytes, target_size: tuple[int, int],
+) -> None:
+    result = await asyncio.to_thread(_print_ready_jpeg, generated, target_size)
     await asyncio.to_thread(_save_result, job["job_id"], result)
     ready = await database.mark_ai_image_job_ready(
         job_id=job["job_id"],
@@ -755,13 +762,25 @@ async def _generate_job(job: dict) -> None:
         size,
         len(upload_payload) / 1048576,
     )
+    landscape = size == "1536x1024"
+    orientation = "landscape, 3:2" if landscape else "portrait, 2:3"
+    prompt = (
+        f"{job['prompt']}\n\n"
+        f"Create a {orientation} image for a 10x15 cm photo print. "
+        "Fill the frame and keep important details away from the edges, "
+        "which may be slightly cropped for printing."
+    )
     generated = await image_api.edit_image(
         upload_payload,
         filename=f"{job['job_id']}{upload_suffix}",
-        prompt=job["prompt"],
+        prompt=prompt,
         size=size,
     )
-    await _finish_job(job, generated)
+    target_size = (
+        print_jobs.LANDSCAPE_PRINT_SIZE if landscape
+        else print_jobs.PORTRAIT_PRINT_SIZE
+    )
+    await _finish_job(job, generated, target_size)
 
 
 async def _process_job(job: dict) -> None:

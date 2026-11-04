@@ -10,7 +10,7 @@
         "vk": true
     },
     "ai_image_edit": {
-        "_comment": "Outside cafe mode, a photo enters this flow only when its caption is exactly AI, ИИ or изменить. In cafe mode AI is available only to admins and allowlisted users. IMAGE_API_KEY stays in .env. Source orientation automatically selects 1536x1024 or 1024x1536.",
+        "_comment": "A photo with text starts AI; exactly ИИ opens the effect menu. AI is available in cafe mode too. IMAGE_API_KEY stays in .env. Landscape sources use 1536x1024; vertical and square sources use 1024x1536.",
         "enabled": true,
         "templates": [
             {

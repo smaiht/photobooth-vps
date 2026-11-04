@@ -256,10 +256,15 @@ class SharedPrintFlowTests(unittest.IsolatedAsyncioTestCase):
         incoming, _download = upload(owner, (461, 310))
         ui = FakeUI()
         job_id = "b" * 32
+
+        async def submit_after_notice(**_kwargs):
+            ui.send_text.assert_any_await(owner, print_flow.PRINT_SENDING_MESSAGE)
+            return "e" * 32
+
         with patch.object(print_flow.uuid, "uuid4") as uuid4, patch.object(
             print_flow,
             "submit_print_job",
-            AsyncMock(return_value="e" * 32),
+            AsyncMock(side_effect=submit_after_notice),
         ) as submit:
             uuid4.return_value.hex = job_id
             self.assertTrue(await print_flow.handle_upload(incoming, ui))
@@ -279,7 +284,7 @@ class SharedPrintFlowTests(unittest.IsolatedAsyncioTestCase):
                 ),
                 call(
                     owner,
-                    "✅ Ваше фото добавлено в очередь и скоро будет распечатано.",
+                    print_flow.PRINT_SENDING_MESSAGE,
                 ),
             ],
         )
@@ -303,8 +308,30 @@ class SharedPrintFlowTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(metadata["print_choice"], "automatic_near_ratio")
         self.assertEqual(
             ui.send_text.await_args_list[-1],
-            call(owner, "✅ Ваше фото добавлено в очередь и скоро будет распечатано."),
+            call(owner, print_flow.PRINT_SENDING_MESSAGE),
         )
+
+    async def test_ai_result_uses_fill_and_awaits_booth_confirmation(self):
+        owner = user("telegram", 322, allowlisted=False)
+        incoming = print_flow.PrintUpload(
+            user=owner,
+            suffix=".jpg",
+            download=AsyncMock(return_value=image_payload((461, 310))),
+            metadata={"ai_image_job_id": "a" * 32},
+        )
+        ui = FakeUI()
+        self.claim_choice.return_value = {
+            "outcome": "authorized", "authorization_kind": "event",
+        }
+        with patch.object(
+            print_flow, "submit_print_job", AsyncMock(return_value="e" * 32),
+        ) as submit:
+            self.assertTrue(await print_flow.handle_upload(incoming, ui))
+
+        ui.send_choice.assert_not_awaited()
+        self.assertEqual(self.claim_choice.await_args.kwargs["print_mode"], "fill")
+        self.assertEqual(submit.await_args.kwargs["metadata"]["print_mode"], "fill")
+        self.assertEqual(ui.send_text.await_args_list[-1].args[1], print_flow.PRINT_SENDING_MESSAGE)
 
     async def test_near_ratio_cafe_request_shows_fill_to_admins(self):
         print_flow.event_access.current_event.return_value = ("Кафе", None, True)
@@ -396,7 +423,7 @@ class SharedPrintFlowTests(unittest.IsolatedAsyncioTestCase):
         )
         ui.send_text.assert_awaited_once_with(
             owner,
-            "✅ Ваше фото добавлено в очередь и скоро будет распечатано.",
+            print_flow.PRINT_SENDING_MESSAGE,
         )
 
     async def test_choice_is_rejected_for_another_user(self):
@@ -775,7 +802,10 @@ class SharedPrintFlowTests(unittest.IsolatedAsyncioTestCase):
                 action,
                 "✅ Решение администратора: печать разрешена.",
             )
-            notify.assert_not_awaited()
+            notify.assert_awaited_once_with(
+                ReplyTarget("vk", 4321),
+                f"✅ Оплата подтверждена.\n\n{print_flow.PRINT_SENDING_MESSAGE}",
+            )
             self.send_admin_status.assert_not_awaited()
             tasks = tuple(print_flow._background_tasks)
             self.assertEqual(len(tasks), 1)
@@ -790,12 +820,11 @@ class SharedPrintFlowTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(dispatch.await_args.kwargs["job_id"], job_id)
         notify.assert_awaited_once_with(
             ReplyTarget("vk", 4321),
-            "✅ Оплата подтверждена. Ваше фото добавлено в очередь "
-            "и скоро будет распечатано.",
+            f"✅ Оплата подтверждена.\n\n{print_flow.PRINT_SENDING_MESSAGE}",
         )
         self.send_admin_status.assert_awaited_once()
         final_status = self.send_admin_status.await_args.args[0]
-        self.assertIn("✅ Фото отправлено на печать.", final_status)
+        self.assertIn("⏳ Фото отправлено на фотобудку.", final_status)
         self.assertIn("Мероприятие: «Кафе»", final_status)
         self.assertIn(f"Job: {job_id}", final_status)
         self.assertIn("Пользователь: Иван Иванов (@vk_guest)", final_status)
@@ -859,10 +888,19 @@ class SharedPrintFlowTests(unittest.IsolatedAsyncioTestCase):
             action,
             "✅ Решение администратора: печать разрешена.",
         )
-        notify.assert_awaited_once_with(
-            ReplyTarget("telegram", 123),
-            "❌ Не удалось передать фото на печать. "
-            "Обратитесь к администратору.",
+        self.assertEqual(
+            notify.await_args_list,
+            [
+                call(
+                    ReplyTarget("telegram", 123),
+                    f"✅ Оплата подтверждена.\n\n{print_flow.PRINT_SENDING_MESSAGE}",
+                ),
+                call(
+                    ReplyTarget("telegram", 123),
+                    "❌ Не удалось передать фото на печать. "
+                    "Обратитесь к администратору.",
+                ),
+            ],
         )
         self.send_admin_status.assert_awaited_once()
         final_status = self.send_admin_status.await_args.args[0]

@@ -1,5 +1,6 @@
 import json
 import unittest
+from datetime import datetime, timedelta, timezone
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import admin_command_service
@@ -1333,7 +1334,7 @@ class LogDeliveryTests(unittest.IsolatedAsyncioTestCase):
 
 
 class PrintCommandResponseTests(unittest.IsolatedAsyncioTestCase):
-    async def test_success_updates_queue_without_duplicate_user_message(self):
+    async def test_success_updates_queue_before_notifying_user(self):
         command_id = "a" * 32
         response = {
             "status": "ok",
@@ -1350,18 +1351,63 @@ class PrintCommandResponseTests(unittest.IsolatedAsyncioTestCase):
             "status": "queued",
             "command_id": command_id,
         }
+        marked = False
+
+        async def mark(*, command_id):
+            nonlocal marked
+            marked = True
+            return queued
+
+        async def send(target, text):
+            self.assertTrue(marked)
+            self.assertEqual(target, ReplyTarget("telegram", 123))
+            self.assertEqual(text, "✅ Фото добавлено в очередь на печать.")
+            return True
+
         with patch.object(
             control_response_service.database,
             "mark_print_job_queued",
-            AsyncMock(return_value=queued),
+            AsyncMock(side_effect=mark),
         ) as mark_queued, patch(
             "control_response_service.messenger_delivery.send_text",
-            new_callable=AsyncMock,
+            AsyncMock(side_effect=send),
         ) as send_text:
             self.assertTrue(await control_response_service.handle(response))
 
         mark_queued.assert_awaited_once_with(command_id=command_id)
-        send_text.assert_not_awaited()
+        send_text.assert_awaited_once()
+
+    async def test_guest_confirmation_retries_after_delivery_failure(self):
+        command_id = "a" * 32
+        response = {
+            "status": "ok",
+            "command": "print_image",
+            "command_id": command_id,
+            "message": "Фото добавлено в очередь на печать.",
+            "reply_target": {"provider": "telegram", "conversation_id": "123"},
+        }
+        transition = {"status": "queued", "authorization_kind": "event"}
+        mark = AsyncMock(side_effect=[
+            {"outcome": "queued", **transition},
+            {"outcome": "already_finished", **transition},
+        ])
+        send = AsyncMock(side_effect=[False, True])
+        with patch.object(control_response_service.database, "mark_print_job_queued", mark), \
+             patch.object(control_response_service.messenger_delivery, "send_text", send):
+            self.assertFalse(await control_response_service.handle(response))
+            self.assertTrue(await control_response_service.handle(response))
+
+        self.assertEqual(mark.await_count, 2)
+        self.assertEqual(send.await_count, 2)
+        minutes = (control_response_service.database.PRINT_COOLDOWN_SECONDS + 59) // 60
+        self.assertIn(f"{minutes} мин.", send.await_args.args[1])
+
+    async def test_delayed_confirmation_does_not_restart_guest_cooldown(self):
+        queued_at = datetime.now(timezone.utc) - timedelta(
+            seconds=control_response_service.database.PRINT_COOLDOWN_SECONDS + 1,
+        )
+        message = control_response_service.print_flow.print_queued_message("event", queued_at)
+        self.assertNotIn("Следующая печать", message)
 
     async def test_booth_error_is_still_reported_to_user(self):
         command_id = "b" * 32

@@ -119,6 +119,37 @@ class BotUserDatabaseTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(parameters, ("telegram", "123", "ev_token"))
 
 
+class AiJobDatabaseTests(unittest.IsolatedAsyncioTestCase):
+    async def test_photo_caption_queues_receiving_job_for_its_owner(self):
+        connection = FakeConnection((9, "event", "receiving"), None)
+        with patch("database._connect", AsyncMock(return_value=connection)):
+            result = await database.queue_ai_image_job(
+                job_id=JOB_ID,
+                user_id=9,
+                current_event_name="event",
+                template_id="custom",
+                template_label="Своё",
+                prompt="Сделай фон морем",
+                expected_status="receiving",
+            )
+        self.assertEqual(result["outcome"], "queued")
+        self.assertEqual(connection.executed[1][1][2], "Сделай фон морем")
+
+    async def test_effect_button_cannot_queue_a_job_still_receiving(self):
+        connection = FakeConnection((9, "event", "receiving"))
+        with patch("database._connect", AsyncMock(return_value=connection)):
+            result = await database.queue_ai_image_job(
+                job_id=JOB_ID,
+                user_id=9,
+                current_event_name="event",
+                template_id="effect",
+                template_label="Эффект",
+                prompt="Промпт",
+            )
+        self.assertEqual(result["outcome"], "inactive")
+        self.assertEqual(len(connection.executed), 1)
+
+
 class PrintJobDatabaseTests(unittest.IsolatedAsyncioTestCase):
     async def test_create_job_starts_processing_with_text_message_ids(self):
         connection = FakeConnection(None, (JOB_ID, "processing"))
@@ -243,9 +274,10 @@ class PrintJobDatabaseTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(connection.executed), 2)
 
     async def test_command_response_transitions_are_idempotent(self):
+        queued_at = object()
         dispatch_connection = FakeConnection((JOB_ID,))
-        queued_connection = FakeConnection((JOB_ID,))
-        duplicate_connection = FakeConnection(None, (JOB_ID, "queued"))
+        queued_connection = FakeConnection((JOB_ID, "event", queued_at))
+        duplicate_connection = FakeConnection(None, (JOB_ID, "queued", "event", queued_at))
         with patch(
             "database._connect",
             AsyncMock(side_effect=[
@@ -265,6 +297,8 @@ class PrintJobDatabaseTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(queued["outcome"], "queued")
         self.assertEqual(duplicate["outcome"], "already_finished")
         self.assertEqual(duplicate["status"], "queued")
+        self.assertEqual(queued["authorization_kind"], duplicate["authorization_kind"])
+        self.assertIs(queued["queued_at"], duplicate["queued_at"])
 
     async def test_admin_authorization_is_cafe_only_compare_and_set(self):
         row = (

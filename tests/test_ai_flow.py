@@ -27,23 +27,17 @@ def truncated_png_bytes(size=(640, 480)) -> bytes:
     return payload[: len(payload) // 2]
 
 
-class AiCaptionTests(unittest.TestCase):
-    def test_only_explicit_ai_captions_enable_the_flow(self):
-        for caption in ("AI", " ai ", "ИИ", "ии", "изменить", "ИЗМЕНИТЬ"):
-            with self.subTest(caption=caption):
-                self.assertTrue(ai_flow.is_ai_caption(caption))
-        for caption in (None, "", "/ai", "AI: poster", "измени фото", "print"):
-            with self.subTest(caption=caption):
-                self.assertFalse(ai_flow.is_ai_caption(caption))
-
+class AiImageTests(unittest.TestCase):
     def test_ai_result_has_an_exact_print_size(self):
-        with Image.open(io.BytesIO(ai_flow._print_ready_jpeg(image_bytes()))) as result:
+        with Image.open(io.BytesIO(ai_flow._print_ready_jpeg(
+            image_bytes(), print_jobs.LANDSCAPE_PRINT_SIZE,
+        ))) as result:
             self.assertEqual(result.size, print_jobs.LANDSCAPE_PRINT_SIZE)
 
-    def test_output_size_uses_portrait_only_for_vertical_sources(self):
+    def test_output_size_uses_portrait_for_square_and_vertical_sources(self):
         for size, expected in (
             ((640, 480), "1536x1024"),
-            ((640, 640), "1536x1024"),
+            ((640, 640), "1024x1536"),
             ((480, 640), "1024x1536"),
         ):
             with self.subTest(size=size):
@@ -58,7 +52,7 @@ class AiCaptionTests(unittest.TestCase):
 
 
 class AiUploadTests(unittest.IsolatedAsyncioTestCase):
-    async def test_cafe_guest_falls_back_to_normal_print_before_download(self):
+    async def test_cafe_guest_enters_ai_route(self):
         upload = ai_flow.AiUpload(
             user=print_flow.PrintUser(
                 provider="telegram",
@@ -74,12 +68,14 @@ class AiUploadTests(unittest.IsolatedAsyncioTestCase):
             return_value=("cafe", None, True),
         ), patch(
             "ai_flow.runtime_config.ai_image_edit_settings",
-        ) as settings:
-            handled = await ai_flow.handle_upload(upload, ui)
+            return_value={"enabled": False},
+        ):
+            handled = await ai_flow.handle_upload(upload, ui, caption="ИИ")
 
-        self.assertFalse(handled)
+        self.assertTrue(handled)
         upload.download.assert_not_awaited()
-        settings.assert_not_called()
+        ui.send_text.assert_awaited_once_with(
+            upload.user, "❌ AI-обработка сейчас отключена.")
 
     async def test_cafe_allowlisted_user_keeps_ai_route(self):
         upload = ai_flow.AiUpload(
@@ -100,7 +96,7 @@ class AiUploadTests(unittest.IsolatedAsyncioTestCase):
             "ai_flow.runtime_config.ai_image_edit_settings",
             return_value={"enabled": False},
         ):
-            handled = await ai_flow.handle_upload(upload, ui)
+            handled = await ai_flow.handle_upload(upload, ui, caption="ИИ")
 
         self.assertTrue(handled)
         ui.send_text.assert_awaited_once_with(
@@ -143,7 +139,7 @@ class AiUploadTests(unittest.IsolatedAsyncioTestCase):
             },
         ), patch(
             "ai_flow.event_access.current_event",
-            return_value=("event", "token", False),
+            return_value=("Кафе", None, True),
         ), patch(
             "ai_flow.print_flow.ensure_user",
             AsyncMock(return_value=1),
@@ -160,9 +156,49 @@ class AiUploadTests(unittest.IsolatedAsyncioTestCase):
             "ai_flow.database.mark_ai_image_job_awaiting_template",
             AsyncMock(return_value={"outcome": "awaiting_template"}),
         ):
-            self.assertTrue(await ai_flow.handle_upload(upload, ui))
+            self.assertTrue(await ai_flow.handle_upload(upload, ui, caption=" иИ "))
 
         self.assertEqual(ui.send_ai_choice.await_args.args[3], templates)
+
+    async def test_caption_is_queued_directly_without_the_effect_menu(self):
+        user = print_flow.PrintUser(
+            provider="vk", provider_user_id=123, conversation_id=123,
+        )
+        upload = ai_flow.AiUpload(
+            user=user, suffix=".jpg", download=AsyncMock(return_value=image_bytes()),
+        )
+        ui = SimpleNamespace(
+            send_text=AsyncMock(return_value=True),
+            send_ai_choice=AsyncMock(),
+        )
+        with TemporaryDirectory() as tmpdir, patch.object(
+            ai_flow, "AI_JOBS_ROOT", Path(tmpdir),
+        ), patch(
+            "ai_flow.runtime_config.ai_image_edit_settings",
+            return_value={"enabled": True, "templates": ()},
+        ), patch(
+            "ai_flow.event_access.current_event",
+            return_value=("event", "token", False),
+        ), patch(
+            "ai_flow.print_flow.ensure_user", AsyncMock(return_value=1),
+        ), patch(
+            "ai_flow.print_flow.user_has_access", AsyncMock(return_value=True),
+        ), patch(
+            "ai_flow.database.create_ai_image_job",
+            AsyncMock(return_value={"outcome": "created", "stale_job_ids": []}),
+        ) as create_job, patch(
+            "ai_flow.database.queue_ai_image_job",
+            AsyncMock(return_value={"outcome": "queued"}),
+        ) as queue:
+            for caption in ("AI", "изменить", "Сделай фон морем"):
+                with self.subTest(caption=caption):
+                    self.assertTrue(await ai_flow.handle_upload(
+                        upload, ui, caption=caption))
+                    self.assertEqual(queue.await_args.kwargs["prompt"], caption)
+                    self.assertEqual(queue.await_args.kwargs["expected_status"], "receiving")
+
+        ui.send_ai_choice.assert_not_awaited()
+        self.assertFalse(create_job.await_args.kwargs["bypass_cooldown"])
 
 
 class AiOwnPromptTests(unittest.IsolatedAsyncioTestCase):
@@ -261,12 +297,42 @@ class AiWorkerTests(unittest.IsolatedAsyncioTestCase):
             await ai_flow._process_job(self.job(job_id))
             result = ai_flow._load_result(job_id, ".jpg")
 
-        self.assertEqual(edit_image.await_args.kwargs["prompt"], "Prompt")
+        self.assertTrue(edit_image.await_args.kwargs["prompt"].startswith("Prompt\n"))
+        self.assertIn("landscape, 3:2", edit_image.await_args.kwargs["prompt"])
         self.assertEqual(edit_image.await_args.kwargs["size"], "1536x1024")
         with Image.open(io.BytesIO(result)) as image:
             self.assertEqual(image.size, print_jobs.LANDSCAPE_PRINT_SIZE)
         send_photo.assert_awaited_once()
         failed.assert_not_awaited()
+
+    async def test_square_source_produces_portrait_even_if_api_returns_landscape(self):
+        job_id = "e" * 32
+        with TemporaryDirectory() as tmpdir, patch.object(
+            ai_flow, "AI_JOBS_ROOT", Path(tmpdir),
+        ), patch(
+            "ai_flow.event_access.current_event", return_value=("event", "token", False),
+        ), patch(
+            "ai_flow.image_api.edit_image",
+            AsyncMock(return_value=image_bytes((640, 480))),
+        ) as edit_image, patch(
+            "ai_flow.database.mark_ai_image_job_ready",
+            AsyncMock(return_value={"outcome": "ready"}),
+        ), patch(
+            "ai_flow.database.mark_ai_image_job_delivered", AsyncMock(),
+        ), patch(
+            "ai_flow.messenger_delivery.send_photo", AsyncMock(return_value=True),
+        ) as send_photo:
+            ai_flow._save_source(job_id, ".jpg", image_bytes((640, 640)))
+            job = self.job(job_id)
+            job["template_id"] = ai_flow.CUSTOM_TEMPLATE_ID
+            await ai_flow._process_job(job)
+            result = ai_flow._load_result(job_id, ".jpg")
+
+        self.assertEqual(edit_image.await_args.kwargs["size"], "1024x1536")
+        self.assertIn("portrait, 2:3", edit_image.await_args.kwargs["prompt"])
+        self.assertEqual(send_photo.await_args.args[2], "✅ Готово!")
+        with Image.open(io.BytesIO(result)) as image:
+            self.assertEqual(image.size, print_jobs.PORTRAIT_PRINT_SIZE)
 
     async def test_broken_generated_image_fails_the_job(self):
         job_id = "d" * 32
@@ -317,13 +383,14 @@ class AiAdapterRoutingTests(unittest.IsolatedAsyncioTestCase):
             ))
 
         ai_upload.assert_awaited_once()
+        self.assertEqual(ai_upload.await_args.kwargs["caption"], "ИИ")
         print_upload.assert_not_awaited()
 
     async def test_vk_ai_caption_bypasses_normal_print(self):
         message = {
             "from_id": 123,
             "peer_id": 123,
-            "text": "изменить",
+            "text": "Сделай фон морем",
             "attachments": [{
                 "type": "photo",
                 "photo": {
@@ -347,7 +414,42 @@ class AiAdapterRoutingTests(unittest.IsolatedAsyncioTestCase):
             self.assertTrue(await vk_print.handle_message(object(), message))
 
         ai_upload.assert_awaited_once()
+        self.assertEqual(ai_upload.await_args.kwargs["caption"], message["text"])
         print_upload.assert_not_awaited()
+
+    async def test_plain_photo_in_each_messenger_keeps_the_print_route(self):
+        messages = (
+            (telegram_print, {
+                "message_id": 7,
+                "from": {"id": 123},
+                "chat": {"id": 123},
+                "caption": "  ",
+                "photo": [{"file_id": "photo", "file_size": 100}],
+            }),
+            (vk_print, {
+                "from_id": 123,
+                "peer_id": 123,
+                "text": "",
+                "attachments": [{"type": "photo", "photo": {
+                    "id": 1, "owner_id": 2,
+                    "sizes": [{"width": 640, "height": 480,
+                               "url": "https://vk.test/photo.jpg"}],
+                }}],
+            }),
+        )
+        for module, message in messages:
+            with self.subTest(provider=module.__name__), patch.object(
+                ai_flow, "handle_upload", AsyncMock(),
+            ) as ai_upload, patch.object(
+                print_flow, "handle_upload", AsyncMock(return_value=True),
+            ) as print_upload:
+                if module is telegram_print:
+                    handled = await module.handle_message(object(), "https://tg.test", message)
+                else:
+                    handled = await module.handle_message(object(), message)
+                self.assertTrue(handled)
+                ai_upload.assert_not_awaited()
+                print_upload.assert_awaited_once()
 
 
 if __name__ == "__main__":

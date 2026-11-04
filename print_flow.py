@@ -5,10 +5,12 @@ from __future__ import annotations
 import asyncio
 import html
 import logging
+import math
 import re
 import time
 import uuid
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from typing import Awaitable, Callable, Protocol
 
 import admin_notifications
@@ -143,11 +145,34 @@ def mode_text(mode: str) -> str:
     raise ValueError("неизвестный вариант печати")
 
 
+PHOTO_INSTRUCTIONS = (
+    "Отправьте фото, чтобы его распечатать.\n\n"
+    "Или отправьте фото с описанием, чтобы ИИ отредактировал его перед печатью. "
+    "Например: «Сделай меня на обложке журнала».\n\n"
+    "Или фото с подписью «ИИ», чтобы выбрать эффект."
+)
+
+
 def connected_event_message(event_name: str) -> str:
-    return (
-        f'✅ Вы подключены к мероприятию «{event_name}». '
-        "Теперь можно отправить фотографию."
-    )
+    return f'✅ Вы подключены к мероприятию «{event_name}».\n\n{PHOTO_INSTRUCTIONS}'
+
+
+PRINT_SENDING_MESSAGE = "⏳ Отправляем фото на фотобудку. Дождитесь подтверждения."
+
+
+def print_queued_message(
+    authorization_kind: str | None,
+    queued_at: datetime | None = None,
+) -> str:
+    message = "✅ Фото добавлено в очередь на печать."
+    if authorization_kind == "event":
+        seconds = database.PRINT_COOLDOWN_SECONDS
+        if queued_at is not None:
+            seconds -= math.floor((datetime.now(timezone.utc) - queued_at).total_seconds())
+        if seconds > 0:
+            minutes = (seconds + 59) // 60
+            message += f"\n\nСледующая печать будет доступна через {minutes} мин."
+    return message
 
 
 def print_choice_message(*, telegram_html: bool) -> str:
@@ -527,12 +552,15 @@ async def handle_upload(upload: PrintUpload, ui: PrintUI) -> bool:
             preview=preview,
         )
 
-        if preview.auto_mode is not None:
-            mode = preview.auto_mode
+        ai_result = bool(upload.metadata.get("ai_image_job_id"))
+        if preview.auto_mode is not None or ai_result:
+            mode = "fill" if ai_result else preview.auto_mode
             metadata.update({
                 "print_mode": mode,
                 "print_choice": (
-                    "automatic_exact_ratio"
+                    "automatic_ai_fill"
+                    if ai_result
+                    else "automatic_exact_ratio"
                     if preview.exact_ratio
                     else "automatic_near_ratio"
                 ),
@@ -594,6 +622,7 @@ async def handle_upload(upload: PrintUpload, ui: PrintUI) -> bool:
                 )
                 raise ValueError(_claim_error(claim))
 
+            await _safe_send_text(ui, user, PRINT_SENDING_MESSAGE)
             command_id = await submit_print_job(
                 job_id=job_id,
                 external_user_id=user.provider_user_id,
@@ -601,11 +630,6 @@ async def handle_upload(upload: PrintUpload, ui: PrintUI) -> bool:
                 payload=payload,
                 metadata=metadata,
                 reply_target=user.target,
-            )
-            await _safe_send_text(
-                ui,
-                user,
-                "✅ Ваше фото добавлено в очередь и скоро будет распечатано.",
             )
             log.info(
                 "%s print job sent without choice job=%s user=%s mode=%s command=%s",
@@ -896,6 +920,7 @@ async def handle_choice(action: PrintAction, ui: PrintUI) -> bool:
                 print_choice=f"{user.provider}_button",
                 print_selected_at=time.time(),
             )
+            await _safe_send_text(ui, user, PRINT_SENDING_MESSAGE)
             command_id = await submit_print_job(
                 job_id=job_id,
                 external_user_id=user.provider_user_id,
@@ -914,11 +939,6 @@ async def handle_choice(action: PrintAction, ui: PrintUI) -> bool:
             )
             return True
 
-        await _safe_send_text(
-            ui,
-            user,
-            "✅ Ваше фото добавлено в очередь и скоро будет распечатано.",
-        )
         await _delete_pending(job_id)
         log.info(
             "%s print choice submitted job=%s user=%s mode=%s command=%s",
@@ -1016,6 +1036,10 @@ async def _dispatch_admin_approved(result: dict) -> None:
             or result.get("user_provider_user_id")
             or metadata["sender_id"]
         )
+        await _notify_target(
+            result,
+            f"✅ Оплата подтверждена.\n\n{PRINT_SENDING_MESSAGE}",
+        )
         command_id = await submit_print_job(
             job_id=job_id,
             external_user_id=external_user_id,
@@ -1049,15 +1073,10 @@ async def _dispatch_admin_approved(result: dict) -> None:
 
     await asyncio.gather(
         _delete_pending(job_id),
-        _notify_target(
-            result,
-            "✅ Оплата подтверждена. Ваше фото добавлено в очередь "
-            "и скоро будет распечатано.",
-        ),
         _notify_admins(
             admin_job_result_text(
                 result,
-                "✅ Фото отправлено на печать.",
+                "⏳ Фото отправлено на фотобудку.",
                 metadata=metadata,
             ),
             job_id=job_id,

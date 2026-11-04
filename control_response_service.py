@@ -11,6 +11,7 @@ import admin_notifications
 import database
 import event_access
 import messenger_delivery
+import print_flow
 import runtime_config
 import yadisk_poll
 from messaging import ReplyTarget
@@ -51,7 +52,7 @@ def _with_vps_event(text: str) -> str:
     return "\n".join(lines)
 
 
-async def _persist_print_result(response: dict) -> bool:
+async def _persist_print_result(response: dict) -> dict | None:
     try:
         if response.get("status") == "ok":
             transition = await database.mark_print_job_queued(
@@ -67,7 +68,7 @@ async def _persist_print_result(response: dict) -> bool:
     except Exception as exc:
         # Keep the durable response on Disk until the database transition lands.
         log.warning("Control: cannot persist print response: %s", exc)
-        return False
+        return None
 
     outcome = transition.get("outcome")
     expected = (
@@ -85,7 +86,7 @@ async def _persist_print_result(response: dict) -> bool:
             outcome,
             transition.get("status"),
         )
-    return expected
+    return transition if expected else None
 
 
 async def _activate_event(response: dict) -> tuple[str | None, str | None] | None:
@@ -307,11 +308,17 @@ async def handle(response: dict) -> bool:
     target = ReplyTarget.from_value(response.get("reply_target"))
 
     if response.get("command") == "print_image":
-        if not await _persist_print_result(response):
+        transition = await _persist_print_result(response)
+        if transition is None:
             return False
         if response.get("status") == "ok":
-            # The print flow acknowledged submission before the booth response.
-            return True
+            return await messenger_delivery.send_text(
+                target,
+                print_flow.print_queued_message(
+                    transition.get("authorization_kind"),
+                    transition.get("queued_at"),
+                ),
+            )
 
     if response["status"] == "ok" and response["command"] == "set_event":
         activation = await _activate_event(response)

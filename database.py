@@ -7,7 +7,7 @@ import uuid
 PROVIDERS = frozenset({"telegram", "vk", "max"})
 PRINT_MODES = frozenset({"fit", "fill"})
 PRINT_COOLDOWN_SECONDS = 5 * 60
-AI_COOLDOWN_SECONDS = 10 * 60
+AI_COOLDOWN_SECONDS = 5 * 60
 
 
 async def _connect():
@@ -888,7 +888,7 @@ async def mark_print_job_queued(*, command_id: str | uuid.UUID) -> dict:
             UPDATE print_jobs
             SET status = 'queued', queued_at = now(), closed_at = now()
             WHERE command_id = %s AND status = 'dispatching'
-            RETURNING id::text
+            RETURNING id::text, authorization_kind, queued_at
             """,
             (command_id,),
         )
@@ -899,6 +899,8 @@ async def mark_print_job_queued(*, command_id: str | uuid.UUID) -> dict:
                 "job_id": row[0],
                 "status": "queued",
                 "command_id": command_id,
+                "authorization_kind": row[1],
+                "queued_at": row[2],
             }
         return await _command_transition_fallback(
             connection=connection,
@@ -949,7 +951,7 @@ async def _command_transition_fallback(
     requested_outcome: str,
 ) -> dict:
     cursor = await connection.execute(
-        "SELECT id::text, status FROM print_jobs WHERE command_id = %s",
+        "SELECT id::text, status, authorization_kind, queued_at FROM print_jobs WHERE command_id = %s",
         (command_id,),
     )
     row = await cursor.fetchone()
@@ -962,6 +964,8 @@ async def _command_transition_fallback(
         "job_id": row[0],
         "status": row[1],
         "command_id": command_id,
+        "authorization_kind": row[2],
+        "queued_at": row[3],
     }
 
 
@@ -1126,6 +1130,7 @@ async def queue_ai_image_job(
     template_id: str,
     template_label: str,
     prompt: str,
+    expected_status: str = "awaiting_template",
 ) -> dict:
     """Select a configured template and atomically place the job in the queue."""
     job_id = _uuid_text(job_id, "job_id")
@@ -1133,6 +1138,8 @@ async def queue_ai_image_job(
     template_id = _required_text(template_id, "template_id")
     template_label = _required_text(template_label, "template_label")
     prompt = _required_text(prompt, "prompt")
+    if expected_status not in {"receiving", "awaiting_template"}:
+        raise ValueError("invalid AI job source status")
     connection = await _connect()
     async with connection:
         async with connection.transaction():
@@ -1153,7 +1160,7 @@ async def queue_ai_image_job(
                 return {"outcome": "not_owner", "job_id": _uuid_hex(job_id, "job_id")}
             if event_name != current_event_name:
                 return {"outcome": "event_changed", "job_id": _uuid_hex(job_id, "job_id")}
-            if status != "awaiting_template":
+            if status != expected_status:
                 return {
                     "outcome": "inactive",
                     "job_id": _uuid_hex(job_id, "job_id"),

@@ -94,7 +94,7 @@ async def reply_to_start(
         return
     if allowed:
         text = (
-            "Отправьте фотографию, чтобы напечатать её."
+            print_flow.PHOTO_INSTRUCTIONS
             if cafe_mode
             else print_flow.connected_event_message(event_name)
         )
