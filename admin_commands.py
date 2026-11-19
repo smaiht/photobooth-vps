@@ -59,6 +59,7 @@ KNOWN_COMMANDS = {
     "/restart": "restart",
     "/event": "set_event",
     "/template": "set_template_pack",
+    "/charge": "flash_charge",
 }
 
 PRESET_NAME_RE = re.compile(r"^[a-z][a-z0-9_]{0,39}$")
@@ -68,6 +69,7 @@ _HELP_USAGE = {
     "/light": "/light <имя>",
     "/event": "/event <название>",
     "/template": "/template <pack>",
+    "/charge": "/charge on|off",
 }
 _GENERAL_HELP_COMMANDS = tuple(
     _HELP_USAGE.get(name, name) for name in KNOWN_COMMANDS
@@ -160,6 +162,13 @@ def _parse_template(argument: str | None) -> ParsedCommand:
     return "set_template_pack", {"name": name}
 
 
+def _parse_charge(argument: str | None) -> ParsedCommand:
+    value = (argument or "").strip().lower()
+    if value not in ("on", "off"):
+        raise ValueError("Использование: /charge on или /charge off")
+    return "flash_charge", {"on": value == "on"}
+
+
 def _parse_without_arguments(
     command: str,
     argument: str | None,
@@ -191,6 +200,8 @@ def parse(text: str) -> ParsedCommand | None:
         return _parse_light(argument)
     if known_command == "set_template_pack":
         return _parse_template(argument)
+    if known_command == "flash_charge":
+        return _parse_charge(argument)
     if known_command in (
         "clear_print_queue",
         "clear_photos",
@@ -257,6 +268,11 @@ def sent_message(command: str, data: dict | None) -> str:
             f"⏳ Переключаю template pack на {data['name']}; "
             "ожидаю подтверждение будки"
         )
+    if command == "flash_charge":
+        return (
+            f"⏳ Зарядка вспышки: {'ВКЛ' if data['on'] else 'ВЫКЛ'}; "
+            "ожидаю подтверждение будки"
+        )
     if command == "get_config":
         return "⏳ Запрашиваю конфиги фотобудки..."
     if command == "clear_print_queue":
@@ -276,6 +292,7 @@ def failed_message(command: str, error: Exception) -> str:
         "set_app_config": "Настройка приложения не отправлена",
         "set_camera_preset": "Пресет света не отправлен",
         "set_template_pack": "Template pack не переключён",
+        "flash_charge": "Команда зарядки не отправлена",
         "clear_print_queue": "Очистка очередей печати не отправлена",
         "clear_photos": "Очистка папки photos не отправлена",
         "clear_print_jobs": "Очистка папки photos_print_jobs не отправлена",
