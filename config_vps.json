@@ -14,14 +14,39 @@
         "enabled": true,
         "templates": [
             {
-                "id": "event_hero",
-                "button": "🌟 Я — ГЕРОЙ СОБЫТИЯ",
-                "prompt": "Preserve the recognizable identities, ages, facial features, skin tones and expressions of the main subjects in the foreground. Reimagine them in dynamic, glamorous superstar poses with high-fashion clothing, dramatic professional lighting, and an elegant premier event environment. Keep the overall look polished, flattering, and suitable for a premium 10x15 print. Do not generate any text, letters, logos or watermarks."
+                "id": "film_90s",
+                "button": "📸 ПЛЁНКА 90-Х",
+                "prompt": "Preserve the recognizable identities, ages, facial features, skin tones and expressions of the main subjects in the foreground. Turn the photo into an authentic candid 1990s party snapshot taken on a point-and-shoot 35mm film camera with a harsh direct on-camera flash: bright flash-lit faces, slightly darker background falloff, natural film grain, warm faded colors and a subtle light leak at one edge. Add a small orange digital camera date stamp in the bottom right corner. Keep clothing, hairstyles and setting believable for a fun 90s celebration. It must look like a real scanned film print, not a digital filter. Do not generate any other text, logos or watermarks."
             },
             {
                 "id": "poster",
                 "button": "🎬 ПОСТЕР / ОБЛОЖКА",
                 "prompt": "Preserve the recognizable identities, ages, facial features, skin tones and expressions of the main subjects in the foreground. Create a vibrant, festive magazine cover composition. Surround the main subjects with stylish, celebratory Russian text, catchy headlines, and typographic elements that complement their appearance and the holiday mood, wrapping around them beautifully like on a premium lifestyle or fashion magazine cover. Do not generate any unrelated watermarks or logos."
+            },
+            {
+                "id": "character",
+                "button": "🎭 Я — ПЕРСОНАЖ",
+                "prompt": "Preserve the recognizable identities, ages, facial features, skin tones and expressions of the main subjects in the foreground. Reimagine them as stylish, collectible toy dolls or action figures packaged inside a premium cardboard toy box with a clear, glossy transparent plastic front window. Arrange themed miniature toy accessories and cool props neatly inside the packaging beside them. The overall presentation should look like a mint-condition, professionally designed retail action figure blister pack."
+            },
+            {
+                "id": "anime",
+                "button": "🌿 АНИМЕ-СКАЗКА",
+                "prompt": "Preserve the recognizable identities, ages, facial features, skin tones and expressions of the main subjects in the foreground. Redraw the whole scene as a frame from a hand-painted Japanese animated feature film: soft watercolor-like painted backgrounds, lush nature details, warm gentle sunlight, clean expressive linework and a cozy storybook atmosphere. Keep every person clearly recognizable through face shape, hairstyle, clothing and expression. Do not generate any text, letters, logos or watermarks."
+            },
+            {
+                "id": "old_money",
+                "button": "💎 OLD MONEY",
+                "prompt": "Preserve the recognizable identities, ages, facial features, skin tones and expressions of the main subjects in the foreground. Restyle them as a quiet-luxury 'old money' editorial photoshoot: elegant tailored classic outfits in cream, navy, camel and white, pearls or a subtle classic wristwatch, neat polished hair, set on the sunlit terrace of a country estate or in a classic wood-paneled library. Soft natural daylight, refined muted color grading, a medium-format film look and relaxed confident poses. Do not generate any text, letters, logos or watermarks."
+            },
+            {
+                "id": "event_hero",
+                "button": "🌟 Я — ГЕРОЙ СОБЫТИЯ",
+                "prompt": "Preserve the recognizable identities, ages, facial features, skin tones and expressions of the main subjects in the foreground. Reimagine them in dynamic, glamorous superstar poses with high-fashion clothing, dramatic professional lighting, and an elegant premier event environment. Keep the overall look polished, flattering, and suitable for a premium 10x15 print. Do not generate any text, letters, logos or watermarks."
+            },
+            {
+                "id": "oil_portrait",
+                "button": "🎨 ПОРТРЕТ МАСЛОМ",
+                "prompt": "Preserve the recognizable identities, ages, facial features, skin tones and expressions of the main subjects in the foreground. Transform the photo into a museum-quality classical oil painting portrait in the manner of the Old Masters: rich chiaroscuro lighting, a dark warm background, visible brushstrokes and canvas texture, period aristocratic clothing with velvet, lace and gold details, and dignified poses. Faces must stay true to the originals. Do not generate any text, letters, logos, picture frames or watermarks."
             },
             {
                 "id": "era",
@@ -32,11 +57,6 @@
                 "id": "collector_card",
                 "button": "🃏 КОЛЛЕКЦИОННАЯ КАРТОЧКА",
                 "prompt": "Preserve the recognizable identities, ages, facial features, skin tones and expressions of the main subjects in the foreground. Reimagine them as characters on a stylish, premium fantasy or superhero collectible gaming card, complete with an elegant, thematic card border. Add minimal, humorous and witty Russian text, funny titles, or silly stat labels integrated seamlessly into the card design, matching the subjects' unique appearance and playful vibe."
-            },
-            {
-                "id": "character",
-                "button": "🎭 Я — ПЕРСОНАЖ",
-                "prompt": "Preserve the recognizable identities, ages, facial features, skin tones and expressions of the main subjects in the foreground. Reimagine them as stylish, collectible toy dolls or action figures packaged inside a premium cardboard toy box with a clear, glossy transparent plastic front window. Arrange themed miniature toy accessories and cool props neatly inside the packaging beside them. The overall presentation should look like a mint-condition, professionally designed retail action figure blister pack."
             },
             {
                 "id": "comic",

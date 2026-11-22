@@ -1399,8 +1399,7 @@ class PrintCommandResponseTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(mark.await_count, 2)
         self.assertEqual(send.await_count, 2)
-        minutes = (control_response_service.database.PRINT_COOLDOWN_SECONDS + 59) // 60
-        self.assertIn(f"{minutes} мин.", send.await_args.args[1])
+        self.assertIn("Следующая печать будет доступна через", send.await_args.args[1])
 
     async def test_delayed_confirmation_does_not_restart_guest_cooldown(self):
         queued_at = datetime.now(timezone.utc) - timedelta(

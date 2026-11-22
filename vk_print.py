@@ -15,12 +15,17 @@ import aiohttp
 import ai_flow
 import print_flow
 import print_media
+import runtime_config
 import vk_api
 
 
 log = logging.getLogger(__name__)
 
 SAFE_FILENAME_RE = re.compile(r"[\x00-\x1f\x7f]")
+# VK inline keyboards allow at most 6 rows and 10 buttons, so the AI menu
+# shows presets in pages: preset rows + navigation row + «СВОЁ»/«ОТМЕНА» row.
+AI_PAGE_SIZE = 4
+AI_PAGE_RE = re.compile(r"^[0-9]{1,2}$")
 
 
 @dataclass(frozen=True)
@@ -260,7 +265,18 @@ def _choice_keyboard(job_id: str) -> dict:
     }
 
 
-def _ai_choice_keyboard(job_id: str, templates: tuple[dict, ...]) -> dict:
+def _ai_page_count(templates: tuple[dict, ...]) -> int:
+    return max(1, -(-len(templates) // AI_PAGE_SIZE))
+
+
+def _ai_choice_keyboard(
+    job_id: str,
+    templates: tuple[dict, ...],
+    page: int = 0,
+) -> dict:
+    pages = _ai_page_count(templates)
+    page = min(max(0, int(page)), pages - 1)
+    start = page * AI_PAGE_SIZE
     buttons = [
         [{
             "action": {
@@ -270,28 +286,51 @@ def _ai_choice_keyboard(job_id: str, templates: tuple[dict, ...]) -> dict:
             },
             "color": "primary",
         }]
-        for template in templates
+        for template in templates[start:start + AI_PAGE_SIZE]
     ]
-    buttons.append([{
-        "action": {
-            "type": "callback",
-            "label": ai_flow.CUSTOM_BUTTON,
-            "payload": _payload(
-                "ai_template",
-                ai_flow.CUSTOM_TEMPLATE_ID,
-                job_id,
-            ),
+    navigation = []
+    if page > 0:
+        navigation.append({
+            "action": {
+                "type": "callback",
+                "label": "◀ НАЗАД",
+                "payload": _payload("ai_page", str(page - 1), job_id),
+            },
+            "color": "secondary",
+        })
+    if page < pages - 1:
+        navigation.append({
+            "action": {
+                "type": "callback",
+                "label": f"ЕЩЁ ▶ ({page + 2}/{pages})",
+                "payload": _payload("ai_page", str(page + 1), job_id),
+            },
+            "color": "secondary",
+        })
+    if navigation:
+        buttons.append(navigation)
+    buttons.append([
+        {
+            "action": {
+                "type": "callback",
+                "label": ai_flow.CUSTOM_BUTTON,
+                "payload": _payload(
+                    "ai_template",
+                    ai_flow.CUSTOM_TEMPLATE_ID,
+                    job_id,
+                ),
+            },
+            "color": "primary",
         },
-        "color": "primary",
-    }])
-    buttons.append([{
-        "action": {
-            "type": "callback",
-            "label": "❌ ОТМЕНА",
-            "payload": _payload("ai_cancel", "cancel", job_id),
+        {
+            "action": {
+                "type": "callback",
+                "label": "❌ ОТМЕНА",
+                "payload": _payload("ai_cancel", "cancel", job_id),
+            },
+            "color": "negative",
         },
-        "color": "negative",
-    }])
+    ])
     return {"inline": True, "buttons": buttons}
 
 
@@ -472,6 +511,12 @@ def _action_parts(payload: dict) -> tuple[str, str, str] | None:
         valid_action = action_name == "cancel"
     elif kind == "ai_print":
         valid_action = action_name == "print"
+    elif kind == "ai_page":
+        valid_action = isinstance(action_name, str) and bool(
+            AI_PAGE_RE.fullmatch(action_name)
+        )
+    elif kind == "ai_regenerate":
+        valid_action = action_name == "regenerate"
     else:
         valid_action = False
     if not valid_action or not isinstance(job_id, str):
@@ -584,12 +629,56 @@ async def handle_event(
     if parsed is None:
         return False
     kind, action = parsed
+    if kind == "ai_page":
+        return await _show_ai_page(session, action)
     ui = VkPrintUI(session)
     if kind == "print_choice":
         return await print_flow.handle_choice(action, ui)
     if kind == "print_admin":
         return await print_flow.handle_admin_action(action, ui)
     return await ai_flow.handle_action(action, ui)
+
+
+async def _show_ai_page(
+    session: aiohttp.ClientSession,
+    action: ai_flow.AiAction,
+) -> bool:
+    """Swap the AI menu card to another page of presets in place."""
+    event = action.context.get("vk_message_event")
+    if not isinstance(event, dict):
+        return False
+    peer_id = int(event["peer_id"])
+    cmid = int(event["conversation_message_id"])
+    try:
+        templates = runtime_config.ai_image_edit_settings()["templates"]
+        message = await vk_api.get_message_by_cmid(session, peer_id, cmid)
+        await vk_api.edit_message(
+            session,
+            peer_id,
+            cmid,
+            str(message.get("text") or "").strip(),
+            attachment=vk_api.message_attachment_refs(message),
+            keyboard=_ai_choice_keyboard(
+                action.job_id,
+                templates,
+                int(action.action),
+            ),
+        )
+        text = ""
+    except Exception:
+        log.exception("Could not switch VK AI menu page job=%s", action.job_id)
+        text = "Не удалось открыть страницу, попробуйте ещё раз"
+    try:
+        await vk_api.answer_message_event(
+            session,
+            event_id=str(event["event_id"]),
+            user_id=int(event["user_id"]),
+            peer_id=peer_id,
+            text=text,
+        )
+    except Exception:
+        log.exception("Could not answer VK AI page event job=%s", action.job_id)
+    return True
 
 
 async def handle_message(

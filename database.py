@@ -6,8 +6,8 @@ import uuid
 
 PROVIDERS = frozenset({"telegram", "vk", "max"})
 PRINT_MODES = frozenset({"fit", "fill"})
-PRINT_COOLDOWN_SECONDS = 5 * 60
-AI_COOLDOWN_SECONDS = 5 * 60
+PRINT_COOLDOWN_SECONDS = 10
+AI_COOLDOWN_SECONDS = 10
 
 
 async def _connect():
@@ -1426,6 +1426,36 @@ async def print_cooldown_retry_after(
         )
         row = await cursor.fetchone()
         return max(0, int(row[0])) if row is not None else 0
+
+
+async def get_ai_image_job(*, job_id: str | uuid.UUID) -> dict | None:
+    """Return the stored settings of one AI job, used to regenerate its result."""
+    job_id = _uuid_text(job_id, "job_id")
+    connection = await _connect()
+    async with connection:
+        cursor = await connection.execute(
+            """
+            SELECT user_id, event_name, status, source_message_id,
+                   source_suffix, template_id, template_label, prompt
+            FROM ai_image_jobs
+            WHERE id = %s
+            """,
+            (job_id,),
+        )
+        row = await cursor.fetchone()
+        if row is None:
+            return None
+        return {
+            "job_id": _uuid_hex(job_id, "job_id"),
+            "user_id": int(row[0]),
+            "event_name": row[1],
+            "status": row[2],
+            "source_message_id": row[3],
+            "source_suffix": row[4],
+            "template_id": row[5],
+            "template_label": row[6],
+            "prompt": row[7],
+        }
 
 
 async def claim_ai_image_job_for_print(

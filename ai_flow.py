@@ -35,6 +35,8 @@ WORKER_FALLBACK_SECONDS = 5
 
 CUSTOM_TEMPLATE_ID = "custom"
 CUSTOM_BUTTON = "✏️ СВОЁ"
+PRINT_BUTTON = "🖨 РАСПЕЧАТАТЬ"
+REGENERATE_BUTTON = "🔄 ПЕРЕГЕНЕРИРОВАТЬ"
 
 _worker_wakeup = asyncio.Event()
 _actions_in_progress: set[str] = set()
@@ -90,7 +92,7 @@ def valid_template_id(value: object) -> bool:
     return (
         isinstance(value, str)
         and runtime_config.AI_TEMPLATE_ID_RE.fullmatch(value) is not None
-        and value not in {"cancel", "print"}
+        and value not in {"cancel", "print", "regenerate"}
     )
 
 
@@ -145,11 +147,6 @@ def _load_result(job_id: str, suffix: str) -> bytes:
     if not payload:
         raise ValueError("stored AI result is empty")
     return payload
-
-
-def _delete_source(job_id: str, suffix: str) -> None:
-    if SUFFIX_RE.fullmatch(str(suffix or "")):
-        (_job_dir(job_id) / f"source{suffix}").unlink(missing_ok=True)
 
 
 def _delete_job_files(job_id: str) -> None:
@@ -320,7 +317,7 @@ async def handle_upload(upload: AiUpload, ui: AiUI, *, caption: str) -> bool:
             await ui.send_text(
                 user,
                 "❌ Следующую AI-обработку можно запустить через "
-                f"{max(1, (retry_seconds + 59) // 60)} мин.",
+                f"{print_flow.format_wait(retry_seconds)}",
             )
             return True
         if created.get("outcome") == "already_open":
@@ -551,11 +548,11 @@ async def _handle_print(action: AiAction, ui: AiUI) -> bool:
             event_name=event_name,
         )
         if retry_after > 0:
-            minutes = max(1, (retry_after + 59) // 60)
             await _safe_ack(
                 ui,
                 action,
-                f"Следующую фотографию можно напечатать через {minutes} мин.",
+                "Следующую фотографию можно напечатать через "
+                f"{print_flow.format_wait(retry_after)}",
                 alert=True,
             )
             return True
@@ -616,8 +613,126 @@ async def _handle_print(action: AiAction, ui: AiUI) -> bool:
     return True
 
 
+async def _handle_regenerate(action: AiAction, ui: AiUI) -> bool:
+    """Queue a new job from the original photo with the same preset or prompt."""
+    user = action.user
+    if not runtime_config.ai_image_edit_settings()["enabled"]:
+        await _safe_ack(ui, action, "AI-обработка сейчас отключена", alert=True)
+        return True
+    event_name, event_token, cafe_mode = event_access.current_event()
+    if not await print_flow.user_has_access(
+        user,
+        event_token=event_token,
+        cafe_mode=cafe_mode,
+    ):
+        await _safe_ack(
+            ui,
+            action,
+            print_flow.EVENT_ACCESS_REQUIRED_MESSAGE,
+            alert=True,
+        )
+        return True
+    database_user_id = await print_flow.ensure_user(user)
+    old = await database.get_ai_image_job(job_id=action.job_id)
+    if old is None or old["status"] != "ready":
+        await _safe_ack(ui, action, "Этот результат уже неактивен", alert=True)
+        return True
+    if old["user_id"] != database_user_id:
+        await _safe_ack(
+            ui, action, "Перегенерировать может только отправитель", alert=True,
+        )
+        return True
+    if old["event_name"] != event_name:
+        await _safe_ack(ui, action, "Мероприятие уже изменилось", alert=True)
+        return True
+    if not (old["template_id"] and old["template_label"] and old["prompt"]):
+        await _safe_ack(ui, action, "Этот результат уже неактивен", alert=True)
+        return True
+    try:
+        source = await asyncio.to_thread(
+            _load_source,
+            action.job_id,
+            old["source_suffix"],
+        )
+    except (OSError, ValueError):
+        await _safe_ack(
+            ui,
+            action,
+            "Исходное фото уже недоступно — пришлите его заново",
+            alert=True,
+        )
+        return True
+
+    job_id = uuid.uuid4().hex
+    created = await database.create_ai_image_job(
+        job_id=job_id,
+        user_id=database_user_id,
+        event_name=event_name,
+        conversation_id=user.conversation_id,
+        source_message_id=old["source_message_id"],
+        source_suffix=old["source_suffix"],
+        bypass_cooldown=user.is_admin or user.allowlisted,
+    )
+    for stale_job_id in created.get("stale_job_ids", ()):
+        await asyncio.to_thread(_delete_job_files, stale_job_id)
+    outcome = created.get("outcome")
+    if outcome == "cooldown":
+        retry_seconds = int(created.get("retry_after_seconds") or 0)
+        await _safe_ack(
+            ui,
+            action,
+            "Новый вариант можно запустить через "
+            f"{print_flow.format_wait(retry_seconds)}",
+            alert=True,
+        )
+        return True
+    if outcome == "already_open":
+        await _safe_ack(
+            ui,
+            action,
+            "Дождитесь окончания текущей AI-обработки",
+            alert=True,
+        )
+        return True
+    if outcome != "created":
+        raise RuntimeError("не удалось создать AI-задание")
+
+    try:
+        await asyncio.to_thread(_save_source, job_id, old["source_suffix"], source)
+        error = await _queue_job(
+            user,
+            job_id,
+            template_id=old["template_id"],
+            template_label=old["template_label"],
+            prompt=old["prompt"],
+            expected_status="receiving",
+        )
+        if error:
+            raise ValueError(error)
+    except Exception as exc:
+        log.warning("AI regenerate rejected job=%s from=%s: %s", job_id, action.job_id, exc)
+        try:
+            await database.fail_ai_image_job(job_id=job_id, last_error=str(exc))
+        except Exception:
+            log.exception("Could not close failed AI regenerate job=%s", job_id)
+        await asyncio.to_thread(_delete_job_files, job_id)
+        await _safe_ack(ui, action, str(exc), alert=True)
+        return True
+
+    log.info(
+        "%s AI regenerate queued job=%s from=%s user=%s",
+        user.provider.upper(),
+        job_id,
+        action.job_id,
+        user.provider_user_id,
+    )
+    await _safe_ack(ui, action, "Генерируем новый вариант")
+    await _safe_send_text(ui, user, "⏳ Генерируем новый вариант…")
+    return True
+
+
 async def handle_action(action: AiAction, ui: AiUI) -> bool:
-    if action.action not in {"template", "cancel", "print"}:
+    if action.action not in {"template", "cancel", "print", "regenerate"}:
         return False
     action_key = f"{action.action}:{action.job_id}"
     if action_key in _actions_in_progress:
@@ -629,6 +744,8 @@ async def handle_action(action: AiAction, ui: AiUI) -> bool:
             return await _handle_cancel(action, ui)
         if action.action == "print":
             return await _handle_print(action, ui)
+        if action.action == "regenerate":
+            return await _handle_regenerate(action, ui)
         return await _handle_template(action, ui)
     except Exception as exc:
         log.exception("AI action failed action=%s job=%s", action.action, action.job_id)
@@ -638,30 +755,45 @@ async def handle_action(action: AiAction, ui: AiUI) -> bool:
         _actions_in_progress.discard(action_key)
 
 
+def _vk_payload(kind: str, action: str, job_id: str) -> str:
+    return json.dumps(
+        {"type": kind, "action": action, "job_id": job_id},
+        ensure_ascii=False,
+        separators=(",", ":"),
+    )
+
+
 def _result_keyboard(provider: str, job_id: str) -> dict:
     if provider == "telegram":
         return {
-            "inline_keyboard": [[{
-                "text": "🖨 РАСПЕЧАТАТЬ",
-                "callback_data": f"ai:p:{job_id}",
-            }]],
+            "inline_keyboard": [
+                [{"text": PRINT_BUTTON, "callback_data": f"ai:p:{job_id}"}],
+                [{"text": REGENERATE_BUTTON, "callback_data": f"ai:r:{job_id}"}],
+            ],
         }
     if provider == "vk":
-        payload = json.dumps(
-            {"type": "ai_print", "action": "print", "job_id": job_id},
-            ensure_ascii=False,
-            separators=(",", ":"),
-        )
         return {
             "inline": True,
-            "buttons": [[{
-                "action": {
-                    "type": "callback",
-                    "label": "🖨 РАСПЕЧАТАТЬ",
-                    "payload": payload,
-                },
-                "color": "primary",
-            }]],
+            "buttons": [
+                [{
+                    "action": {
+                        "type": "callback",
+                        "label": PRINT_BUTTON,
+                        "payload": _vk_payload("ai_print", "print", job_id),
+                    },
+                    "color": "primary",
+                }],
+                [{
+                    "action": {
+                        "type": "callback",
+                        "label": REGENERATE_BUTTON,
+                        "payload": _vk_payload(
+                            "ai_regenerate", "regenerate", job_id,
+                        ),
+                    },
+                    "color": "secondary",
+                }],
+            ],
         }
     raise ValueError(f"unsupported AI result provider: {provider}")
 
@@ -730,11 +862,8 @@ async def _finish_job(
     if ready.get("outcome") != "ready":
         await asyncio.to_thread(_delete_job_files, job["job_id"])
         return
-    await asyncio.to_thread(
-        _delete_source,
-        job["job_id"],
-        job["source_suffix"],
-    )
+    # The source stays next to the result so «Перегенерировать» can reuse it;
+    # the whole job directory is removed once the result is printed.
     job["result_suffix"] = RESULT_SUFFIX
     await _deliver_result(job)
     log.info(

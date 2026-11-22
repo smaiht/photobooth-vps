@@ -160,6 +160,14 @@ def connected_event_message(event_name: str) -> str:
 PRINT_SENDING_MESSAGE = "⏳ Отправляем фото на фотобудку. Дождитесь подтверждения."
 
 
+def format_wait(seconds: int) -> str:
+    """Human-readable wait time: seconds under a minute, minutes otherwise."""
+    seconds = max(1, int(seconds))
+    if seconds < 60:
+        return f"{seconds} сек."
+    return f"{(seconds + 59) // 60} мин."
+
+
 def print_queued_message(
     authorization_kind: str | None,
     queued_at: datetime | None = None,
@@ -170,8 +178,7 @@ def print_queued_message(
         if queued_at is not None:
             seconds -= math.floor((datetime.now(timezone.utc) - queued_at).total_seconds())
         if seconds > 0:
-            minutes = (seconds + 59) // 60
-            message += f"\n\nСледующая печать будет доступна через {minutes} мин."
+            message += f"\n\nСледующая печать будет доступна через {format_wait(seconds)}"
     return message
 
 
@@ -397,8 +404,7 @@ def _claim_error(claim: dict) -> str:
     if outcome == "cooldown":
         retry_seconds = int(claim.get("retry_after_seconds") or 0)
         return (
-            "следующую фотографию можно напечатать через "
-            f"{max(1, (retry_seconds + 59) // 60)} мин."
+            f"следующую фотографию можно напечатать через {format_wait(retry_seconds)}"
         )
     if outcome == "access_denied":
         return EVENT_ACCESS_REQUIRED_MESSAGE

@@ -1,4 +1,5 @@
 import io
+import json
 import unittest
 from pathlib import Path
 from tempfile import TemporaryDirectory
@@ -251,6 +252,229 @@ class AiOwnPromptTests(unittest.IsolatedAsyncioTestCase):
             queue.await_args.kwargs["prompt"],
             "сделай нас космонавтами",
         )
+
+
+class AiRegenerateTests(unittest.IsolatedAsyncioTestCase):
+    def old_job(self, **overrides) -> dict:
+        job = {
+            "job_id": "a" * 32,
+            "user_id": 1,
+            "event_name": "event",
+            "status": "ready",
+            "source_message_id": "77",
+            "source_suffix": ".jpg",
+            "template_id": "effect",
+            "template_label": "Effect",
+            "prompt": "Prompt",
+        }
+        job.update(overrides)
+        return job
+
+    def action(self, user=None) -> ai_flow.AiAction:
+        user = user or print_flow.PrintUser(
+            provider="telegram", provider_user_id=123, conversation_id=123,
+        )
+        return ai_flow.AiAction(user=user, action="regenerate", job_id="a" * 32)
+
+    def patches(self, tmpdir, *, old, created):
+        return (
+            patch.object(ai_flow, "AI_JOBS_ROOT", Path(tmpdir)),
+            patch(
+                "ai_flow.runtime_config.ai_image_edit_settings",
+                return_value={"enabled": True, "templates": ()},
+            ),
+            patch(
+                "ai_flow.event_access.current_event",
+                return_value=("event", "token", False),
+            ),
+            patch("ai_flow.print_flow.user_has_access", AsyncMock(return_value=True)),
+            patch("ai_flow.print_flow.ensure_user", AsyncMock(return_value=1)),
+            patch("ai_flow.database.get_ai_image_job", AsyncMock(return_value=old)),
+            patch(
+                "ai_flow.database.create_ai_image_job",
+                AsyncMock(return_value=created),
+            ),
+            patch(
+                "ai_flow.database.queue_ai_image_job",
+                AsyncMock(return_value={"outcome": "queued"}),
+            ),
+        )
+
+    async def run_action(self, tmpdir, *, old, created, save_source=True):
+        ui = SimpleNamespace(
+            send_text=AsyncMock(return_value=True),
+            acknowledge=AsyncMock(),
+        )
+        p = self.patches(tmpdir, old=old, created=created)
+        with p[0], p[1], p[2], p[3], p[4], p[5], p[6] as create, p[7] as queue:
+            if save_source:
+                ai_flow._save_source("a" * 32, ".jpg", image_bytes())
+            await ai_flow.handle_action(self.action(), ui)
+            self.sources_match = (
+                queue.await_count == 1
+                and ai_flow._load_source(queue.await_args.kwargs["job_id"], ".jpg")
+                == ai_flow._load_source("a" * 32, ".jpg")
+            )
+        return ui, create, queue
+
+    async def test_queues_new_job_from_original_photo_with_same_prompt(self):
+        with TemporaryDirectory() as tmpdir:
+            ui, create, queue = await self.run_action(
+                tmpdir,
+                old=self.old_job(),
+                created={"outcome": "created", "stale_job_ids": []},
+            )
+        new_job_id = create.await_args.kwargs["job_id"]
+        self.assertNotEqual(new_job_id, "a" * 32)
+        self.assertTrue(self.sources_match)
+
+        self.assertFalse(create.await_args.kwargs["bypass_cooldown"])
+        self.assertEqual(create.await_args.kwargs["source_suffix"], ".jpg")
+        queue.assert_awaited_once()
+        self.assertEqual(queue.await_args.kwargs["job_id"], new_job_id)
+        self.assertEqual(queue.await_args.kwargs["template_id"], "effect")
+        self.assertEqual(queue.await_args.kwargs["prompt"], "Prompt")
+        self.assertEqual(queue.await_args.kwargs["expected_status"], "receiving")
+        ui.send_text.assert_awaited_once()
+
+    async def test_cooldown_is_reported_without_queueing(self):
+        with TemporaryDirectory() as tmpdir:
+            ui, _create, queue = await self.run_action(
+                tmpdir,
+                old=self.old_job(),
+                created={
+                    "outcome": "cooldown",
+                    "retry_after_seconds": 12,
+                    "stale_job_ids": [],
+                },
+            )
+        queue.assert_not_awaited()
+        self.assertIn("12 сек.", ui.acknowledge.await_args.args[1])
+
+    async def test_printed_or_foreign_result_is_rejected(self):
+        for old, text in (
+            (self.old_job(status="print_submitted"), "неактивен"),
+            (self.old_job(user_id=2), "только отправитель"),
+            (self.old_job(event_name="old"), "Мероприятие"),
+        ):
+            with self.subTest(text=text), TemporaryDirectory() as tmpdir:
+                ui, create, _queue = await self.run_action(
+                    tmpdir,
+                    old=old,
+                    created={"outcome": "created", "stale_job_ids": []},
+                )
+                create.assert_not_awaited()
+                self.assertIn(text, ui.acknowledge.await_args.args[1])
+
+    async def test_missing_source_asks_to_send_photo_again(self):
+        with TemporaryDirectory() as tmpdir:
+            ui, create, _queue = await self.run_action(
+                tmpdir,
+                old=self.old_job(),
+                created={"outcome": "created", "stale_job_ids": []},
+                save_source=False,
+            )
+        create.assert_not_awaited()
+        self.assertIn("пришлите его заново", ui.acknowledge.await_args.args[1])
+
+    def test_result_keyboards_offer_print_and_regenerate(self):
+        job_id = "b" * 32
+        telegram = ai_flow._result_keyboard("telegram", job_id)
+        self.assertEqual(
+            [row[0]["callback_data"] for row in telegram["inline_keyboard"]],
+            [f"ai:p:{job_id}", f"ai:r:{job_id}"],
+        )
+        vk = ai_flow._result_keyboard("vk", job_id)
+        payloads = [row[0]["action"]["payload"] for row in vk["buttons"]]
+        self.assertIn('"type":"ai_regenerate"', payloads[1])
+
+    async def test_messenger_buttons_are_parsed_as_regenerate(self):
+        job_id = "b" * 32
+        handle = AsyncMock(return_value=True)
+        with patch("telegram_print.ai_flow.handle_action", handle):
+            await telegram_print.handle_callback(None, "base", {
+                "id": "cb",
+                "data": f"ai:r:{job_id}",
+                "from": {"id": 123},
+                "message": {"message_id": 5, "chat": {"id": 123}},
+            })
+        self.assertEqual(handle.await_args.args[0].action, "regenerate")
+
+        parsed = vk_print.parse_event_action({
+            "event_id": "e",
+            "user_id": 123,
+            "peer_id": 123,
+            "conversation_message_id": 9,
+            "payload": {
+                "type": "ai_regenerate", "action": "regenerate", "job_id": job_id,
+            },
+        })
+        self.assertIsNotNone(parsed)
+        self.assertEqual(parsed[1].action, "regenerate")
+
+
+class VkAiMenuPagingTests(unittest.IsolatedAsyncioTestCase):
+    templates = tuple(
+        {"id": f"t{index}", "button": f"Effect {index}", "prompt": "p"}
+        for index in range(10)
+    )
+
+    def labels(self, keyboard):
+        return [[button["action"]["label"] for button in row]
+                for row in keyboard["buttons"]]
+
+    def test_every_page_fits_vk_inline_limits(self):
+        job_id = "a" * 32
+        seen = []
+        for page in range(vk_print._ai_page_count(self.templates)):
+            keyboard = vk_print._ai_choice_keyboard(job_id, self.templates, page)
+            rows = keyboard["buttons"]
+            self.assertTrue(keyboard["inline"])
+            self.assertLessEqual(len(rows), 6)
+            self.assertLessEqual(sum(len(row) for row in rows), 10)
+            self.assertEqual(
+                self.labels(keyboard)[-1], [ai_flow.CUSTOM_BUTTON, "❌ ОТМЕНА"],
+            )
+            seen.extend(
+                json.loads(row[0]["action"]["payload"])["action"]
+                for row in rows
+                if json.loads(row[0]["action"]["payload"])["type"] == "ai_template"
+                and json.loads(row[0]["action"]["payload"])["action"] != "custom"
+            )
+        self.assertEqual(seen, [template["id"] for template in self.templates])
+
+    def test_short_menu_has_no_navigation(self):
+        keyboard = vk_print._ai_choice_keyboard("a" * 32, self.templates[:3])
+        self.assertEqual(len(keyboard["buttons"]), 4)
+
+    async def test_page_button_edits_card_keyboard_in_place(self):
+        job_id = "a" * 32
+        event = {
+            "event_id": "e",
+            "user_id": 123,
+            "peer_id": 123,
+            "conversation_message_id": 9,
+            "payload": {"type": "ai_page", "action": "1", "job_id": job_id},
+        }
+        with patch(
+            "vk_print.runtime_config.ai_image_edit_settings",
+            return_value={"enabled": True, "templates": self.templates},
+        ), patch(
+            "vk_print.vk_api.get_message_by_cmid",
+            AsyncMock(return_value={"text": "✨ Выберите AI-эффект:"}),
+        ), patch(
+            "vk_print.vk_api.message_attachment_refs",
+            return_value="photo1_2",
+        ), patch("vk_print.vk_api.edit_message", AsyncMock()) as edit, patch(
+            "vk_print.vk_api.answer_message_event", AsyncMock(),
+        ) as answer, patch("vk_print.ai_flow.handle_action", AsyncMock()) as ai:
+            self.assertTrue(await vk_print.handle_event(None, event))
+
+        ai.assert_not_awaited()
+        keyboard = edit.await_args.kwargs["keyboard"]
+        self.assertEqual(self.labels(keyboard)[0], ["Effect 4"])
+        self.assertEqual(edit.await_args.kwargs["attachment"], "photo1_2")
+        self.assertEqual(answer.await_args.kwargs["text"], "")
 
 
 class AiWorkerTests(unittest.IsolatedAsyncioTestCase):

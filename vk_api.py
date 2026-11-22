@@ -416,13 +416,15 @@ async def edit_message(
     text: str,
     *,
     attachment: str | None = None,
+    keyboard: dict | None = None,
 ) -> None:
+    """Edit a message; without ``keyboard`` its buttons are removed."""
     params: dict[str, Any] = {
         "peer_id": peer_id,
         "cmid": conversation_message_id,
         "message": text,
         "keyboard": json.dumps(
-            {"buttons": []},
+            keyboard if keyboard is not None else {"buttons": []},
             ensure_ascii=False,
             separators=(",", ":"),
         ),
@@ -449,20 +451,24 @@ async def answer_message_event(
     peer_id: int,
     text: str,
 ) -> None:
-    event_data = json.dumps(
-        {"type": "show_snackbar", "text": str(text or "")[:90]},
-        ensure_ascii=False,
-        separators=(",", ":"),
-    )
+    params: dict[str, Any] = {
+        "event_id": event_id,
+        "user_id": user_id,
+        "peer_id": peer_id,
+    }
+    # Without event_data VK just stops the button spinner, with no snackbar.
+    if str(text or "").strip():
+        params["event_data"] = json.dumps(
+            {"type": "show_snackbar", "text": str(text)[:90]},
+            ensure_ascii=False,
+            separators=(",", ":"),
+        )
 
     async def answer_once() -> None:
         response = await api_call(
             session,
             "messages.sendMessageEventAnswer",
-            event_id=event_id,
-            user_id=user_id,
-            peer_id=peer_id,
-            event_data=event_data,
+            **params,
         )
         if response not in (1, True):
             raise VkApiError(

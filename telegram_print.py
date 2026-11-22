@@ -24,7 +24,8 @@ ADMIN_RE = re.compile(r"^print_admin:(approve|reject):([a-f0-9]{32})$")
 AI_TEMPLATE_RE = re.compile(
     r"^ai:t:([a-z0-9][a-z0-9_-]{0,19}):([a-f0-9]{32})$"
 )
-AI_ACTION_RE = re.compile(r"^ai:(c|p):([a-f0-9]{32})$")
+AI_ACTION_RE = re.compile(r"^ai:(c|p|r):([a-f0-9]{32})$")
+AI_ACTION_NAMES = {"c": "cancel", "p": "print", "r": "regenerate"}
 
 _rejected_media_groups: set[str] = set()
 
@@ -438,7 +439,7 @@ async def handle_callback(
         action_code, job_id = matched.groups()
         action = ai_flow.AiAction(
             user=_action_user(callback),
-            action="cancel" if action_code == "c" else "print",
+            action=AI_ACTION_NAMES[action_code],
             job_id=job_id,
             action_id=callback.get("id"),
             context=callback,
